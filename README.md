@@ -15,7 +15,8 @@ It delivers:
 2. **GPU Sinc Upsampling**: High-throughput OpenCL-accelerated band-limited Whittaker–Shannon Sinc interpolation supporting **Linear Phase**, **Minimum Phase**, and **Apodizing** impulse responses.
 3. **Advanced Psychoacoustic Noise Shaping**: 4th-order multi-band noise-shaping curves (Shibata & High-Rate) moving dither energy safely into the high ultrasonic spectrum ($>35\text{ kHz}$).
 4. **Forensic Cutoff & Fake Hi-Res Detection**: Automated acoustic analysis identifying upsampled CD masters, brick-wall filter cutoffs, zero-stuffing, filter phase signatures, and ultrasonic noise profiles.
-5. **Interactive Web Explorer**: A real-time, on-demand browser application providing dynamic library navigation, live DSP spectral analysis in under 1 second, interactive spectrograms with exact cursor dB level readouts, and in-browser lossless playback.
+5. **Audiophile Dynamic Range (DR) Scoring**: Official 64-bit Pleasurize Music Foundation (PMF) TT Dynamic Range Meter scoring alongside EBU R128 Loudness Range (LRA) and Integrated LUFS.
+6. **Interactive Web Explorer**: A real-time, on-demand browser application providing dynamic library navigation, live DSP spectral analysis in under 1 second, interactive spectrograms with exact cursor dB level readouts, and in-browser lossless playback.
 
 ---
 
@@ -43,6 +44,29 @@ It delivers:
   - `[DYNAMIC RANGE]`: Official **TT Dynamic Range (DR Score e.g. DR12)**, **EBU R128 Loudness Range (LRA)**, and **Integrated LUFS**.
 - **Interactive Heatmap Canvas**: Zoom/pan with mouse wheel and drag; cursor HUD reveals **exact Time (s), Frequency (kHz), and Level (dBFS)** anywhere on the canvas.
 - **Built-in Lossless Audio Streaming**: Audition FLAC files directly in your browser while visually correlating audio transients with the spectrogram.
+
+---
+
+## 🎚️ Audiophile Dynamic Range (DR) Scoring & Loudness Metrics
+
+AcoustiSinc computes industry-standard audiophile dynamic range and broadcast loudness metrics in strict 64-bit double precision:
+
+### 1. TT Dynamic Range Meter (Official PMF Standard)
+Standardized by the [Pleasurize Music Foundation](https://dr.loudness-war.info) and Foobar2000 (`foo_dynamic_range`), the TT DR meter evaluates crest dynamics across 3-second blocks:
+$$\text{DR Score} = \text{Track Peak (dBFS)} - \text{Average RMS of Top 20\% Loudest Blocks (dBFS)}$$
+
+#### Audiophile DR Rating Scale:
+| DR Score | Rating | Color Code | Characteristics |
+| :--- | :--- | :--- | :--- |
+| **DR 14+** | **Pristine Dynamics** | 🟦 Cyan / Blue | Uncompressed audiophile masters (Classical, Acoustic Jazz, early vinyl/CD transfers). |
+| **DR 10 – 13** | **Good Dynamics** | 🟩 Green | Open, dynamic recordings with natural transients and high punch. |
+| **DR 7 – 9** | **Moderate Compression** | 🟨 Yellow | Noticeable dynamic compression and limiting (typical commercial pop/rock masters). |
+| **DR 1 – 6** | **Heavy Compression** | 🟥 Red | Severe brick-wall limiting / Loudness War hyper-compression. |
+
+### 2. Broadcast & Mastering Metrics
+- **EBU R128 Loudness Range (LRA)**: Measures macro-dynamics (dynamic span in **LU / dB**) using dual-gated K-weighting filters (discarding silence below $-70\text{ LUFS}$ and relative gate at $-20\text{ LU}$).
+- **Integrated Loudness ($\text{LUFS}$)**: ITU-R BS.1770-4 overall perceived loudness across the track.
+- **Peak-to-RMS Crest Factor ($\text{dB}$)**: Total headroom between overall RMS power and true peak level.
 
 ---
 
@@ -84,7 +108,7 @@ python server.py --root "/path/to/music" --port 8765
 python server.py
 ```
 
-Open **`http://localhost:8765`** in your browser. Navigate directories using the path input bar, quick-jump buttons (`Start`, `Home`, `Root`), or the interactive sidebar tree. Click any track to run live DSP forensic analysis in under a second with interactive zooming, dB level inspection, and lossless audio streaming.
+Open **`http://localhost:8765`** in your browser. Navigate directories using the path input bar, quick-jump buttons (`Start`, `Home`, `Root`), or the interactive sidebar tree. Click any track to run live DSP forensic analysis in under a second with interactive zooming, dB level inspection, color-coded DR badges, and lossless audio streaming.
 
 #### Explorer Options
 | Option | Type | Default | Description |
@@ -137,6 +161,7 @@ python upsampler.py "/path/to/source_music" "/path/to/upsampled_music" --phase a
 | **Passband Ripple** | $< \pm 0.00001\text{ dB}$ ($0\text{ Hz} \to 20\text{ kHz}$) |
 | **Intersample Headroom** | Guaranteed $\ge 0.3\text{ dBFS}$ margin with pre-scan gain normalization |
 | **Dither Resolution** | 24-bit TPDF with 4th-order Psychoacoustic Noise Shaping |
+| **Dynamic Range Standards** | TT Dynamic Range Meter (PMF DR Score) & EBU R128 / ITU-R BS.1770-4 LRA |
 | **FLAC Output** | Bit-perfect Level 5 ($0.625$) with complete Vorbis Comment & Picture replication |
 
 ---
