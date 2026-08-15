@@ -76,36 +76,54 @@ pip install -r requirements.txt
 Launch the interactive web application server:
 
 ```bash
+# Start browsing from a specific music directory
 python server.py --root "/path/to/music" --port 8765
+
+# Or start from the current working directory
+python server.py
 ```
 
-Open **`http://localhost:8765`** in your browser. You can navigate directories using the path input bar, quick-jump buttons (`Start`, `Home`, `Root`), or the interactive sidebar tree. Click any track to run live DSP forensic analysis in under a second with interactive zooming, dB level inspection, and lossless audio streaming.
+Open **`http://localhost:8765`** in your browser. Navigate directories using the path input bar, quick-jump buttons (`Start`, `Home`, `Root`), or the interactive sidebar tree. Click any track to run live DSP forensic analysis in under a second with interactive zooming, dB level inspection, and lossless audio streaming.
+
+#### Explorer Options
+| Option | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `--root <path>` | *Optional* | `.` *(current directory)* | Initial directory path to display in the file browser. |
+| `--port <number>` | *Optional* | `8765` | Local TCP port for the web interface. |
+| `--host <ip>` | *Optional* | `0.0.0.0` | Network bind address (`0.0.0.0` allows LAN access, `127.0.0.1` for local-only). |
 
 ---
 
 ### 2. Running the GPU Sinc Upsampler (`upsampler.py`)
 
 #### Basic Usage
-Upsample a directory of audio tracks or a full recursive library from a source folder into a destination folder:
+Upsample a single track, a single album folder, or an entire recursive music library:
 
 ```bash
-# Minimum-Phase upsampling from source to target
+# Minimum-Phase upsampling from source to destination
 python upsampler.py "/path/to/source_music" "/path/to/upsampled_music" --phase min
 
-# Linear-Phase upsampling
-python upsampler.py "/path/to/source_music" "/path/to/upsampled_music" --phase linear
+# Linear-Phase upsampling (default phase and default destination)
+python upsampler.py "/path/to/source_music" --phase linear
 
 # Apodizing filter mode
 python upsampler.py "/path/to/source_music" "/path/to/upsampled_music" --phase apodizing
 ```
 
-#### Command-Line Options
-- `source`: Path to a single audio file or root directory containing album folders.
-- `target` (or `-o`, `--output-dir`): Target destination root directory (preserves source album subfolder hierarchy). If omitted, automatically defaults to `<source>_upsampled_<phase>`.
-- `--phase {linear, min, apodizing}`: Sinc filter phase characteristic (default: `linear`).
-- `--dither {shibata, high_rate, none}`: 24-bit psychoacoustic noise shaping profile (default: `shibata`).
-- `--no-dither`: Disable dither and noise shaping (raw truncation).
-- `--tmp-dir /path/to/nvme`: Custom fast scratch directory for NVMe memory-mapped buffers.
+#### Command-Line Parameters
+| Parameter | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `source` | **Mandatory** | *(None)* | Path to a single audio track (`.flac`/`.wav`) or a root directory containing album folders. |
+| `target` *(or `-o`, `--output-dir`)* | *Optional* | `<source>_upsampled_<phase>` | Destination root directory. Preserves the full source album subfolder hierarchy. |
+| `--phase` | *Optional* | `linear` | Sinc filter phase characteristic: `linear`, `min` (minimum phase / no pre-ringing), or `apodizing`. |
+| `--dither` | *Optional* | `shibata` | 24-bit psychoacoustic noise shaping profile: `shibata`, `high_rate`, or `none`. |
+| `--no-dither` | *Optional* | `False` | Flag to disable dither and noise shaping (raw truncation). |
+| `--tmp-dir` | *Optional* | `/tmp/upsample_scratch` | Custom fast NVMe scratch path for 64-bit memory-mapped buffers. |
+
+> [!NOTE]
+> **Batch Processing & Initial JIT Warm-Up**:
+> When processing your first track in a batch, execution may take an extra 1–3 seconds while OpenCL JIT-compiles the double-precision GPU sinc kernels, PyVkFFT builds and caches GPU plans, and Numba JIT-compiles the multi-core noise-shaping loops.
+> All subsequent tracks and recursive album folders run at full native GPU acceleration (~3–5× faster).
 
 ---
 
