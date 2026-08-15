@@ -191,12 +191,14 @@ def get_sinc_program(ctx):
         CL_SINC_PROGRAM = cl.Program(ctx, OPENCL_SINC_SRC).build()
     return CL_SINC_PROGRAM
 
-def get_gpu_filter_kernel(queue, fast_output_len, padded_len, in_len, scale_factor, phase_mode):
+def get_gpu_filter_kernel(queue, fast_output_len, padded_len, in_len, scale_factor, phase_mode="linear", apodizing=False):
     p = phase_mode.lower()
-    if p in ['linear']:
+    is_min = p in ['min', 'minimum']
+    
+    if not is_min and not apodizing:
         return None, 0
 
-    key = (padded_len, in_len, scale_factor, p)
+    key = (padded_len, in_len, scale_factor, is_min, apodizing)
     if key in GPU_FILTER_CACHE:
         return GPU_FILTER_CACHE[key], 1
 
@@ -205,15 +207,15 @@ def get_gpu_filter_kernel(queue, fast_output_len, padded_len, in_len, scale_fact
         GPU_FILTER_CACHE.clear()
 
     prg = get_sinc_program(queue.context)
+    transition_bins = max(16, int((in_len - 1) * 2000.0 / (22050.0 if in_len > 22050 else 44100.0))) if apodizing else max(16, int((in_len - 1) * 250.0 / (22050.0 if in_len > 22050 else 44100.0)))
+    k_cutoff = in_len - 1
 
-    if p in ['min', 'minimum']:
-        k_cutoff = in_len - 1
-        w = max(16, int((in_len - 1) * 2000.0 / (22050.0 if in_len > 22050 else 44100.0)))
-        
+    if is_min:
+        # Minimum Phase Kernel (with or without Apodizing transition shaping)
         gpu_log_mag = cla.empty(queue, (padded_len,), dtype=np.complex128)
         prg.init_min_phase_log_mag(
             queue, (padded_len,), None,
-            gpu_log_mag.data, np.uint64(padded_len), np.uint64(k_cutoff), np.uint64(w)
+            gpu_log_mag.data, np.uint64(padded_len), np.uint64(k_cutoff), np.uint64(transition_bins)
         )
         
         # 1D IFFT to cepstral domain in double precision
@@ -236,16 +238,14 @@ def get_gpu_filter_kernel(queue, fast_output_len, padded_len, in_len, scale_fact
         queue.finish()
         
         del gpu_log_mag, gpu_cep
-    elif p in ['intermediate', 'apodizing', 'apod']:
+    else:
+        # Linear Phase Apodizing Kernel
         d_kernel = cla.empty(queue, (padded_len,), dtype=np.complex128)
-        transition_bins = 128
         prg.init_apodizing_filter(
             queue, (padded_len,), None,
             d_kernel.data, np.uint64(padded_len), np.uint64(in_len), np.uint64(transition_bins)
         )
         queue.finish()
-    else:
-        return None, 0
 
     GPU_FILTER_CACHE[key] = d_kernel
     return d_kernel, 1
@@ -255,7 +255,7 @@ def get_gpu_filter_kernel(queue, fast_output_len, padded_len, in_len, scale_fact
 # GPU SINC UPSAMPLER ENGINE (BATCHED MULTI-CHANNEL IN VRAM)
 # ==============================================================================
 
-def upsample_multichannel_gpu(pcm_data, scale_factor, queue, phase_mode="linear"):
+def upsample_multichannel_gpu(pcm_data, scale_factor, queue, phase_mode="linear", apodizing=False):
     """
     Batched multi-channel GPU sinc upsampler using 64-bit double precision.
     Processes all channels simultaneously in a single GPU submission.
@@ -278,7 +278,7 @@ def upsample_multichannel_gpu(pcm_data, scale_factor, queue, phase_mode="linear"
     gpu_freq = rfftn(gpu_in, ndim=1)
 
     # 3. Sinc Zero-Padding + Filter Multiplication entirely inside VRAM
-    d_kernel, apply_filter = get_gpu_filter_kernel(queue, fast_output_len, padded_spectrum_shape, fft_in_shape, scale_factor, phase_mode)
+    d_kernel, apply_filter = get_gpu_filter_kernel(queue, fast_output_len, padded_spectrum_shape, fft_in_shape, scale_factor, phase_mode, apodizing)
     kernel_data = d_kernel.data if d_kernel is not None else gpu_freq.data
 
     gpu_padded = cla.empty(queue, (num_channels, padded_spectrum_shape), dtype=np.complex128)
@@ -633,7 +633,7 @@ def scan_album(files):
 # TRACK PROCESSOR
 # ==============================================================================
 
-def process_track(filepath, dest_dir, gain_factor, album_max_peak_lin, queue, phase_mode, dither_mode, tmp_dir):
+def process_track(filepath, dest_dir, gain_factor, album_max_peak_lin, queue, phase_mode, dither_mode, tmp_dir, apodizing=False):
     t0 = time.time()
     def elapsed(): return f"[+{time.time() - t0:6.2f}s]"
 
@@ -656,10 +656,14 @@ def process_track(filepath, dest_dir, gain_factor, album_max_peak_lin, queue, ph
     orig_samples, num_channels = data.shape
     scale_factor, target_rate = get_target_scale(samplerate)
 
+    is_min = phase_mode.lower() in ['min', 'minimum']
+    phase_label = "MINIMUM PHASE" if is_min else "LINEAR PHASE"
+    filter_label = f"{phase_label} APODIZING" if apodizing else phase_label
+
     print(f"\n{elapsed()} --------------------------------------------------")
     print(f"{elapsed()} Processing {filename}")
     print(f"{elapsed()} Input:  {orig_samples:,} samples @ {samplerate}Hz ({num_channels} ch)")
-    print(f"{elapsed()} Target: {target_rate}Hz (Scale: {scale_factor}x | Phase: {phase_mode.upper()} | Dither: {dither_mode.upper()})")
+    print(f"{elapsed()} Target: {target_rate}Hz (Scale: {scale_factor}x | Filter: {filter_label} | Dither: {dither_mode.upper()})")
 
     data = data * gain_factor
 
@@ -694,9 +698,9 @@ def process_track(filepath, dest_dir, gain_factor, album_max_peak_lin, queue, ph
             if len(chunk_pcm) < SAFE_CHUNK_LEN:
                 chunk_buf = np.zeros((SAFE_CHUNK_LEN, num_channels), dtype=np.float64)
                 chunk_buf[:len(chunk_pcm), :] = chunk_pcm
-                upsampled_chunk = upsample_multichannel_gpu(chunk_buf, scale_factor, queue, phase_mode)
+                upsampled_chunk = upsample_multichannel_gpu(chunk_buf, scale_factor, queue, phase_mode, apodizing)
             else:
-                upsampled_chunk = upsample_multichannel_gpu(chunk_pcm, scale_factor, queue, phase_mode)
+                upsampled_chunk = upsample_multichannel_gpu(chunk_pcm, scale_factor, queue, phase_mode, apodizing)
             
             left_guard = (pos - src_start) * scale_factor
             valid_len = min(chunk_size, orig_samples - pos) * scale_factor
@@ -711,7 +715,7 @@ def process_track(filepath, dest_dir, gain_factor, album_max_peak_lin, queue, ph
         gc.collect()
         print(f"{elapsed()} Batched GPU Sinc Chunking complete in {time.time() - t_gpu:.3f}s")
     else:
-        output_data = upsample_multichannel_gpu(data, scale_factor, queue, phase_mode)
+        output_data = upsample_multichannel_gpu(data, scale_factor, queue, phase_mode, apodizing)
         print(f"{elapsed()} Batched GPU Sinc complete in {time.time() - t_gpu:.3f}s")
 
     del data
@@ -759,7 +763,7 @@ def process_track(filepath, dest_dir, gain_factor, album_max_peak_lin, queue, ph
 # ALBUM BATCH CONTROLLER WITH RETRY AUTO-HEALING
 # ==============================================================================
 
-def process_album_folder(source_album_dir, dest_album_dir, queue, phase_mode, dither_mode, tmp_dir):
+def process_album_folder(source_album_dir, dest_album_dir, queue, phase_mode, dither_mode, tmp_dir, apodizing=False):
     print(f"\n==================================================")
     print(f"Directory:   {source_album_dir}")
     print(f"Destination: {dest_album_dir}")
@@ -789,7 +793,7 @@ def process_album_folder(source_album_dir, dest_album_dir, queue, phase_mode, di
 
         for idx, f in enumerate(files, 1):
             print(f"\n--- Track [{idx}/{len(files)}] ---")
-            clipped, fut = process_track(f, dest_album_dir, gain_factor, album_max_peak_lin, queue, phase_mode, dither_mode, tmp_dir)
+            clipped, fut = process_track(f, dest_album_dir, gain_factor, album_max_peak_lin, queue, phase_mode, dither_mode, tmp_dir, apodizing=apodizing)
             if fut is not None:
                 pass_futures.append(fut)
             if clipped:
@@ -831,9 +835,10 @@ def process_album_folder(source_album_dir, dest_album_dir, queue, phase_mode, di
 def main():
     parser = argparse.ArgumentParser(description="AcoustiSinc: GPU-Accelerated 64-Bit Sinc Audio Upsampler")
     parser.add_argument("source", help="Source audio file or root directory containing album folders")
-    parser.add_argument("target", nargs="?", default=None, help="Target output directory (optional, default: <source>_upsampled_<phase>)")
+    parser.add_argument("target", nargs="?", default=None, help="Target output directory (optional, default: <source>_upsampled_<topology>)")
     parser.add_argument("-o", "--output-dir", default=None, help="Explicit target output directory")
-    parser.add_argument("--phase", choices=['linear', 'min', 'minimum', 'intermediate', 'apodizing', 'apod'], default='linear', help="Filter phase mode (default: linear)")
+    parser.add_argument("--phase", choices=['linear', 'min', 'minimum'], default='linear', help="Filter phase mode: linear (symmetric) or min (minimum phase, causal)")
+    parser.add_argument("--apodizing", "--apod", action="store_true", help="Enable Apodizing transition band to attenuate pre-existing studio ADC ringing")
     parser.add_argument("--dither", choices=['shibata', 'high_rate', 'none'], default='shibata', help="Dither & noise shaping mode (default: shibata)")
     parser.add_argument("--no-dither", action="store_true", help="Disable dither and noise shaping")
     parser.add_argument("--tmp-dir", default=DEFAULT_TMP_DIR, help="Scratch directory for NVMe memory-mapped buffers")
@@ -844,14 +849,18 @@ def main():
         print(f"[Error] Source path not found: {source_path}")
         sys.exit(1)
 
+    is_min = args.phase.lower() in ['min', 'minimum']
+    phase_name = "MINIMUM PHASE" if is_min else "LINEAR PHASE"
+    topology_name = f"{phase_name} APODIZING" if args.apodizing else phase_name
+    topology_suffix = ("min_apod" if args.apodizing else "min") if is_min else ("linear_apod" if args.apodizing else "linear")
+
     target_dir = args.output_dir or args.target
     if not target_dir:
-        phase_suffix = "min" if args.phase.lower() in ['min', 'minimum'] else ("apod" if args.phase.lower() in ['apod', 'apodizing', 'intermediate'] else "linear")
         if os.path.isfile(source_path):
             parent = os.path.dirname(source_path)
-            target_dir = os.path.join(parent, f"upsampled_{phase_suffix}")
+            target_dir = os.path.join(parent, f"upsampled_{topology_suffix}")
         else:
-            target_dir = f"{source_path.rstrip(os.sep)}_upsampled_{phase_suffix}"
+            target_dir = f"{source_path.rstrip(os.sep)}_upsampled_{topology_suffix}"
 
     target_dir = os.path.abspath(target_dir)
     dither_mode = "none" if args.no_dither else args.dither
@@ -863,7 +872,9 @@ def main():
     print(f"=======================================================")
     print(f"Source Path     : {source_path}")
     print(f"Destination Path: {target_dir}")
-    print(f"Phase Mode      : {args.phase.upper()}")
+    print(f"Filter Topology : {topology_name}")
+    print(f"Phase Mode      : {phase_name}")
+    print(f"Apodizing Filter: {'ENABLED (Anti-ADC Ringing)' if args.apodizing else 'DISABLED (Standard Sinc Bandwidth)'}")
     print(f"Noise Shaping   : {dither_mode.upper()} (In-Register Double Precision)")
     print(f"FLAC Compression: Level 5 (Strict)")
     print(f"Precision       : 64-bit Double Precision (Strict)")
@@ -875,7 +886,7 @@ def main():
     if os.path.isfile(source_path):
         os.makedirs(target_dir, exist_ok=True)
         gain_factor, pk = scan_album([source_path])
-        process_track(source_path, target_dir, gain_factor, pk, queue, args.phase, dither_mode, tmp_dir)
+        process_track(source_path, target_dir, gain_factor, pk, queue, args.phase, dither_mode, tmp_dir, apodizing=args.apodizing)
         file_writer_pool.shutdown(wait=True)
         return
 
@@ -892,7 +903,7 @@ def main():
     for idx, album_dir in enumerate(album_directories, 1):
         dest_album_dir = get_destination_dir(album_dir, source_path, target_dir)
         print(f"\n==================================================\n[Album {idx}/{len(album_directories)}]")
-        process_album_folder(album_dir, dest_album_dir, queue, args.phase, dither_mode, tmp_dir)
+        process_album_folder(album_dir, dest_album_dir, queue, args.phase, dither_mode, tmp_dir, apodizing=args.apodizing)
 
     file_writer_pool.shutdown(wait=True)
     print("\n>>> All recursive album batches completed cleanly!")

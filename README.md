@@ -122,25 +122,29 @@ Open **`http://localhost:8765`** in your browser. Navigate directories using the
 ### 2. Running the GPU Sinc Upsampler (`upsampler.py`)
 
 #### Basic Usage
-Upsample a single track, a single album folder, or an entire recursive music library:
+Upsample a single track, an album folder, or an entire recursive music library with your preferred filter topology:
 
 ```bash
-# Minimum-Phase upsampling from source to destination
+# 1. Minimum-Phase Apodizing (Recommended for Red Book CD 44.1k/48k - zero pre-ringing & removes ADC ringing)
+python upsampler.py "/path/to/source_music" "/path/to/upsampled_music" --phase min --apodizing
+
+# 2. Pure Minimum-Phase (Zero pre-ringing, full sinc bandwidth)
 python upsampler.py "/path/to/source_music" "/path/to/upsampled_music" --phase min
 
-# Linear-Phase upsampling (default phase and default destination)
-python upsampler.py "/path/to/source_music" --phase linear
+# 3. Linear-Phase Apodizing (Symmetric linear phase, removes ADC ringing)
+python upsampler.py "/path/to/source_music" "/path/to/upsampled_music" --phase linear --apodizing
 
-# Apodizing filter mode
-python upsampler.py "/path/to/source_music" "/path/to/upsampled_music" --phase apodizing
+# 4. Pure Linear-Phase Sinc (Default: symmetric phase, bit-perfect passband up to Nyquist)
+python upsampler.py "/path/to/source_music"
 ```
 
 #### Command-Line Parameters
 | Parameter | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `source` | **Mandatory** | *(None)* | Path to a single audio track (`.flac`/`.wav`) or a root directory containing album folders. |
-| `target` *(or `-o`, `--output-dir`)* | *Optional* | `<source>_upsampled_<phase>` | Destination root directory. Preserves the full source album subfolder hierarchy. |
-| `--phase` | *Optional* | `linear` | Sinc filter phase characteristic: `linear`, `min` (minimum phase / no pre-ringing), or `apodizing`. |
+| `target` *(or `-o`, `--output-dir`)* | *Optional* | `<source>_upsampled_<topology>` | Destination root directory. Preserves the full source album subfolder hierarchy. |
+| `--phase` | *Optional* | `linear` | Filter phase mode: `linear` (symmetric) or `min` (minimum phase / causal, zero pre-ringing). |
+| `--apodizing`, `--apod` | *Optional* | `False` *(Off)* | Switch to enable Apodizing transition band to attenuate pre-existing studio ADC ringing. |
 | `--dither` | *Optional* | `shibata` | 24-bit psychoacoustic noise shaping profile: `shibata`, `high_rate`, or `none`. |
 | `--no-dither` | *Optional* | `False` | Flag to disable dither and noise shaping (raw truncation). |
 | `--tmp-dir` | *Optional* | `/tmp/upsample_scratch` | Custom fast NVMe scratch path for 64-bit memory-mapped buffers. |
