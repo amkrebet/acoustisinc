@@ -31,18 +31,15 @@ It delivers:
 - **Metadata & Album Art Preservation**: Lossless bit-perfect tag copying, ReplayGain retention, and embedded cover art extraction/sanitization.
 - **Strict FLAC Compression Level 5**: Consistent balanced lossless compression.
 
-### 2. Forensic Spectrum Analyzer (`analyser.py`)
+### 2. Interactive Real-Time Forensic Explorer (`server.py`)
+- **On-Demand Real-Time Analysis**: Dynamic library navigation with live 64-bit DSP forensic analysis in $\sim 0.8\text{s}$.
 - **Hi-Fi News Style Spectral Inspection**: Full-track Peak Hold and RMS noise floor traces.
-- **Automated Forensics**:
+- **Automated Forensics & Cutoff Detection**:
   - `[FAKE HI-RES / UPSAMPLED CD SOURCE]`: Detects sharp $>45\text{ dB}$ brick-wall cutoffs near $22.05\text{ kHz}$.
   - `[UPSAMPLED 48 kHz / 96 kHz SOURCE]`: Identifies $24\text{ kHz}$ and $48\text{ kHz}$ legacy digital master cutoffs.
   - `[NATIVE HI-RES MATERIAL]`: Verifies continuous acoustic harmonic extension into ultrasonic frequencies.
   - `[FILTER SIGNATURE]`: Measures transient asymmetry ratios to classify Linear Phase vs Minimum Phase filtering.
   - `[NOISE PROFILE]`: Identifies Psychoacoustic Noise Shaping rise ($+6\text{ dB} \to +20\text{ dB}$ HF rise), Flat TPDF dither, or DSD ultrasonic humps.
-- **High-DPI HTML5 Reports**: Generates self-contained interactive `.html` reports in $<300\text{ ms}$ with full zoom/pan and crosshairs.
-
-### 3. Interactive Web Application (`server.py`)
-- **On-Demand Real-Time Analysis**: Browse albums and click tracks to execute 64-bit DSP analysis in $\sim 0.8\text{s}$.
 - **Interactive Heatmap Canvas**: Zoom/pan with mouse wheel and drag; cursor HUD reveals **exact Time (s), Frequency (kHz), and Level (dBFS)** anywhere on the canvas.
 - **Built-in Lossless Audio Streaming**: Audition FLAC files directly in your browser while visually correlating audio transients with the spectrogram.
 
@@ -59,7 +56,7 @@ It delivers:
 
 ```bash
 # Clone repository
-git clone https://github.com/your-username/acoustisinc.git
+git clone https://github.com/amkrebet/acoustisinc.git
 cd acoustisinc
 
 # Create virtual environment
@@ -109,18 +106,6 @@ python upsampler.py "/path/to/source_music" "/path/to/upsampled_music" --phase a
 - `--dither {shibata, high_rate, none}`: 24-bit psychoacoustic noise shaping profile (default: `shibata`).
 - `--no-dither`: Disable dither and noise shaping (raw truncation).
 - `--tmp-dir /path/to/nvme`: Custom fast scratch directory for NVMe memory-mapped buffers.
-
----
-
-### 3. Running Single-File Forensic Analysis (`analyser.py`)
-
-Generate a standalone, self-contained interactive HTML5 forensic report for any audio track:
-
-```bash
-python analyser.py "/path/to/track.flac" --out "track_spectrum.html"
-```
-
-The generated `.html` report opens in any web browser with interactive zoom, pan, real-time cursor dB levels, and lab metrics.
 
 ---
 
