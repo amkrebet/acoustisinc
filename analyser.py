@@ -27,60 +27,6 @@ import matplotlib
 from PIL import Image
 
 
-def detect_filter_phase(y, sr, cutoff_hz):
-    """
-    Analyzes filter phase characteristics (Linear vs Minimum Phase) by examining 
-    pre-ringing vs post-ringing of isolated Nyquist transients.
-    """
-    nyq = sr / 2.0
-    low_cut = (cutoff_hz - 3000) / nyq
-    high_cut = min((cutoff_hz + 500) / nyq, 0.99)
-    
-    if low_cut <= 0:
-        return "Indeterminate"
-
-    b, a = signal.butter(4, [low_cut, high_cut], btype='bandpass')
-    y_band = signal.lfilter(b, a, y)
-    envelope = np.abs(y_band)
-    
-    distance_samples = int(sr * 0.05) 
-    peaks, _ = signal.find_peaks(envelope, distance=distance_samples)
-    
-    if len(peaks) == 0:
-        return "Indeterminate (No Transients Found)"
-        
-    peak_amps = envelope[peaks]
-    top_indices = np.argsort(peak_amps)[-20:]
-    top_peaks = peaks[top_indices]
-    
-    window_samples = int((3.0 / 1000.0) * sr)
-    gap_samples = int((0.1 / 1000.0) * sr)
-    
-    asymmetry_ratios = []
-    
-    for p in top_peaks:
-        if p - window_samples < 0 or p + window_samples >= len(y_band):
-            continue
-            
-        pre_rms = np.sqrt(np.mean(y[p - window_samples : p - gap_samples]**2))
-        post_rms = np.sqrt(np.mean(y[p + gap_samples : p + window_samples]**2))
-        
-        if pre_rms > 1e-9:
-            asymmetry_ratios.append(post_rms / pre_rms)
-            
-    if not asymmetry_ratios:
-        return "Indeterminate"
-        
-    avg_asymmetry = np.median(asymmetry_ratios)
-    
-    if avg_asymmetry < 1.6:
-        return f"LINEAR PHASE (Symmetric Pre/Post Ringing | Ratio: {avg_asymmetry:.2f})"
-    elif avg_asymmetry > 3.0:
-        return f"MINIMUM PHASE (Heavy Post-Ringing | Ratio: {avg_asymmetry:.2f})"
-    else:
-        return f"INTERMEDIATE / APODIZING (Asymmetric | Ratio: {avg_asymmetry:.2f})"
-
-
 def calculate_dynamic_range_metrics(y, sr):
     """
     Computes audiophile and broadcast dynamic range & loudness metrics with strict 64-bit precision:
@@ -276,10 +222,6 @@ def analyze_audio_forensics(y, sr):
             effective_cutoff_hz = nyquist
             report.append("\nASSESSMENT: [NATIVE HI-RES MATERIAL]")
             report.append("  -> Continuous harmonic energy extending well into the ultrasonic band.")
-            
-        if is_upsampled:
-            phase_report = detect_filter_phase(y, sr, cutoff_hz=detected_base_hz)
-            report.append(f"  -> FILTER SIGNATURE: {phase_report}")
 
     report.insert(3, f"Effective Signal Bandwidth: ~{effective_cutoff_hz/1000:.1f} kHz")
 

@@ -182,17 +182,14 @@ def analyze_file_on_demand(filepath):
 
         webp_b64, lookup_b64, lookup_w, lookup_h = encode_spectrogram_and_lookup(spec_db)
 
-        # Extract verdict, noise profile, and filter signature
+        # Extract verdict and noise profile
         verdict = "ANALYZED"
         noise_profile = ""
-        filter_signature = ""
         for line in assessment_text.splitlines():
             if line.startswith("ASSESSMENT:"):
                 verdict = line.replace("ASSESSMENT:", "").strip()
             elif line.startswith("NOISE PROFILE:"):
                 noise_profile = line.replace("NOISE PROFILE:", "").strip().strip("[]")
-            elif "FILTER SIGNATURE:" in line:
-                filter_signature = line.split("FILTER SIGNATURE:")[-1].strip()
 
         return {
             "status": "ok",
@@ -203,7 +200,6 @@ def analyze_file_on_demand(filepath):
             "duration_s": duration_s,
             "verdict": verdict,
             "noise_profile": noise_profile,
-            "filter_signature": filter_signature,
             "dr_score": dr_metrics.get("dr_score", 0),
             "dr_val": dr_metrics.get("dr_val", 0.0),
             "crest_factor_db": dr_metrics.get("crest_factor_db", 0.0),
@@ -648,7 +644,6 @@ HTML_PAGE = """<!DOCTYPE html>
                             <div id="verdictBadge" class="badge-hires" style="font-size: 0.82rem; padding: 4px 10px;">--</div>
                             <div id="drBadge" class="badge-hires" style="font-size: 0.82rem; padding: 4px 10px; display: none;">--</div>
                             <div id="noiseBadge" class="badge-cd" style="font-size: 0.82rem; padding: 4px 10px; display: none;">--</div>
-                            <div id="filterBadge" class="badge-cd" style="font-size: 0.82rem; padding: 4px 10px; display: none;">--</div>
                         </div>
                     </div>
                     <audio id="audioPlayer" controls></audio>
@@ -934,18 +929,6 @@ HTML_PAGE = """<!DOCTYPE html>
                     }
                 } else {
                     nBadge.style.display = 'none';
-                }
-
-                // Filter signature badge
-                const fBadge = document.getElementById('filterBadge');
-                if (data.filter_signature && !data.filter_signature.includes('Indeterminate')) {
-                    fBadge.style.display = 'inline-block';
-                    fBadge.textContent = data.filter_signature.split('(')[0].trim();
-                    fBadge.style.background = '#21262d';
-                    fBadge.style.borderColor = '#30363d';
-                    fBadge.style.color = '#c9d1d9';
-                } else {
-                    fBadge.style.display = 'none';
                 }
 
                 // Audio stream player
