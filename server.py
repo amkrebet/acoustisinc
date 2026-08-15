@@ -56,59 +56,69 @@ def get_directory_contents(target_path):
         target_path = os.path.expanduser(target_path)
     target_path = os.path.abspath(target_path)
 
-    if not os.path.exists(target_path) or not os.path.isdir(target_path):
-        return None
+    if not os.path.exists(target_path):
+        return {"error": f"Path does not exist: {target_path}"}
+    if not os.path.isdir(target_path):
+        return {"error": f"Path is not a directory: {target_path}"}
 
     folders = []
     files = []
 
     try:
         entries = sorted(os.listdir(target_path), key=lambda s: s.lower())
-    except Exception:
-        return None
+    except Exception as e:
+        return {"error": f"Cannot read directory: {str(e)}"}
 
     for name in entries:
         if name.startswith("."):
             continue
         full_path = os.path.join(target_path, name)
 
-        if os.path.isdir(full_path):
-            # Count audio files inside
-            audio_count = 0
-            try:
-                sub_entries = os.listdir(full_path)
-                audio_count = sum(1 for e in sub_entries if e.lower().endswith(('.flac', '.wav', '.aiff', '.m4a', '.mp3')) and not e.endswith('.WIP') and not e.startswith('.'))
-            except Exception:
-                pass
-            folders.append({
-                "name": name,
-                "path": full_path,
-                "audio_count": audio_count
-            })
+        try:
+            if os.path.isdir(full_path):
+                audio_count = 0
+                try:
+                    sub_entries = os.listdir(full_path)
+                    audio_count = sum(1 for e in sub_entries if e.lower().endswith(('.flac', '.wav', '.aiff', '.m4a', '.mp3')) and not e.endswith('.WIP') and not e.startswith('.'))
+                except Exception:
+                    pass
+                folders.append({
+                    "name": name,
+                    "path": full_path,
+                    "audio_count": audio_count
+                })
 
-        elif os.path.isfile(full_path) and name.lower().endswith(('.flac', '.wav', '.aiff', '.m4a', '.mp3')) and not name.endswith('.WIP'):
-            file_meta = {
-                "name": name,
-                "path": full_path,
-                "size_bytes": os.path.getsize(full_path),
-                "size_str": format_bytes(os.path.getsize(full_path)),
-                "samplerate": 0,
-                "channels": 0,
-                "duration_str": "--:--",
-                "is_hires": False
-            }
-            try:
-                info = sf.info(full_path)
-                file_meta["samplerate"] = info.samplerate
-                file_meta["channels"] = info.channels
-                file_meta["duration_s"] = info.duration
-                file_meta["duration_str"] = format_seconds(info.duration)
-                file_meta["is_hires"] = info.samplerate > 48000
-                file_meta["subtype"] = info.subtype
-            except Exception:
-                pass
+            elif os.path.isfile(full_path) and name.lower().endswith(('.flac', '.wav', '.aiff', '.m4a', '.mp3')) and not name.endswith('.WIP'):
+                size_bytes = 0
+                try:
+                    size_bytes = os.path.getsize(full_path)
+                except Exception:
+                    pass
 
-            files.append(file_meta)
+                file_meta = {
+                    "name": name,
+                    "path": full_path,
+                    "size_bytes": size_bytes,
+                    "size_str": format_bytes(size_bytes),
+                    "samplerate": 0,
+                    "channels": 0,
+                    "duration_str": "--:--",
+                    "is_hires": False
+                }
+                try:
+                    info = sf.info(full_path)
+                    file_meta["samplerate"] = info.samplerate
+                    file_meta["channels"] = info.channels
+                    file_meta["duration_s"] = info.duration
+                    file_meta["duration_str"] = format_seconds(info.duration)
+                    file_meta["is_hires"] = info.samplerate > 48000
+                    file_meta["subtype"] = info.subtype
+                except Exception:
+                    pass
+
+                files.append(file_meta)
+        except Exception:
+            continue
 
     # Build breadcrumbs
     parts = []
@@ -793,26 +803,26 @@ HTML_PAGE = """<!DOCTYPE html>
 
             // Files
             const filteredFiles = directoryData.files.filter(f => !filter || f.name.toLowerCase().includes(filter));
-            filteredFiles.forEach(f => {
+            filteredFiles.forEach((f, idx) => {
                 const div = document.createElement('div');
                 div.className = 'file-item';
-                div.id = `file-${btoa(f.path).replace(/=/g, '')}`;
+                div.id = `file-item-${idx}`;
                 
                 const badgeClass = f.is_hires ? 'badge-hires' : 'badge-cd';
                 const badgeText = f.samplerate ? `${(f.samplerate/1000).toFixed(1)}k` : 'FLAC';
 
                 div.innerHTML = `
                     <div class="file-top">
-                        <div class="file-title">🎵 ${f.name}</div>
+                        <div class="file-title">🎵 ${escapeHtml(f.name)}</div>
                         <span class="${badgeClass}">${badgeText}</span>
                     </div>
                     <div class="file-meta">
                         <span>⏱ ${f.duration_str}</span>
                         <span>📦 ${f.size_str}</span>
-                        ${f.subtype ? `<span>${f.subtype}</span>` : ''}
+                        ${f.subtype ? `<span>${escapeHtml(f.subtype)}</span>` : ''}
                     </div>
                 `;
-                div.onclick = () => analyzeTrack(f);
+                div.onclick = () => analyzeTrack(f, div);
                 treeList.appendChild(div);
             });
 
@@ -821,16 +831,22 @@ HTML_PAGE = """<!DOCTYPE html>
             }
         }
 
-        async function analyzeTrack(file) {
+        function escapeHtml(text) {
+            if (!text) return '';
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        async function analyzeTrack(file, fileEl) {
             document.querySelectorAll('.file-item').forEach(el => el.classList.remove('active'));
-            const fileEl = document.getElementById(`file-${btoa(file.path).replace(/=/g, '')}`);
             if (fileEl) fileEl.classList.add('active');
 
             const emptyState = document.getElementById('emptyState');
             const analysisContent = document.getElementById('analysisContent');
 
             emptyState.style.display = 'flex';
-            emptyState.innerHTML = `<div class="spinner"></div><p style="margin-top: 12px;">Running 64-bit DSP Forensic Analysis on <strong>${file.name}</strong>...</p>`;
+            emptyState.innerHTML = `<div class="spinner"></div><p style="margin-top: 12px;">Running 64-bit DSP Forensic Analysis on <strong>${escapeHtml(file.name)}</strong>...</p>`;
             analysisContent.style.display = 'none';
 
             try {
