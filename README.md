@@ -2,6 +2,8 @@
 
 > **High-Performance GPU-Accelerated 64-Bit Sinc Audio Upsampler & Interactive Forensic Spectral Analyzer**
 
+![AcoustiSinc Forensic Spectral Analysis](analyser_example.png)
+
 ---
 
 ## 🌟 Overview
