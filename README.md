@@ -14,9 +14,10 @@ It delivers:
 1. **Mathematical Purity**: Strict **64-bit double precision (`float64` / `complex128` / OpenCL `double2`)** maintained end-to-end across all FFTs, filtering kernels, and noise-shaping algorithms.
 2. **GPU Sinc Upsampling**: High-throughput OpenCL-accelerated band-limited Whittaker–Shannon Sinc interpolation supporting **Linear Phase**, **Minimum Phase**, and **Apodizing** impulse responses.
 3. **Advanced Psychoacoustic Noise Shaping**: 4th-order multi-band noise-shaping curves (Shibata & High-Rate) moving dither energy safely into the high ultrasonic spectrum ($>35\text{ kHz}$).
-4. **Forensic Cutoff & Fake Hi-Res Detection**: Automated acoustic analysis identifying upsampled CD masters, brick-wall filter cutoffs, zero-stuffing, filter phase signatures, and ultrasonic noise profiles.
-5. **Audiophile Dynamic Range (DR) Scoring**: Official 64-bit Pleasurize Music Foundation (PMF) TT Dynamic Range Meter scoring alongside EBU R128 Loudness Range (LRA) and Integrated LUFS.
-6. **Interactive Web Explorer**: A real-time, on-demand browser application providing dynamic library navigation, live DSP spectral analysis in under 1 second, interactive spectrograms with exact cursor dB level readouts, and in-browser lossless playback.
+4. **Dynamic Gain Structure & Auto-Healing**: Pre-flight album headroom scanning with exact overshoot-calculated auto-healing guaranteeing zero intersample clipping.
+5. **Forensic Cutoff & Fake Hi-Res Detection**: Automated acoustic analysis identifying upsampled CD masters, brick-wall filter cutoffs, zero-stuffing, filter phase signatures, and ultrasonic noise profiles.
+6. **Audiophile Dynamic Range (DR) Scoring**: Official 64-bit Pleasurize Music Foundation (PMF) TT Dynamic Range Meter scoring alongside EBU R128 Loudness Range (LRA) and Integrated LUFS.
+7. **Interactive Web Explorer**: A real-time, on-demand browser application providing dynamic library navigation, live DSP spectral analysis in under 1 second, interactive spectrograms with exact cursor dB level readouts, and in-browser lossless playback.
 
 ---
 
@@ -24,11 +25,11 @@ It delivers:
 
 ### 1. Mastering-Grade Sinc Upsampler (`upsampler.py`)
 - **Auto-Integer Ratio Scaling**: Upsamples $44.1\text{ kHz} \to 176.4\text{ kHz}$ ($4\times$) and $48\text{ kHz} \to 192\text{ kHz}$ ($4\times$) without fractional alias artifacts.
-- **Phase Modes**:
+- **Filter Topologies**:
   - `linear`: True symmetric linear-phase band-limited Sinc reconstruction.
   - `min` / `minimum`: Causal minimum-phase reconstruction eliminating all pre-ringing for crisp transient attack.
-  - `apodizing`: Apodizing transition band to attenuate pre-existing ADC brick-wall ripple.
-- **Intersample Headroom Management**: Pre-flight album gain scans with auto-healing to guarantee **zero intersample clipping** ($0\text{ dBFS}$ true peak compliance).
+  - `--apodizing`: Apodizing transition band to attenuate pre-existing ADC brick-wall ringing (can be combined with Linear or Minimum Phase).
+- **Intersample Headroom Management**: Pre-flight album gain scans with exact overshoot auto-healing to guarantee **zero intersample clipping** ($0\text{ dBFS}$ true peak compliance).
 - **Metadata & Album Art Preservation**: Lossless bit-perfect tag copying, ReplayGain retention, and embedded cover art extraction/sanitization.
 - **Strict FLAC Compression Level 5**: Consistent balanced lossless compression.
 
@@ -44,6 +45,26 @@ It delivers:
   - `[DYNAMIC RANGE]`: Official **TT Dynamic Range (DR Score e.g. DR12)**, **EBU R128 Loudness Range (LRA)**, and **Integrated LUFS**.
 - **Interactive Heatmap Canvas**: Zoom/pan with mouse wheel and drag; cursor HUD reveals **exact Time (s), Frequency (kHz), and Level (dBFS)** anywhere on the canvas.
 - **Built-in Lossless Audio Streaming**: Audition FLAC files directly in your browser while visually correlating audio transients with the spectrogram.
+
+---
+
+## 🛡️ Intersample Headroom & Dynamic Gain Structure
+
+Upsampling band-limited audio reconstructs the continuous analog waveform between discrete digital samples. On heavily mastered or brick-wall limited audio, this natural mathematical curve reconstruction creates **intersample true-peak overshoots** that easily exceed $0\text{ dBFS}$.
+
+AcoustiSinc uses an intelligent **2-Stage Dynamic Gain Architecture** to guarantee absolute zero intersample clipping while preserving maximum dynamic range:
+
+### 1. Stage 1: Pre-Flight Album Headroom Scan
+- Prior to upsampling, all audio tracks in an album folder are scanned in parallel to measure the global album peak (`album_max_peak_db`).
+- An initial calculated gain normalization factor is applied with a calibrated $+2.4\text{ dB}$ intersample crest margin:
+  $$\text{Initial Gain Factor} = \frac{10^{-0.3 / 20}}{10^{(\text{album\_max\_peak\_db} + 2.4) / 20}}$$
+- Preserves 100% of relative inter-track volume relationships across the entire album.
+
+### 2. Stage 2: Exact Overshoot Auto-Healing
+- Every upsampled track is scanned in 64-bit double precision across its full output buffer for true intersample peak compliance against the $-0.3\text{ dBFS}$ ceiling (`PEAK_TARGET_DB`).
+- If an extreme track exceeds $-0.3\text{ dBFS}$ due to intense harmonic reconstruction, the engine captures the exact true peak overshoot and calculates the precise dynamic backoff:
+  $$\text{Exact Backoff Factor} = \left(\frac{\text{PEAK\_TARGET\_LIN}}{\text{max\_overshoot\_peak}}\right) \times 10^{-0.2 / 20}$$
+- The album pass is cleanly restarted with this exact gain factor, resolving the clipping in a **single retry** without unnecessary iterative volume loss.
 
 ---
 
@@ -164,6 +185,7 @@ python upsampler.py "/path/to/source_music"
 | **Stopband Attenuation** | $>140\text{ dB}$ rejection |
 | **Passband Ripple** | $< \pm 0.00001\text{ dB}$ ($0\text{ Hz} \to 20\text{ kHz}$) |
 | **Intersample Headroom** | Guaranteed $\ge 0.3\text{ dBFS}$ margin with pre-scan gain normalization |
+| **Headroom Healing** | Exact overshoot-calculated dynamic backoff on clipping retry |
 | **Dither Resolution** | 24-bit TPDF with 4th-order Psychoacoustic Noise Shaping |
 | **Dynamic Range Standards** | TT Dynamic Range Meter (PMF DR Score) & EBU R128 / ITU-R BS.1770-4 LRA |
 | **FLAC Output** | Bit-perfect Level 5 ($0.625$) with complete Vorbis Comment & Picture replication |
