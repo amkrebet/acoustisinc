@@ -29,12 +29,8 @@ import numpy as np
 from analyser import analyze_audio_forensics, encode_spectrogram_and_lookup
 
 
-BOOKMARKS = [
-    {"name": "1xxK_min (Upsampled)", "path": "/mnt/PrimaryFS/1xxK_min/music"},
-    {"name": "FLAC_music (Source)", "path": "/mnt/PrimaryFS/FLAC_music/music"},
-    {"name": "1xxK (Upsampled)", "path": "/mnt/PrimaryFS/1xxK/music"},
-    {"name": "Workspace", "path": "/home/amkrebet/upsample"}
-]
+# Default root directory for initial browsing
+INITIAL_ROOT = os.getcwd()
 
 
 def format_bytes(size):
@@ -54,6 +50,12 @@ def get_directory_contents(target_path):
     """
     Lists subdirectories and audio files in target_path with rich metadata.
     """
+    if not target_path or not str(target_path).strip():
+        target_path = INITIAL_ROOT
+    if str(target_path).startswith("~"):
+        target_path = os.path.expanduser(target_path)
+    target_path = os.path.abspath(target_path)
+
     if not os.path.exists(target_path) or not os.path.isdir(target_path):
         return None
 
@@ -588,7 +590,13 @@ HTML_PAGE = """<!DOCTYPE html>
             <span>🔬 Hi-Res Audio Forensic Explorer</span>
             <span class="brand-badge">HTML5 Dynamic DSP</span>
         </div>
-        <div class="bookmarks" id="bookmarkContainer"></div>
+        <div style="display: flex; align-items: center; gap: 8px; flex: 1; max-width: 680px;">
+            <input type="text" id="pathBar" class="search-box" style="flex: 1; margin: 0; padding: 6px 12px; font-size: 0.85rem;" placeholder="Enter folder path (e.g. /path/to/music or ~)...">
+            <button class="btn" onclick="navigateToPathBar()" style="padding: 6px 12px; font-weight: bold;">Go</button>
+            <button class="btn" onclick="loadDirectory('.')" title="Initial Directory">📍 Start</button>
+            <button class="btn" onclick="loadDirectory('~')" title="User Home">🏠 Home</button>
+            <button class="btn" onclick="loadDirectory('/')" title="Root Filesystem">📂 Root</button>
+        </div>
     </header>
 
     <div class="main-layout">
@@ -700,19 +708,17 @@ HTML_PAGE = """<!DOCTYPE html>
     </div>
 
     <script>
-        const bookmarks = """ + json.dumps(BOOKMARKS) + """;
-        let currentPath = bookmarks[0].path;
+        let currentPath = '';
         let currentAnalysis = null;
         let directoryData = null;
 
-        // Render bookmarks
-        const bContainer = document.getElementById('bookmarkContainer');
-        bookmarks.forEach(b => {
-            const btn = document.createElement('button');
-            btn.className = 'btn-bookmark';
-            btn.textContent = b.name;
-            btn.onclick = () => loadDirectory(b.path);
-            bContainer.appendChild(btn);
+        function navigateToPathBar() {
+            const p = document.getElementById('pathBar').value.trim();
+            loadDirectory(p || '.');
+        }
+
+        document.getElementById('pathBar').addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') navigateToPathBar();
         });
 
         // Search filtering
@@ -721,17 +727,25 @@ HTML_PAGE = """<!DOCTYPE html>
         });
 
         async function loadDirectory(path) {
-            currentPath = path;
+            const player = document.getElementById('audioPlayer');
+            if (player && !player.paused) player.pause();
+
+            currentPath = path || '';
             const treeList = document.getElementById('treeList');
             treeList.innerHTML = '<div style="padding: 20px; text-align: center; color: #8b949e;"><div class="spinner" style="margin: 0 auto 10px;"></div>Loading directory...</div>';
 
             try {
-                const res = await fetch(`/api/browse?path=${encodeURIComponent(path)}`);
+                const res = await fetch(`/api/browse?path=${encodeURIComponent(currentPath)}`);
                 directoryData = await res.json();
+                if (directoryData.error) {
+                    throw new Error(directoryData.error);
+                }
+                currentPath = directoryData.current_path;
+                document.getElementById('pathBar').value = currentPath;
                 renderBreadcrumbs(directoryData.breadcrumbs, directoryData.parent_path);
-                renderDirectory('');
+                renderDirectory(document.getElementById('searchBox').value.toLowerCase());
             } catch (err) {
-                treeList.innerHTML = `<div style="padding: 20px; color: var(--accent-red);">Failed to load directory: ${err.message}</div>`;
+                treeList.innerHTML = `<div style="padding: 20px; color: var(--accent-red); text-align: center;">Failed to load directory:<br><small>${err.message}</small></div>`;
             }
         }
 
@@ -1490,7 +1504,7 @@ class ForensicWebHandler(BaseHTTPRequestHandler):
             self.wfile.write(HTML_PAGE.encode("utf-8"))
 
         elif path == "/api/browse":
-            target = params.get("path", ["/mnt/PrimaryFS/1xxK_min/music"])[0]
+            target = params.get("path", [""])[0]
             data = get_directory_contents(target)
             if data is None:
                 self.send_response(404)
@@ -1577,21 +1591,28 @@ class ForensicWebHandler(BaseHTTPRequestHandler):
 
 
 def main():
+    global INITIAL_ROOT
     parser = argparse.ArgumentParser(description="Hi-Res Audio Forensic Explorer Web Server")
+    parser.add_argument("--root", default=os.getcwd(), help="Initial directory to browse (default: current working directory)")
     parser.add_argument("--port", type=int, default=8765, help="HTTP server port (default: 8765)")
     parser.add_argument("--host", default="0.0.0.0", help="HTTP server host (default: 0.0.0.0)")
     args = parser.parse_args()
+
+    INITIAL_ROOT = os.path.abspath(os.path.expanduser(args.root))
+    if not os.path.exists(INITIAL_ROOT):
+        INITIAL_ROOT = os.getcwd()
 
     server_address = (args.host, args.port)
     httpd = ThreadingHTTPServer(server_address, ForensicWebHandler)
     print(f"\n=======================================================")
     print(f"🔬 HI-RES AUDIO FORENSIC EXPLORER (WEB APPLICATION)")
     print(f"=======================================================")
-    print(f"Server URL : http://localhost:{args.port}")
-    print(f"Network URL: http://{args.host}:{args.port}")
-    print(f"Mode       : Multi-Threaded Concurrent I/O")
-    print(f"Precision  : 64-bit Double Precision (Strict float64)")
-    print(f"Status     : Live & Ready for On-Demand Analysis")
+    print(f"Initial Root: {INITIAL_ROOT}")
+    print(f"Server URL  : http://localhost:{args.port}")
+    print(f"Network URL : http://{args.host}:{args.port}")
+    print(f"Mode        : Multi-Threaded Concurrent I/O")
+    print(f"Precision   : 64-bit Double Precision (Strict float64)")
+    print(f"Status      : Live & Ready for On-Demand Analysis")
     print(f"=======================================================\n")
 
     try:

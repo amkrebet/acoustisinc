@@ -29,7 +29,7 @@ It delivers:
 - **Metadata & Album Art Preservation**: Lossless bit-perfect tag copying, ReplayGain retention, and embedded cover art extraction/sanitization.
 - **Strict FLAC Compression Level 5**: Consistent balanced lossless compression.
 
-### 2. Forensic Spectrum Analyzer (`analyser.py` & `batch_analyser.py`)
+### 2. Forensic Spectrum Analyzer (`analyser.py`)
 - **Hi-Fi News Style Spectral Inspection**: Full-track Peak Hold and RMS noise floor traces.
 - **Automated Forensics**:
   - `[FAKE HI-RES / UPSAMPLED CD SOURCE]`: Detects sharp $>45\text{ dB}$ brick-wall cutoffs near $22.05\text{ kHz}$.
@@ -77,61 +77,48 @@ pip install -r requirements.txt
 Launch the interactive web application server:
 
 ```bash
-python server.py --port 8765
+python server.py --root "/path/to/music" --port 8765
 ```
 
-Open **`http://localhost:8765`** in your browser to browse directories, analyze tracks on the fly, and inspect spectral profiles.
+Open **`http://localhost:8765`** in your browser. You can navigate directories using the path input bar, quick-jump buttons (`Start`, `Home`, `Root`), or the interactive sidebar tree. Click any track to run live DSP forensic analysis in under a second with interactive zooming, dB level inspection, and lossless audio streaming.
 
 ---
 
-### 2. Running the GPU Sinc Upsampler
+### 2. Running the GPU Sinc Upsampler (`upsampler.py`)
 
 #### Basic Usage
-Upsample a directory of FLAC files:
+Upsample a directory of audio tracks or a full recursive library from a source folder into a destination folder:
 
 ```bash
-# Minimum-Phase upsampling (default Shibata noise shaping)
-python upsampler.py "/path/to/source/music" --phase min
+# Minimum-Phase upsampling from source to target
+python upsampler.py "/path/to/source_music" "/path/to/upsampled_music" --phase min
 
 # Linear-Phase upsampling
-python upsampler.py "/path/to/source/music" --phase linear
+python upsampler.py "/path/to/source_music" "/path/to/upsampled_music" --phase linear
 
 # Apodizing filter mode
-python upsampler.py "/path/to/source/music" --phase apodizing
+python upsampler.py "/path/to/source_music" "/path/to/upsampled_music" --phase apodizing
 ```
 
-#### Command-Line Arguments
-- `source_dir`: Path to audio file or directory containing album folders.
+#### Command-Line Options
+- `source`: Path to a single audio file or root directory containing album folders.
+- `target` (or `-o`, `--output-dir`): Target destination root directory (preserves source album subfolder hierarchy). If omitted, automatically defaults to `<source>_upsampled_<phase>`.
 - `--phase {linear, min, apodizing}`: Sinc filter phase characteristic (default: `linear`).
-- `--dither {shibata, high_rate, none}`: 24-bit psychoacoustic dither profile (default: `shibata`).
+- `--dither {shibata, high_rate, none}`: 24-bit psychoacoustic noise shaping profile (default: `shibata`).
 - `--no-dither`: Disable dither and noise shaping (raw truncation).
-- `--tmp-dir /path/to/nvme`: Custom fast scratch directory for memory-mapped buffers.
+- `--tmp-dir /path/to/nvme`: Custom fast scratch directory for NVMe memory-mapped buffers.
 
 ---
 
-### 3. Running Single-File Forensic Analysis
+### 3. Running Single-File Forensic Analysis (`analyser.py`)
 
-Generate a self-contained interactive HTML5 forensic report:
+Generate a standalone, self-contained interactive HTML5 forensic report for any audio track:
 
 ```bash
 python analyser.py "/path/to/track.flac" --out "track_spectrum.html"
 ```
 
-The output `.html` report opens in any web browser with full interactive zoom, pan, cursor dB levels, and lab metrics.
-
----
-
-### 4. Running Full Library Batch Analysis
-
-Recursively analyze an entire music library and generate HTML reports in dedicated `spectrum_analysis/` subfolders:
-
-```bash
-# Scan and analyze library (automatically skips pre-existing reports)
-python batch_analyser.py --root "/path/to/music" --workers 4
-
-# Force re-analysis of all files
-python batch_analyser.py --root "/path/to/music" --force
-```
+The generated `.html` report opens in any web browser with interactive zoom, pan, real-time cursor dB levels, and lab metrics.
 
 ---
 

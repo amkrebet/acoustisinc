@@ -548,19 +548,15 @@ def is_memmap_necessary(orig_samples, scale_factor, num_channels):
         return required_bytes > (available_ram * 0.40)
     return required_bytes > (4.5 * 1024 * 1024 * 1024)
 
-def get_folder_tag(phase_mode):
-    p = phase_mode.lower()
-    if p in ['min', 'minimum']: return "1xxK_min"
-    elif p in ['intermediate', 'apodizing', 'apod']: return "1xxK_apod"
-    else: return "1xxK_GPU"
-
-def get_destination_dir(current_dir, folder_tag):
-    if "FLAC_music" in current_dir:
-        return current_dir.replace("FLAC_music", folder_tag, 1)
-    else:
-        parent = os.path.dirname(current_dir.rstrip(os.sep))
-        current_name = os.path.basename(current_dir.rstrip(os.sep))
-        return os.path.join(parent, f"{current_name}_{folder_tag}")
+def get_destination_dir(source_dir, root_source_dir, root_target_dir):
+    """
+    Computes the corresponding output directory for an album folder,
+    preserving the source subdirectory hierarchy under root_target_dir.
+    """
+    if os.path.abspath(source_dir) == os.path.abspath(root_source_dir):
+        return root_target_dir
+    rel_path = os.path.relpath(source_dir, root_source_dir)
+    return os.path.join(root_target_dir, rel_path)
 
 def get_audio_files(directory):
     audio_files = []
@@ -763,27 +759,24 @@ def process_track(filepath, dest_dir, gain_factor, album_max_peak_lin, queue, ph
 # ALBUM BATCH CONTROLLER WITH RETRY AUTO-HEALING
 # ==============================================================================
 
-def process_album_folder(target_dir, queue, phase_mode, dither_mode, tmp_dir):
-    folder_tag = get_folder_tag(phase_mode)
-    dest_dir = get_destination_dir(target_dir, folder_tag)
-
+def process_album_folder(source_album_dir, dest_album_dir, queue, phase_mode, dither_mode, tmp_dir):
     print(f"\n==================================================")
-    print(f"Directory:   {target_dir}")
-    print(f"Destination: {dest_dir}")
+    print(f"Directory:   {source_album_dir}")
+    print(f"Destination: {dest_album_dir}")
     print(f"==================================================")
 
-    files = get_audio_files(target_dir)
+    files = get_audio_files(source_album_dir)
     if not files: return
-    if all(os.path.exists(os.path.join(dest_dir, os.path.basename(f))) for f in files):
-        print(f">>> All {len(files)} target files already exist in {dest_dir}. Skipping album.")
+    if all(os.path.exists(os.path.join(dest_album_dir, os.path.basename(f))) for f in files):
+        print(f">>> All {len(files)} target files already exist in {dest_album_dir}. Skipping album.")
         return
 
-    os.makedirs(dest_dir, exist_ok=True)
+    os.makedirs(dest_album_dir, exist_ok=True)
     try:
-        with os.scandir(target_dir) as entries:
+        with os.scandir(source_album_dir) as entries:
             for entry in entries:
                 if entry.is_file() and entry.name.lower().endswith(('.jpg', '.jpeg', '.png', '.gif')):
-                    dst_img = os.path.join(dest_dir, entry.name)
+                    dst_img = os.path.join(dest_album_dir, entry.name)
                     if not os.path.exists(dst_img): shutil.copy2(entry.path, dst_img)
     except Exception: pass
 
@@ -796,7 +789,7 @@ def process_album_folder(target_dir, queue, phase_mode, dither_mode, tmp_dir):
 
         for idx, f in enumerate(files, 1):
             print(f"\n--- Track [{idx}/{len(files)}] ---")
-            clipped, fut = process_track(f, dest_dir, gain_factor, album_max_peak_lin, queue, phase_mode, dither_mode, tmp_dir)
+            clipped, fut = process_track(f, dest_album_dir, gain_factor, album_max_peak_lin, queue, phase_mode, dither_mode, tmp_dir)
             if fut is not None:
                 pass_futures.append(fut)
             if clipped:
@@ -818,7 +811,7 @@ def process_album_folder(target_dir, queue, phase_mode, dither_mode, tmp_dir):
                 except Exception: pass
 
             for f in files:
-                out_f = os.path.join(dest_dir, os.path.basename(f))
+                out_f = os.path.join(dest_album_dir, os.path.basename(f))
                 if os.path.exists(out_f):
                     try: os.remove(out_f)
                     except Exception: pass
@@ -837,43 +830,69 @@ def process_album_folder(target_dir, queue, phase_mode, dither_mode, tmp_dir):
 
 def main():
     parser = argparse.ArgumentParser(description="AcoustiSinc: GPU-Accelerated 64-Bit Sinc Audio Upsampler")
-    parser.add_argument("source_dir", nargs="?", default=os.getcwd())
-    parser.add_argument("--phase", choices=['linear', 'min', 'minimum', 'intermediate', 'apodizing', 'apod'], default='linear')
-    parser.add_argument("--dither", choices=['shibata', 'high_rate', 'none'], default='shibata')
-    parser.add_argument("--no-dither", action="store_true")
-    parser.add_argument("--tmp-dir", default=DEFAULT_TMP_DIR)
+    parser.add_argument("source", help="Source audio file or root directory containing album folders")
+    parser.add_argument("target", nargs="?", default=None, help="Target output directory (optional, default: <source>_upsampled_<phase>)")
+    parser.add_argument("-o", "--output-dir", default=None, help="Explicit target output directory")
+    parser.add_argument("--phase", choices=['linear', 'min', 'minimum', 'intermediate', 'apodizing', 'apod'], default='linear', help="Filter phase mode (default: linear)")
+    parser.add_argument("--dither", choices=['shibata', 'high_rate', 'none'], default='shibata', help="Dither & noise shaping mode (default: shibata)")
+    parser.add_argument("--no-dither", action="store_true", help="Disable dither and noise shaping")
+    parser.add_argument("--tmp-dir", default=DEFAULT_TMP_DIR, help="Scratch directory for NVMe memory-mapped buffers")
     args = parser.parse_args()
 
-    root_dir = os.path.abspath(args.source_dir)
+    source_path = os.path.abspath(args.source)
+    if not os.path.exists(source_path):
+        print(f"[Error] Source path not found: {source_path}")
+        sys.exit(1)
+
+    target_dir = args.output_dir or args.target
+    if not target_dir:
+        phase_suffix = "min" if args.phase.lower() in ['min', 'minimum'] else ("apod" if args.phase.lower() in ['apod', 'apodizing', 'intermediate'] else "linear")
+        if os.path.isfile(source_path):
+            parent = os.path.dirname(source_path)
+            target_dir = os.path.join(parent, f"upsampled_{phase_suffix}")
+        else:
+            target_dir = f"{source_path.rstrip(os.sep)}_upsampled_{phase_suffix}"
+
+    target_dir = os.path.abspath(target_dir)
     dither_mode = "none" if args.no_dither else args.dither
     tmp_dir = os.path.abspath(args.tmp_dir)
     os.makedirs(tmp_dir, exist_ok=True)
-    folder_tag = get_folder_tag(args.phase)
 
-    print(f"\n[AcoustiSinc] Source Directory  : {root_dir}")
-    print(f"[AcoustiSinc] Phase Mode        : {args.phase.upper()}")
-    print(f"[AcoustiSinc] Parallel Routing  : {folder_tag}")
-    print(f"[AcoustiSinc] Noise Shaping     : {dither_mode.upper()} (In-Register Double Precision)")
-    print(f"[AcoustiSinc] FLAC Compression  : Level 5 (Strict)")
-    print(f"[AcoustiSinc] Precision         : 64-bit Double Precision (Strict)")
+    print(f"\n=======================================================")
+    print(f"ACOUSTISINC: 64-BIT GPU SINC AUDIO UPSAMPLER")
+    print(f"=======================================================")
+    print(f"Source Path     : {source_path}")
+    print(f"Destination Path: {target_dir}")
+    print(f"Phase Mode      : {args.phase.upper()}")
+    print(f"Noise Shaping   : {dither_mode.upper()} (In-Register Double Precision)")
+    print(f"FLAC Compression: Level 5 (Strict)")
+    print(f"Precision       : 64-bit Double Precision (Strict)")
+    print(f"=======================================================\n")
 
     ctx = cl.create_some_context(interactive=False)
     queue = cl.CommandQueue(ctx)
 
-    if os.path.isfile(root_dir):
-        dest_dir = get_destination_dir(os.path.dirname(root_dir), folder_tag)
-        os.makedirs(dest_dir, exist_ok=True)
-        gain_factor, pk = scan_album([root_dir])
-        process_track(root_dir, dest_dir, gain_factor, pk, queue, args.phase, dither_mode, tmp_dir)
+    if os.path.isfile(source_path):
+        os.makedirs(target_dir, exist_ok=True)
+        gain_factor, pk = scan_album([source_path])
+        process_track(source_path, target_dir, gain_factor, pk, queue, args.phase, dither_mode, tmp_dir)
         file_writer_pool.shutdown(wait=True)
         return
 
-    album_directories = sorted({r for r, d, f in os.walk(root_dir) if not any(s in r for s in SKIP_TAGS) and any(x.lower().endswith(('.flac', '.wav')) for x in f)})
-    if not album_directories: return
+    # Discover all subdirectories containing FLAC or WAV files
+    album_directories = sorted({
+        r for r, d, f in os.walk(source_path)
+        if not os.path.abspath(r).startswith(target_dir) and any(x.lower().endswith(('.flac', '.wav')) for x in f)
+    })
+
+    if not album_directories:
+        print(f"[AcoustiSinc] No FLAC or WAV files found under {source_path}")
+        return
 
     for idx, album_dir in enumerate(album_directories, 1):
+        dest_album_dir = get_destination_dir(album_dir, source_path, target_dir)
         print(f"\n==================================================\n[Album {idx}/{len(album_directories)}]")
-        process_album_folder(album_dir, queue, args.phase, dither_mode, tmp_dir)
+        process_album_folder(album_dir, dest_album_dir, queue, args.phase, dither_mode, tmp_dir)
 
     file_writer_pool.shutdown(wait=True)
     print("\n>>> All recursive album batches completed cleanly!")
