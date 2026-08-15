@@ -159,7 +159,7 @@ def analyze_file_on_demand(filepath):
             data[:taper_len] *= taper
             data[-taper_len:] *= taper[::-1]
 
-        spec_db, freqs, peak_dbfs, rms_dbfs, assessment_text = analyze_audio_forensics(data, sr)
+        spec_db, freqs, peak_dbfs, rms_dbfs, assessment_text, dr_metrics = analyze_audio_forensics(data, sr)
 
         nyquist = sr / 2.0
         duration_s = len(data) / float(sr)
@@ -204,6 +204,11 @@ def analyze_file_on_demand(filepath):
             "verdict": verdict,
             "noise_profile": noise_profile,
             "filter_signature": filter_signature,
+            "dr_score": dr_metrics.get("dr_score", 0),
+            "dr_val": dr_metrics.get("dr_val", 0.0),
+            "crest_factor_db": dr_metrics.get("crest_factor_db", 0.0),
+            "integrated_lufs": dr_metrics.get("integrated_lufs", -140.0),
+            "lra_lu": dr_metrics.get("lra_lu", 0.0),
             "report_text": assessment_text,
             "webp_base64": webp_b64,
             "lookup_base64": lookup_b64,
@@ -641,6 +646,7 @@ HTML_PAGE = """<!DOCTYPE html>
                         </div>
                         <div style="display: flex; gap: 8px; flex-wrap: wrap; align-items: center;">
                             <div id="verdictBadge" class="badge-hires" style="font-size: 0.82rem; padding: 4px 10px;">--</div>
+                            <div id="drBadge" class="badge-hires" style="font-size: 0.82rem; padding: 4px 10px; display: none;">--</div>
                             <div id="noiseBadge" class="badge-cd" style="font-size: 0.82rem; padding: 4px 10px; display: none;">--</div>
                             <div id="filterBadge" class="badge-cd" style="font-size: 0.82rem; padding: 4px 10px; display: none;">--</div>
                         </div>
@@ -876,6 +882,32 @@ HTML_PAGE = """<!DOCTYPE html>
                     vBadge.style.background = '#21262d';
                     vBadge.style.borderColor = '#30363d';
                     vBadge.style.color = '#8b949e';
+                }
+
+                // Dynamic Range badge
+                const drBadge = document.getElementById('drBadge');
+                if (data.dr_score !== undefined && data.dr_score !== null) {
+                    drBadge.style.display = 'inline-block';
+                    drBadge.textContent = `DR${data.dr_score} (${data.dr_val} dB)`;
+                    if (data.dr_score >= 14) {
+                        drBadge.style.background = 'rgba(0, 229, 255, 0.15)';
+                        drBadge.style.borderColor = 'rgba(0, 229, 255, 0.4)';
+                        drBadge.style.color = '#00e5ff';
+                    } else if (data.dr_score >= 10) {
+                        drBadge.style.background = 'rgba(0, 230, 118, 0.15)';
+                        drBadge.style.borderColor = 'rgba(0, 230, 118, 0.4)';
+                        drBadge.style.color = '#00e676';
+                    } else if (data.dr_score >= 7) {
+                        drBadge.style.background = 'rgba(255, 214, 0, 0.15)';
+                        drBadge.style.borderColor = 'rgba(255, 214, 0, 0.4)';
+                        drBadge.style.color = '#ffd600';
+                    } else {
+                        drBadge.style.background = 'rgba(255, 23, 68, 0.15)';
+                        drBadge.style.borderColor = 'rgba(255, 23, 68, 0.4)';
+                        drBadge.style.color = '#ff1744';
+                    }
+                } else {
+                    drBadge.style.display = 'none';
                 }
 
                 // Noise profile badge

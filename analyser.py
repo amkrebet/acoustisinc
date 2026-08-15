@@ -81,6 +81,105 @@ def detect_filter_phase(y, sr, cutoff_hz):
         return f"INTERMEDIATE / APODIZING (Asymmetric | Ratio: {avg_asymmetry:.2f})"
 
 
+def calculate_dynamic_range_metrics(y, sr):
+    """
+    Computes audiophile and broadcast dynamic range & loudness metrics with strict 64-bit precision:
+    1. Official Pleasurize Music Foundation / TT Dynamic Range Meter (DR Score e.g. DR12)
+    2. ITU-R BS.1770-4 / EBU R128 Integrated Loudness (LUFS) and Loudness Range (LRA in LU)
+    3. Peak-to-RMS Crest Factor (dB)
+    """
+    # 1. Official TT Dynamic Range (3-second blocks, top 20% loudest RMS vs peak)
+    block_len = int(sr * 3.0)
+    if len(y) < block_len:
+        block_len = len(y)
+
+    num_blocks = len(y) // block_len
+    if num_blocks > 0:
+        blocks = y[:num_blocks * block_len].reshape(num_blocks, block_len)
+        block_rms = np.sqrt(np.mean(blocks**2, axis=1))
+        
+        top_count = max(1, int(np.ceil(num_blocks * 0.20)))
+        sorted_rms = np.sort(block_rms)
+        top_20_rms = sorted_rms[-top_count:]
+        
+        top_rms_mean = np.sqrt(np.mean(top_20_rms**2))
+        top_rms_db = 20.0 * np.log10(top_rms_mean) if top_rms_mean > 0 else -140.0
+    else:
+        overall_rms = np.sqrt(np.mean(y**2))
+        top_rms_db = 20.0 * np.log10(overall_rms) if overall_rms > 0 else -140.0
+
+    peak_val = np.max(np.abs(y))
+    peak_db = 20.0 * np.log10(peak_val) if peak_val > 0 else -140.0
+    
+    dr_val = peak_db - top_rms_db
+    dr_score = max(0, int(np.round(dr_val)))
+    
+    # 2. Integrated RMS and Crest Factor
+    tot_rms = np.sqrt(np.mean(y**2))
+    tot_rms_db = 20.0 * np.log10(tot_rms) if tot_rms > 0 else -140.0
+    crest_factor_db = peak_db - tot_rms_db
+
+    # 3. ITU-R BS.1770 / EBU R128 Loudness (LUFS) & Loudness Range (LRA)
+    try:
+        # High-shelf filter design (BS.1770)
+        vh = np.power(10.0, 3.9998438 / 20.0)
+        vb = np.power(vh, 0.4996667741545416)
+        K = np.tan(np.pi * 1681.974450955533 / sr)
+        K2 = K * K
+        den = 1.0 + np.sqrt(2.0) * K + K2
+        b_shelf = [(vh + vb * np.sqrt(2.0) * K + K2) / den, 2.0 * (K2 - vh) / den, (vh - vb * np.sqrt(2.0) * K + K2) / den]
+        a_shelf = [1.0, 2.0 * (K2 - 1.0) / den, (1.0 - np.sqrt(2.0) * K + K2) / den]
+
+        # High-pass filter design (BS.1770)
+        K_hp = np.tan(np.pi * 38.13547087602444 / sr)
+        K2_hp = K_hp * K_hp
+        den_hp = 1.0 + np.sqrt(2.0) * K_hp + K2_hp
+        b_hp = [1.0 / den_hp, -2.0 / den_hp, 1.0 / den_hp]
+        a_hp = [1.0, 2.0 * (K2_hp - 1.0) / den_hp, (1.0 - np.sqrt(2.0) * K_hp + K2_hp) / den_hp]
+
+        y_k = signal.lfilter(b_shelf, a_shelf, y)
+        y_k = signal.lfilter(b_hp, a_hp, y_k)
+
+        # Short-term loudness blocks (3.0s window, 100ms step)
+        step_len = int(sr * 0.1)
+        win_len = int(sr * 3.0)
+        if len(y_k) >= win_len:
+            num_st = (len(y_k) - win_len) // step_len
+            st_blocks = np.array([np.mean(y_k[i * step_len : i * step_len + win_len]**2) for i in range(num_st)], dtype=np.float64)
+            st_lufs = -0.691 + 10.0 * np.log10(np.maximum(st_blocks, 1e-12))
+            valid_st = st_lufs[st_lufs > -70.0]
+            
+            if len(valid_st) > 0:
+                ungated_mean_power = np.mean(10.0**(valid_st / 10.0))
+                rel_thresh = (-0.691 + 10.0 * np.log10(ungated_mean_power)) - 20.0
+                gated_st = valid_st[valid_st > rel_thresh]
+                if len(gated_st) > 0:
+                    lra = np.percentile(gated_st, 95) - np.percentile(gated_st, 10)
+                    integrated_lufs = -0.691 + 10.0 * np.log10(np.mean(10.0**(gated_st / 10.0)))
+                else:
+                    lra = 0.0
+                    integrated_lufs = -0.691 + 10.0 * np.log10(ungated_mean_power)
+            else:
+                lra = 0.0
+                integrated_lufs = -70.0
+        else:
+            lra = 0.0
+            p = np.mean(y_k**2)
+            integrated_lufs = -0.691 + 10.0 * np.log10(p) if p > 0 else -140.0
+    except Exception:
+        lra = 0.0
+        integrated_lufs = tot_rms_db
+
+    return {
+        "dr_score": dr_score,
+        "dr_val": round(dr_val, 2),
+        "peak_dbfs": round(peak_db, 2),
+        "crest_factor_db": round(crest_factor_db, 2),
+        "integrated_lufs": round(integrated_lufs, 1),
+        "lra_lu": round(lra, 1)
+    }
+
+
 def analyze_audio_forensics(y, sr):
     """
     Executes automated forensic analysis using strict 64-bit double precision.
@@ -234,11 +333,21 @@ def analyze_audio_forensics(y, sr):
             
         report.append(f"NOISE PROFILE: [{noise_profile}]")
             
-    peak_val = np.max(np.abs(y))
-    peak_db = 20 * np.log10(peak_val) if peak_val > 0 else -140.0
-    report.append(f"\nPeak Signal Level: {peak_db:.2f} dBFS")
-    
-    return spec_db, freqs, peak_dbfs, rms_dbfs, "\n".join(report)
+    # 4. Dynamic Range & Loudness Analysis (TT DR Score & EBU R128 LRA)
+    dr_metrics = calculate_dynamic_range_metrics(y, sr)
+    dr_score = dr_metrics["dr_score"]
+    dr_val = dr_metrics["dr_val"]
+    crest_db = dr_metrics["crest_factor_db"]
+    lufs = dr_metrics["integrated_lufs"]
+    lra = dr_metrics["lra_lu"]
+    peak_db = dr_metrics["peak_dbfs"]
+
+    report.append(f"\nDYNAMIC RANGE (TT DR Meter) : DR{dr_score} ({dr_val:.1f} dB)")
+    report.append(f"EBU R128 Loudness Range (LRA): {lra:.1f} LU | Integrated: {lufs:.1f} LUFS")
+    report.append(f"Peak-to-RMS Crest Factor     : {crest_db:.2f} dB")
+    report.append(f"Peak Signal Level            : {peak_db:.2f} dBFS")
+
+    return spec_db, freqs, peak_dbfs, rms_dbfs, "\n".join(report), dr_metrics
 
 
 def encode_spectrogram_and_lookup(spec_db, width=1600, height=800, lookup_w=600, lookup_h=300):
@@ -1234,7 +1343,7 @@ def main():
         data[:taper_len] *= taper
         data[-taper_len:] *= taper[::-1]
 
-    spec_db, freqs, peak_dbfs, rms_dbfs, assessment_text = analyze_audio_forensics(data, sr)
+    spec_db, freqs, peak_dbfs, rms_dbfs, assessment_text, dr_metrics = analyze_audio_forensics(data, sr)
     
     print("\n" + assessment_text)
     print("----------------------------\n")
