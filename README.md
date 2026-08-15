@@ -58,7 +58,7 @@ AcoustiSinc uses an intelligent **2-Stage Dynamic Gain Architecture** to guarant
 - Prior to upsampling, all audio tracks in an album folder are scanned in parallel to measure the global album peak (`album_max_peak_db`).
 - An initial calculated gain normalization factor is applied with a calibrated $+2.4\text{ dB}$ intersample crest margin:
 
-$$\text{Initial Gain Factor} = \frac{10^{-0.3 / 20}}{10^{(\text{album\_max\_peak\_db} + 2.4) / 20}}$$
+$$\text{Initial Gain Factor} = \frac{10^{-0.3 / 20}}{10^{(\text{Album Peak}_{\text{dBFS}} + 2.4) / 20}}$$
 
 - Preserves 100% of relative inter-track volume relationships across the entire album.
 
@@ -66,7 +66,7 @@ $$\text{Initial Gain Factor} = \frac{10^{-0.3 / 20}}{10^{(\text{album\_max\_peak
 - Every upsampled track is scanned in 64-bit double precision across its full output buffer for true intersample peak compliance against the $-0.3\text{ dBFS}$ ceiling (`PEAK_TARGET_DB`).
 - If an extreme track exceeds $-0.3\text{ dBFS}$ due to intense harmonic reconstruction, the engine captures the exact true peak overshoot and calculates the precise dynamic backoff:
 
-$$\text{Exact Backoff Factor} = \left(\frac{\text{PEAK\_TARGET\_LIN}}{\text{max\_overshoot\_peak}}\right) \times 10^{-0.2 / 20}$$
+$$\text{Exact Backoff Factor} = \left(\frac{\text{Peak}_{\text{Target}}}{\text{Peak}_{\text{Overshoot}}}\right) \times 10^{-0.2 / 20}$$
 
 - The album pass is cleanly restarted with this exact gain factor, resolving the clipping in a **single retry** without unnecessary iterative volume loss.
 
@@ -79,7 +79,7 @@ AcoustiSinc computes industry-standard audiophile dynamic range and broadcast lo
 ### TT Dynamic Range Meter (Official PMF Standard)
 Standardized by the [Pleasurize Music Foundation](https://dr.loudness-war.info) and Foobar2000 (`foo_dynamic_range`), the TT DR meter evaluates crest dynamics across 3-second blocks:
 
-$$\text{DR Score} = \text{Track Peak (dBFS)} - \text{Average RMS of Top 20\% Loudest Blocks (dBFS)}$$
+$$\text{DR Score} = \text{Peak}_{\text{dBFS}} - \text{RMS}_{\text{Top 20\% (dBFS)}}$$
 
 #### Audiophile DR Rating Scale:
 | DR Score | Rating | Color Code | Characteristics |
