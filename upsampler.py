@@ -643,12 +643,12 @@ def process_track(filepath, dest_dir, gain_factor, album_max_peak_lin, queue, ph
 
     if os.path.exists(dest_path):
         print(f"   [Skip] Output exists: {filename}")
-        return False, None
+        return False, 0.0, None
 
     try: 
         data, samplerate = sf.read(filepath, dtype='float64')
     except Exception: 
-        return False, None
+        return False, 0.0, None
         
     if data.ndim == 1: 
         data = data[:, np.newaxis]
@@ -670,7 +670,7 @@ def process_track(filepath, dest_dir, gain_factor, album_max_peak_lin, queue, ph
     if scale_factor == 1:
         out_int32 = apply_dither_and_noise_shaping(data, dither_mode)
         fut = file_writer_pool.submit(save_and_tag_async, wip_path, dest_path, out_int32, target_rate, filepath, t0, np.max(np.abs(data)), album_max_peak_lin, gain_factor)
-        return False, fut
+        return False, np.max(np.abs(data)), fut
 
     orig_target_samples = orig_samples * scale_factor
     use_mmap = is_memmap_necessary(orig_samples, scale_factor, num_channels)
@@ -735,13 +735,14 @@ def process_track(filepath, dest_dir, gain_factor, album_max_peak_lin, queue, ph
     out_peak_db = 20 * np.log10(out_peak) if out_peak > 0 else -999.0
 
     if out_peak > PEAK_TARGET_LIN:
-        print(f"{elapsed()} [Warning] Intersample clipping detected! Peak: {out_peak_db:.2f} dBFS > Target: {PEAK_TARGET_DB} dBFS")
+        overshoot_db = out_peak_db - PEAK_TARGET_DB
+        print(f"{elapsed()} [Warning] Intersample clipping detected! Peak: {out_peak_db:.2f} dBFS (Overshoot: +{overshoot_db:.2f} dB > Target: {PEAK_TARGET_DB} dBFS)")
         if os.path.exists(wip_path): os.remove(wip_path)
         del output_data
         if use_mmap and mmap_path and os.path.exists(mmap_path): os.remove(mmap_path)
         gc.collect()
         clear_vkfftapp_cache()
-        return True, None
+        return True, out_peak, None
 
     t_dither = time.time()
     out_int32 = apply_dither_and_noise_shaping(output_data, dither_mode)
@@ -756,7 +757,7 @@ def process_track(filepath, dest_dir, gain_factor, album_max_peak_lin, queue, ph
     # Async hand-off to NVMe FLAC compression worker
     fut = file_writer_pool.submit(save_and_tag_async, wip_path, dest_path, out_int32, target_rate, filepath, t0, out_peak, album_max_peak_lin, gain_factor)
     print(f"{elapsed()} [Compute Pipeline Complete] Handed off to NVMe Writer")
-    return False, fut
+    return False, out_peak, fut
 
 
 # ==============================================================================
@@ -789,25 +790,38 @@ def process_album_folder(source_album_dir, dest_album_dir, queue, phase_mode, di
 
     while not album_success and retry_count <= max_retries:
         clipped_in_pass = False
+        max_overshoot_peak = 0.0
         pass_futures = []
 
         for idx, f in enumerate(files, 1):
             print(f"\n--- Track [{idx}/{len(files)}] ---")
-            clipped, fut = process_track(f, dest_album_dir, gain_factor, album_max_peak_lin, queue, phase_mode, dither_mode, tmp_dir, apodizing=apodizing)
+            clipped, out_peak, fut = process_track(f, dest_album_dir, gain_factor, album_max_peak_lin, queue, phase_mode, dither_mode, tmp_dir, apodizing=apodizing)
             if fut is not None:
                 pass_futures.append(fut)
             if clipped:
                 clipped_in_pass = True
+                max_overshoot_peak = out_peak
                 break
 
         if clipped_in_pass:
             retry_count += 1
             if retry_count > max_retries:
-                print(f"\n[Error] Failed to resolve album clipping. Skipping album.")
+                print(f"\n[Error] Failed to resolve album clipping after {max_retries} attempts. Skipping album.")
                 return
-            gain_factor *= 0.891  # -1.0 dB extra backoff
-            print("===============================================")
-            print(">>> ABORTING CURRENT PASS due to intersample clipping.")
+            
+            # Calculate exact required dynamic backoff factor
+            overshoot_ratio = PEAK_TARGET_LIN / max_overshoot_peak
+            safety_margin_lin = 10.0 ** (-0.2 / 20.0)  # Extra 0.2 dB safety buffer
+            exact_backoff_factor = overshoot_ratio * safety_margin_lin
+            
+            old_gain = gain_factor
+            gain_factor *= exact_backoff_factor
+            backoff_db = 20.0 * np.log10(exact_backoff_factor)
+
+            print("==================================================")
+            print(f">>> ABORTING CURRENT PASS due to intersample clipping (Overshoot: {20.0 * np.log10(max_overshoot_peak) - PEAK_TARGET_DB:+.2f} dB).")
+            print(f">>> Calculated exact dynamic backoff: {backoff_db:.2f} dB (Gain: {old_gain:.6f} -> {gain_factor:.6f})")
+            print("==================================================")
 
             # Drain any active background writers before wiping
             for fut in pass_futures:
@@ -823,7 +837,7 @@ def process_album_folder(source_album_dir, dest_album_dir, queue, phase_mode, di
             GPU_FILTER_CACHE.clear()
             clear_vkfftapp_cache()
             gc.collect()
-            print(f">>> Restarting album pass with new Gain Factor: {gain_factor:.6f}")
+            print(f">>> Restarting album pass with exact calculated Gain Factor: {gain_factor:.6f}")
         else:
             album_success = True
 
@@ -886,7 +900,13 @@ def main():
     if os.path.isfile(source_path):
         os.makedirs(target_dir, exist_ok=True)
         gain_factor, pk = scan_album([source_path])
-        process_track(source_path, target_dir, gain_factor, pk, queue, args.phase, dither_mode, tmp_dir, apodizing=args.apodizing)
+        clipped, out_peak, fut = process_track(source_path, target_dir, gain_factor, pk, queue, args.phase, dither_mode, tmp_dir, apodizing=args.apodizing)
+        if clipped and out_peak > PEAK_TARGET_LIN:
+            overshoot_ratio = PEAK_TARGET_LIN / out_peak
+            safety_margin_lin = 10.0 ** (-0.2 / 20.0)
+            gain_factor *= (overshoot_ratio * safety_margin_lin)
+            print(f">>> Retrying single file with exact calculated Gain Factor: {gain_factor:.6f}")
+            process_track(source_path, target_dir, gain_factor, pk, queue, args.phase, dither_mode, tmp_dir, apodizing=args.apodizing)
         file_writer_pool.shutdown(wait=True)
         return
 
