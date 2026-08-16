@@ -146,5 +146,11 @@
   "alternative_rules": {
     "enable_alternative_hypotheses": true,
     "mirror_leakage_min_corr": 0.55
+  },
+  "mqa_rules": {
+    "enabled": true,
+    "confidence": "High",
+    "confidence_score": 0.99,
+    "badge_class": "badge-provenance-mqa"
   }
 }

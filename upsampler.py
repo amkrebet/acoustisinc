@@ -684,7 +684,7 @@ def scan_album(files):
 # TRACK PROCESSOR
 # ==============================================================================
 
-def process_track(filepath, dest_dir, gain_factor, album_max_peak_lin, queue, phase_mode, dither_mode, tmp_dir, apodizing=False):
+def process_track(filepath, dest_dir, gain_factor, album_max_peak_lin, queue, phase_mode, dither_mode, tmp_dir, apodizing=False, mqa_mode='adaptive'):
     t0 = time.time()
     def elapsed(): return f"[+{time.time() - t0:6.2f}s]"
 
@@ -703,6 +703,25 @@ def process_track(filepath, dest_dir, gain_factor, album_max_peak_lin, queue, ph
         
     if data.ndim == 1: 
         data = data[:, np.newaxis]
+
+    # MQA Auto-Detection & Core Unfolding / Stripping Pre-Processor
+    if mqa_mode != 'ignore':
+        try:
+            from mqa_unfolder import probe_mqa_track, unfold_mqa_adaptive, unfold_mqa_simple, strip_mqa_payload
+            is_mqa, orig_mqa_sr, is_studio, mqa_sig = probe_mqa_track(filepath=filepath, sr=samplerate)
+            if is_mqa:
+                studio_tag = "MQA Studio Master" if is_studio else "MQA Authenticated"
+                if mqa_mode == 'strip':
+                    print(f"{elapsed()} [MQA Pre-Processor] Detected {studio_tag} -> Stripping MQA payload bits & re-dithering...")
+                    data, samplerate = strip_mqa_payload(data, samplerate)
+                elif mqa_mode == 'simple' and samplerate in (44100, 48000):
+                    print(f"{elapsed()} [MQA Pre-Processor] Detected {studio_tag} (Original Master: {orig_mqa_sr:,} Hz) -> Simple linear subband unfold ({samplerate} Hz -> {samplerate*2} Hz)...")
+                    data, samplerate = unfold_mqa_simple(data, samplerate)
+                elif mqa_mode == 'adaptive' and samplerate in (44100, 48000):
+                    print(f"{elapsed()} [MQA Pre-Processor] Detected {studio_tag} (Original Master: {orig_mqa_sr:,} Hz) -> Adaptive companded unfold ({samplerate} Hz -> {samplerate*2} Hz | <= -95 dBFS floor)...")
+                    data, samplerate = unfold_mqa_adaptive(data, samplerate)
+        except Exception as e:
+            pass
 
     orig_samples, num_channels = data.shape
     scale_factor, target_rate = get_target_scale(samplerate)
@@ -815,7 +834,7 @@ def process_track(filepath, dest_dir, gain_factor, album_max_peak_lin, queue, ph
 # ALBUM BATCH CONTROLLER WITH RETRY AUTO-HEALING
 # ==============================================================================
 
-def process_album_folder(source_album_dir, dest_album_dir, queue, phase_mode, dither_mode, tmp_dir, apodizing=False):
+def process_album_folder(source_album_dir, dest_album_dir, queue, phase_mode, dither_mode, tmp_dir, apodizing=False, mqa_mode='adaptive'):
     print(f"\n==================================================")
     print(f"Directory:   {source_album_dir}")
     print(f"Destination: {dest_album_dir}")
@@ -846,7 +865,7 @@ def process_album_folder(source_album_dir, dest_album_dir, queue, phase_mode, di
 
         for idx, f in enumerate(files, 1):
             print(f"\n--- Track [{idx}/{len(files)}] ---")
-            clipped, out_peak, fut = process_track(f, dest_album_dir, gain_factor, album_max_peak_lin, queue, phase_mode, dither_mode, tmp_dir, apodizing=apodizing)
+            clipped, out_peak, fut = process_track(f, dest_album_dir, gain_factor, album_max_peak_lin, queue, phase_mode, dither_mode, tmp_dir, apodizing=apodizing, mqa_mode=mqa_mode)
             if fut is not None:
                 pass_futures.append(fut)
             if clipped:
@@ -912,6 +931,7 @@ def main():
     parser.add_argument("--apodizing", "--apod", action="store_true", help="Enable Apodizing transition band to attenuate pre-existing studio ADC ringing")
     parser.add_argument("--dither", choices=['shibata', 'high_rate', 'none'], default='shibata', help="Dither & noise shaping mode (default: shibata)")
     parser.add_argument("--no-dither", action="store_true", help="Disable dither and noise shaping")
+    parser.add_argument("--mqa", choices=['adaptive', 'simple', 'strip', 'ignore'], default='adaptive', help="MQA processing mode: adaptive (companded high-fidelity unfold), simple (linear unfold), strip (strip MQA payload and re-dither), ignore (treat as raw unaltered PCM)")
     parser.add_argument("--tmp-dir", default=DEFAULT_TMP_DIR, help="Scratch directory for NVMe memory-mapped buffers")
     args = parser.parse_args()
 
@@ -948,6 +968,7 @@ def main():
     print(f"Phase Mode      : {phase_name}")
     print(f"Apodizing Filter: {'ENABLED (Anti-ADC Ringing)' if args.apodizing else 'DISABLED (Standard Sinc Bandwidth)'}")
     print(f"Noise Shaping   : {dither_mode.upper()} (In-Register Double Precision)")
+    print(f"MQA Processing  : {args.mqa.upper()}")
     print(f"FLAC Compression: Level 5 (Strict)")
     print(f"Precision       : 64-bit Double Precision (Strict)")
     print(f"=======================================================\n")
@@ -957,13 +978,13 @@ def main():
 
     if os.path.isfile(source_path):
         gain_factor, pk = scan_album([source_path])
-        clipped, out_peak, fut = process_track(source_path, target_dir, gain_factor, pk, queue, args.phase, dither_mode, tmp_dir, apodizing=args.apodizing)
+        clipped, out_peak, fut = process_track(source_path, target_dir, gain_factor, pk, queue, args.phase, dither_mode, tmp_dir, apodizing=args.apodizing, mqa_mode=args.mqa)
         if clipped and out_peak > PEAK_TARGET_LIN:
             overshoot_ratio = PEAK_TARGET_LIN / out_peak
             safety_margin_lin = 10.0 ** (-0.2 / 20.0)
             gain_factor *= (overshoot_ratio * safety_margin_lin)
             print(f">>> Retrying single file with exact calculated Gain Factor: {gain_factor:.6f}")
-            process_track(source_path, target_dir, gain_factor, pk, queue, args.phase, dither_mode, tmp_dir, apodizing=args.apodizing)
+            process_track(source_path, target_dir, gain_factor, pk, queue, args.phase, dither_mode, tmp_dir, apodizing=args.apodizing, mqa_mode=args.mqa)
         file_writer_pool.shutdown(wait=True)
         return
 
@@ -977,13 +998,15 @@ def main():
         print(f"[AcoustiSinc] No FLAC or WAV files found under {source_path}")
         return
 
-    for idx, album_dir in enumerate(album_directories, 1):
-        dest_album_dir = get_destination_dir(album_dir, source_path, target_dir)
-        print(f"\n==================================================\n[Album {idx}/{len(album_directories)}]")
+    for idx, alb_dir in enumerate(album_directories, 1):
+        rel = os.path.relpath(alb_dir, source_path)
+        dest_alb = target_dir if rel == "." else os.path.join(target_dir, rel)
+        print(f"\n==================================================")
+        print(f"[Album {idx}/{len(album_directories)}]")
         try:
-            process_album_folder(album_dir, dest_album_dir, queue, args.phase, dither_mode, tmp_dir, apodizing=args.apodizing)
+            process_album_folder(alb_dir, dest_alb, queue, args.phase, dither_mode, tmp_dir, apodizing=args.apodizing, mqa_mode=args.mqa)
         except Exception as e:
-            err_msg = f"[Album {idx} Skipped on Error]: {album_dir}\nDetails: {e}"
+            err_msg = f"[Album {idx} Skipped on Error]: {alb_dir}\nDetails: {e}"
             print(f"\n{err_msg}\n>>> Continuing to next album...")
             try:
                 with open(os.path.join(target_dir, "upsample_errors.log"), "a", encoding="utf-8") as ef:

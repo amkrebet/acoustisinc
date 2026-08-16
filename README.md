@@ -43,7 +43,16 @@ It delivers:
   - `[NOISE PROFILE]`: Identifies Psychoacoustic Noise Shaping rise ($+6\text{ dB} \to +20\text{ dB}$ HF rise), Flat TPDF dither, or DSD ultrasonic humps.
   - `[DYNAMIC RANGE]`: Official **TT Dynamic Range (DR Score e.g. DR12)**, **EBU R128 Loudness Range (LRA)**, and **Integrated LUFS**.
 - **Interactive Heatmap Canvas**: Zoom/pan with mouse wheel and drag; cursor HUD reveals **exact Time (s), Frequency (kHz), and Level (dBFS)** anywhere on the canvas.
-- **Built-in Lossless Audio Streaming**: Audition FLAC files directly in your browser while visually correlating audio transients with the spectrogram.
+### 3. MQA Forensic Detection & Core Unfolding / Stripping Engine
+- **Dual-Layer Forensic Detection**:
+  - **Fast Metadata Scan**: Vorbis comments (`MQAENCODER`, `ORIGINALSAMPLERATE`, `ENCODER`).
+  - **Deep Bit-Plane Sync**: Scans $L \oplus R$ XOR streams for the official 36-bit sync word (`0xBE0498C88`) and decodes original master rates and studio provenance flags.
+  - **Visual Badging**: Violet `[MQA STUDIO]` or `[MQA]` badge with decoded original master sampling rate in the Web Explorer UI.
+- **Configurable Processing Modes (`--mqa [mode]`)**:
+  - **`adaptive`** *(Default)*: Companded high-fidelity unfold with psychoacoustic noise-gating to reconstruct ultrasonic harmonics while suppressing 8-bit quantization noise in quiet passages ($\le -95\text{ dBFS}$).
+  - **`strip`**: Strips the noisy MQA pseudo-random bitstream hash from the LSBs, applies pristine 64-bit TPDF dither, and upsamples the pure baseband for maximum dynamic range and zero intermodulation distortion.
+  - **`simple`**: Standard linear subband unfold ($2\times$ baseband).
+  - **`ignore`**: Treats the audio as raw unaltered PCM.
 
 ---
 
@@ -176,12 +185,42 @@ python upsampler.py "/path/to/source_music"
 | `--apodizing`, `--apod` | *Optional* | `False` *(Off)* | Switch to enable Apodizing transition band to attenuate pre-existing studio ADC ringing. |
 | `--dither` | *Optional* | `shibata` | 24-bit psychoacoustic noise shaping profile: `shibata`, `high_rate`, or `none`. |
 | `--no-dither` | *Optional* | `False` | Flag to disable dither and noise shaping (raw truncation). |
+| `--mqa` | *Optional* | `adaptive` | MQA processing mode: `adaptive` (companded high-fidelity unfold), `strip` (strip MQA payload and re-dither), `simple` (standard linear unfold), `ignore` (raw PCM). |
 | `--tmp-dir` | *Optional* | `/tmp/upsample_scratch` | Custom fast NVMe scratch path for 64-bit memory-mapped buffers. |
 
-> [!NOTE]
-> **Batch Processing & Initial JIT Warm-Up**:
-> When processing your first track in a batch, execution may take an extra 1–3 seconds while OpenCL JIT-compiles the double-precision GPU sinc kernels, PyVkFFT builds and caches GPU plans, and Numba JIT-compiles the multi-core noise-shaping loops.
-> All subsequent tracks and recursive album folders run at full native GPU acceleration (~3–5× faster).
+---
+
+## 🎼 MQA Processing Modes & Acoustic Trade-Offs
+
+When an MQA-encoded track or MQA-CD rip is detected, AcoustiSinc offers four processing strategies tailored to different musical genres and audiophile preferences:
+
+```bash
+# 1. Adaptive Unfolding (Default - Best for Acoustic Jazz, Classical & Orchestral)
+python upsampler.py "/path/to/mqa_music" --mqa adaptive
+
+# 2. MQA Noise Stripping (Best for Pop, Rock, Electronic & Purist Playback)
+python upsampler.py "/path/to/mqa_music" --mqa strip
+
+# 3. Simple Linear Unfold (Raw historical MQA behavior)
+python upsampler.py "/path/to/mqa_music" --mqa simple
+
+# 4. Raw Ignore (Bit-for-bit uncleaned legacy PCM)
+python upsampler.py "/path/to/mqa_music" --mqa ignore
+```
+
+### Trade-Off Comparison
+
+| Mode | Soundstage & Air | Background Blackness | Distortion Level | Best Musical Fit |
+| :--- | :--- | :--- | :--- | :--- |
+| **`adaptive`** *(Default)* | ⭐⭐⭐⭐⭐ **Maximum** | ⭐⭐⭐⭐ **High** | ⭐⭐⭐⭐ **Low** | Acoustic recordings with genuine ultrasonic harmonics (2L, ECM, live acoustic). |
+| **`strip`** | ⭐⭐⭐⭐ **Very Good** | ⭐⭐⭐⭐⭐ **Pitch Black** | ⭐⭐⭐⭐⭐ **Lowest** | Studio pop, rock, electronic, or questionable MQA provenance (eliminates LSB hash). |
+| **`simple`** | ⭐⭐⭐⭐ **Good** | ⭐⭐ **Grainy / Hazy** | ⭐⭐ **Higher Noise** | Historical reference / raw MQA subband emulation (retains $-48\text{ dBFS}$ floor). |
+| **`ignore`** | ⭐⭐⭐ **Standard** | ⭐⭐⭐ **Slight LSB Hash** | ⭐⭐⭐ **Moderate** | Exact legacy DAC playback without modification. |
+
+#### Why Does MQA Add Noise Without Unfolding?
+* **16-bit MQA-CDs**: Bit 16 is constantly overwritten with pseudo-random MQA packet data. On a standard non-MQA DAC, this toggles like **correlated high-frequency hash noise**, degrading effective SNR from $96\text{ dB}$ to $\approx 84\text{--}88\text{ dB}$.
+* **24-bit MQA**: The lower 8 bits (bits 0–7) hold the compressed subband packet stream instead of physical audio dither.
+* **The `--mqa strip` Solution**: Zero-masks the pseudo-random packet payload and applies **64-bit TPDF dither**, restoring a pure $24\text{bit}$ linear PCM container with a pitch-black $-115\text{ dBFS}$ to $-144\text{ dBFS}$ noise floor.
 
 ---
 

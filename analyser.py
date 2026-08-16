@@ -126,7 +126,7 @@ def calculate_dynamic_range_metrics(y, sr):
     }
 
 
-def analyze_audio_forensics(y, sr, rules_path=None):
+def analyze_audio_forensics(y, sr, rules_path=None, filepath=None):
     """
     Executes automated forensic analysis using strict 64-bit double precision.
     """
@@ -338,9 +338,10 @@ def analyze_audio_forensics(y, sr, rules_path=None):
     report.append(f"Peak Signal Level            : {peak_db:.2f} dBFS")
 
     # 5. Estimated Provenance Analysis (Interprets configurable declarative rules)
-    from provenance_engine import get_provenance_engine
+    from provenance_engine import get_provenance_engine, detect_mqa_signature
+    mqa_info = detect_mqa_signature(filepath=filepath, sr=sr) if filepath else None
     engine = get_provenance_engine(rules_path if 'rules_path' in locals() else None)
-    provenance_info = engine.evaluate(sr, nyquist, freqs, mean_spec_db, rms_dbfs, peak_dbfs, stft_mag, zero_ratio)
+    provenance_info = engine.evaluate(sr, nyquist, freqs, mean_spec_db, rms_dbfs, peak_dbfs, stft_mag, zero_ratio, mqa_info=mqa_info)
 
     primary_prov = provenance_info["primary"]
     alt_prov = provenance_info["alternative"]
@@ -1343,7 +1344,7 @@ def main():
         data[:taper_len] *= taper
         data[-taper_len:] *= taper[::-1]
 
-    spec_db, freqs, peak_dbfs, rms_dbfs, assessment_text, dr_metrics, provenance_info = analyze_audio_forensics(data, sr, rules_path=args.rules)
+    spec_db, freqs, peak_dbfs, rms_dbfs, assessment_text, dr_metrics, provenance_info = analyze_audio_forensics(data, sr, rules_path=args.rules, filepath=filepath)
     
     print("\n" + assessment_text)
     print("----------------------------\n")

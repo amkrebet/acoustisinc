@@ -11,6 +11,105 @@ import numpy as np
 DEFAULT_RULES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "provenance_rules.json")
 
 
+def original_sample_rate_decoder(c: int) -> int:
+    base = 48000 if (c & 1) == 1 else 44100
+    multiplier = 1 << (((c >> 3) & 1) | (((c >> 2) & 1) << 1) | (((c >> 1) & 1) << 2))
+    if multiplier > 16:
+        multiplier *= 2
+    return base * multiplier
+
+
+def detect_mqa_signature(filepath=None, pcm_int32=None, sr=44100):
+    """
+    Forensically detects MQA encoding:
+    1. Metadata Tag scan (MQAENCODER, ORIGINALSAMPLERATE, ENCODER)
+    2. 36-bit magic word (0xbe0498c88) XOR bitstream detection
+    """
+    details = {
+        "is_mqa": False,
+        "is_studio": False,
+        "original_sr": None,
+        "bit_position": None,
+        "encoder": None,
+        "method": None
+    }
+
+    # 1. Metadata check
+    if filepath and os.path.exists(filepath):
+        try:
+            from mutagen.flac import FLAC
+            audio = FLAC(filepath)
+            if audio and audio.tags:
+                for k, v in audio.tags.items():
+                    ku = k.upper()
+                    v_str = str(v[0] if isinstance(v, list) else v)
+                    if "MQAENCODER" in ku:
+                        details["is_mqa"] = True
+                        details["encoder"] = v_str
+                        details["method"] = "METADATA_TAG"
+                    elif "ORIGINALSAMPLERATE" in ku:
+                        try:
+                            details["original_sr"] = int(v_str)
+                            details["is_mqa"] = True
+                        except Exception:
+                            pass
+                if details["is_mqa"]:
+                    if details["original_sr"] is None:
+                        details["original_sr"] = sr * 2
+                    return details
+        except Exception:
+            pass
+
+    # 2. Audio Bitstream check (36-bit magic word 0xbe0498c88)
+    if filepath and os.path.exists(filepath) and pcm_int32 is None:
+        try:
+            import soundfile as sf
+            info = sf.info(filepath)
+            frames = min(int(info.samplerate * 6.0), info.frames)
+            pcm_int32, _ = sf.read(filepath, frames=frames, dtype="int32", always_2d=True)
+        except Exception:
+            pass
+
+    if pcm_int32 is not None and pcm_int32.ndim == 2 and pcm_int32.shape[1] >= 2:
+        try:
+            s0 = pcm_int32[:, 0].astype(np.uint32)
+            s1 = pcm_int32[:, 1].astype(np.uint32)
+            xor_sig = s0 ^ s1
+            MASK_36 = 0xFFFFFFFFF
+            MAGIC = 0xbe0498c88
+
+            for bit in (8, 9, 10, 11, 12, 13, 14, 15, 16, 0, 1, 2, 3, 4, 5, 6, 7):
+                stream = (xor_sig >> bit) & 1
+                buffer = 0
+                for i, b in enumerate(stream):
+                    buffer = ((buffer << 1) | int(b)) & MASK_36
+                    if buffer == MAGIC:
+                        orsf = 0
+                        for m in range(3, 8):
+                            if (i + m) < len(stream):
+                                j = int(stream[i + m])
+                                orsf |= (j << (7 - m))
+                        orig_sr = original_sample_rate_decoder(orsf)
+                        prov = 0
+                        for m in range(29, 34):
+                            if (i + m) < len(stream):
+                                j = int(stream[i + m])
+                                prov |= (j << (33 - m))
+                        is_studio = (prov > 8)
+                        return {
+                            "is_mqa": True,
+                            "is_studio": is_studio,
+                            "original_sr": orig_sr,
+                            "bit_position": bit,
+                            "encoder": "MQA Bitstream Payload",
+                            "method": "BITSTREAM_SYNC"
+                        }
+        except Exception:
+            pass
+
+    return details
+
+
 class ProvenanceRuleEngine:
     """
     Interprets declarative forensic provenance rules to evaluate audio lineage,
@@ -54,7 +153,7 @@ class ProvenanceRuleEngine:
         self.check_and_reload()
         return self._rules or {}
 
-    def evaluate(self, sr, nyquist, freqs, mean_spec_db, rms_dbfs, peak_dbfs, stft_mag, zero_ratio=0.0):
+    def evaluate(self, sr, nyquist, freqs, mean_spec_db, rms_dbfs, peak_dbfs, stft_mag, zero_ratio=0.0, mqa_info=None):
         """
         Executes rule interpreter against extracted spectral features.
         Returns a structured provenance result dictionary.
@@ -191,7 +290,20 @@ class ProvenanceRuleEngine:
         primary_prov = None
         alt_prov = None
 
-        if is_zero_stuffed:
+        if mqa_info and mqa_info.get("is_mqa"):
+            mqa_cfg = rules.get("mqa_rules", {})
+            orig_sr = mqa_info.get("original_sr") or (sr * 2)
+            is_studio = mqa_info.get("is_studio", False)
+            tag_name = "MQA Studio Master" if is_studio else "MQA Authenticated Master"
+            meth = mqa_info.get("method", "BITSTREAM")
+            primary_prov = {
+                "label": f"{tag_name} (Orig: {orig_sr/1000:.1f} kHz)",
+                "confidence": mqa_cfg.get("confidence", "High"),
+                "score": mqa_cfg.get("confidence_score", 0.99),
+                "badge_class": mqa_cfg.get("badge_class", "badge-provenance-mqa"),
+                "details": f"Folded MQA ultrasonic subband detected via {meth}. Original Master: {orig_sr/1000:.1f} kHz."
+            }
+        elif is_zero_stuffed:
             z_spec = rules.get("zero_stuffing", {})
             primary_prov = {
                 "label": "Raw Zero-Stuffed / NOS Source",

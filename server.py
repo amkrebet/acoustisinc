@@ -160,7 +160,7 @@ def analyze_file_on_demand(filepath, rules_path=None):
             data[:taper_len] *= taper
             data[-taper_len:] *= taper[::-1]
 
-        spec_db, freqs, peak_dbfs, rms_dbfs, assessment_text, dr_metrics, provenance_info = analyze_audio_forensics(data, sr, rules_path=rules_path or ACTIVE_RULES_PATH)
+        spec_db, freqs, peak_dbfs, rms_dbfs, assessment_text, dr_metrics, provenance_info = analyze_audio_forensics(data, sr, rules_path=rules_path or ACTIVE_RULES_PATH, filepath=filepath)
 
         nyquist = sr / 2.0
         duration_s = len(data) / float(sr)
@@ -504,6 +504,11 @@ HTML_PAGE = """<!DOCTYPE html>
             border: 1px solid rgba(139, 148, 158, 0.4);
             color: var(--text-muted);
         }
+        .badge-provenance-mqa {
+            background: rgba(186, 104, 200, 0.16);
+            border: 1px solid rgba(186, 104, 200, 0.45);
+            color: #ce93d8;
+        }
         .confidence-pill {
             font-size: 0.72rem;
             font-weight: 600;
@@ -731,6 +736,7 @@ HTML_PAGE = """<!DOCTYPE html>
                             <div id="trackMeta" style="font-size: 0.8rem; color: var(--text-muted); margin-top: 4px;">--</div>
                         </div>
                         <div style="display: flex; gap: 8px; flex-wrap: wrap; align-items: center;">
+                            <div id="mqaBadge" class="badge-provenance-mqa" style="font-size: 0.82rem; padding: 4px 10px; font-weight: 700; letter-spacing: 0.5px; display: none;">MQA</div>
                             <div id="drBadge" class="badge-hires" style="font-size: 0.82rem; padding: 4px 10px; display: none;">--</div>
                             <div id="noiseBadge" class="badge-cd" style="font-size: 0.82rem; padding: 4px 10px; display: none;">--</div>
                         </div>
@@ -1013,6 +1019,15 @@ HTML_PAGE = """<!DOCTYPE html>
                 document.getElementById('trackTitle').textContent = data.filename;
                 document.getElementById('trackMeta').textContent = `${data.sr.toLocaleString()} Hz | ${data.nyquist_khz.toFixed(1)} kHz Nyquist | ${data.duration_s.toFixed(1)}s sample | Analyzed in ${data.analysis_time}s`;
                 
+                // MQA Badge
+                const mqaBadge = document.getElementById('mqaBadge');
+                if (data.provenance && data.provenance.label && data.provenance.label.includes('MQA')) {
+                    mqaBadge.style.display = 'inline-block';
+                    mqaBadge.textContent = data.provenance.label.includes('Studio') ? 'MQA STUDIO' : 'MQA';
+                } else {
+                    mqaBadge.style.display = 'none';
+                }
+
                 // Dynamic Range badge
                 const drBadge = document.getElementById('drBadge');
                 if (data.dr_score !== undefined && data.dr_score !== null) {
