@@ -362,17 +362,26 @@ HTML_PAGE = """<!DOCTYPE html>
             font-size: 0.85rem;
             user-select: none;
             transition: background 0.1s;
+            overflow: hidden;
+            min-width: 0;
+            gap: 8px;
         }
         .folder-item:hover {
             background: var(--surface-hover);
         }
-        .folder-name {
+        .folder-name-container {
+            flex: 1;
+            min-width: 0;
+            overflow: hidden;
+            white-space: nowrap;
             display: flex;
             align-items: center;
-            gap: 8px;
-            overflow: hidden;
-            text-overflow: ellipsis;
+            gap: 6px;
+        }
+        .folder-name {
+            display: inline-block;
             white-space: nowrap;
+            will-change: transform;
         }
         .file-item {
             display: flex;
@@ -384,6 +393,8 @@ HTML_PAGE = """<!DOCTYPE html>
             border: 1px solid #21262d;
             margin-bottom: 4px;
             transition: all 0.15s ease;
+            overflow: hidden;
+            min-width: 0;
         }
         .file-item:hover {
             background: var(--surface-hover);
@@ -398,14 +409,35 @@ HTML_PAGE = """<!DOCTYPE html>
             justify-content: space-between;
             align-items: center;
             gap: 8px;
+            min-width: 0;
+        }
+        .file-title-container {
+            flex: 1;
+            min-width: 0;
+            overflow: hidden;
+            white-space: nowrap;
+            display: flex;
+            align-items: center;
+            gap: 6px;
         }
         .file-title {
+            display: inline-block;
             font-size: 0.85rem;
             font-weight: 500;
             color: var(--text-heading);
-            overflow: hidden;
-            text-overflow: ellipsis;
             white-space: nowrap;
+            will-change: transform;
+        }
+        .ticker-active {
+            animation: ticker-scroll var(--ticker-duration, 4s) cubic-bezier(0.45, 0.05, 0.55, 0.95) infinite alternate;
+        }
+        @keyframes ticker-scroll {
+            0%, 20% {
+                transform: translateX(0);
+            }
+            80%, 100% {
+                transform: translateX(var(--ticker-offset, 0px));
+            }
         }
         .file-meta {
             display: flex;
@@ -780,6 +812,22 @@ HTML_PAGE = """<!DOCTYPE html>
             });
         }
 
+        function setupTicker(itemEl, textEl, containerEl) {
+            itemEl.addEventListener('mouseenter', () => {
+                const diff = textEl.scrollWidth - containerEl.clientWidth;
+                if (diff > 4) {
+                    const duration = Math.max(3.5, diff / 25);
+                    textEl.style.setProperty('--ticker-offset', `-${diff + 6}px`);
+                    textEl.style.setProperty('--ticker-duration', `${duration.toFixed(1)}s`);
+                    textEl.classList.add('ticker-active');
+                }
+            });
+            itemEl.addEventListener('mouseleave', () => {
+                textEl.classList.remove('ticker-active');
+                textEl.style.transform = '';
+            });
+        }
+
         function renderDirectory(filter) {
             if (!directoryData) return;
             const treeList = document.getElementById('treeList');
@@ -790,10 +838,17 @@ HTML_PAGE = """<!DOCTYPE html>
             filteredFolders.forEach(f => {
                 const div = document.createElement('div');
                 div.className = 'folder-item';
+                div.title = f.name;
                 div.innerHTML = `
-                    <div class="folder-name">📁 <strong>${f.name}</strong></div>
-                    <span style="font-size: 0.75rem; color: #8b949e;">${f.audio_count} tracks</span>
+                    <div class="folder-name-container">
+                        <span style="flex-shrink: 0;">📁</span>
+                        <span class="folder-name"><strong>${escapeHtml(f.name)}</strong></span>
+                    </div>
+                    <span style="font-size: 0.75rem; color: #8b949e; flex-shrink: 0;">${f.audio_count} tracks</span>
                 `;
+                const containerEl = div.querySelector('.folder-name-container');
+                const nameEl = div.querySelector('.folder-name');
+                setupTicker(div, nameEl, containerEl);
                 div.onclick = () => loadDirectory(f.path);
                 treeList.appendChild(div);
             });
@@ -804,14 +859,18 @@ HTML_PAGE = """<!DOCTYPE html>
                 const div = document.createElement('div');
                 div.className = 'file-item';
                 div.id = `file-item-${idx}`;
+                div.title = f.name;
                 
                 const badgeClass = f.is_hires ? 'badge-hires' : 'badge-cd';
                 const badgeText = f.samplerate ? `${(f.samplerate/1000).toFixed(1)}k` : 'FLAC';
 
                 div.innerHTML = `
                     <div class="file-top">
-                        <div class="file-title">🎵 ${escapeHtml(f.name)}</div>
-                        <span class="${badgeClass}">${badgeText}</span>
+                        <div class="file-title-container">
+                            <span style="flex-shrink: 0;">🎵</span>
+                            <span class="file-title">${escapeHtml(f.name)}</span>
+                        </div>
+                        <span class="${badgeClass}" style="flex-shrink: 0;">${badgeText}</span>
                     </div>
                     <div class="file-meta">
                         <span>⏱ ${f.duration_str}</span>
@@ -819,6 +878,9 @@ HTML_PAGE = """<!DOCTYPE html>
                         ${f.subtype ? `<span>${escapeHtml(f.subtype)}</span>` : ''}
                     </div>
                 `;
+                const containerEl = div.querySelector('.file-title-container');
+                const titleEl = div.querySelector('.file-title');
+                setupTicker(div, titleEl, containerEl);
                 div.onclick = () => analyzeTrack(f, div);
                 treeList.appendChild(div);
             });
