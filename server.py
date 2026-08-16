@@ -176,12 +176,10 @@ def analyze_file_on_demand(filepath):
         webp_b64, lookup_b64, lookup_w, lookup_h = encode_spectrogram_and_lookup(spec_db)
 
         # Extract verdict and noise profile
-        verdict = "ANALYZED"
+        verdict = provenance_info.get("label", "ANALYZED")
         noise_profile = ""
         for line in assessment_text.splitlines():
-            if line.startswith("ASSESSMENT:"):
-                verdict = line.replace("ASSESSMENT:", "").strip()
-            elif line.startswith("NOISE PROFILE:"):
+            if line.startswith("NOISE PROFILE:"):
                 noise_profile = line.replace("NOISE PROFILE:", "").strip().strip("[]")
 
         return {
@@ -732,22 +730,37 @@ HTML_PAGE = """<!DOCTYPE html>
                             <div id="trackMeta" style="font-size: 0.8rem; color: var(--text-muted); margin-top: 4px;">--</div>
                         </div>
                         <div style="display: flex; gap: 8px; flex-wrap: wrap; align-items: center;">
-                            <div id="verdictBadge" class="badge-hires" style="font-size: 0.82rem; padding: 4px 10px;">--</div>
                             <div id="drBadge" class="badge-hires" style="font-size: 0.82rem; padding: 4px 10px; display: none;">--</div>
                             <div id="noiseBadge" class="badge-cd" style="font-size: 0.82rem; padding: 4px 10px; display: none;">--</div>
                         </div>
                     </div>
                     <!-- Estimated Provenance Banner -->
-                    <div id="provenanceCard" class="provenance-banner" style="display: none;">
-                        <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px;">
-                            <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
-                                <span style="font-size: 1.05rem;">🏷️</span>
-                                <strong style="font-size: 0.85rem; color: var(--text-heading);">Estimated Provenance:</strong>
-                                <span id="provBadge" class="provenance-tag badge-provenance-native">--</span>
+                    <div id="provenanceCard" class="provenance-banner" style="display: none; gap: 8px;">
+                        <!-- Primary Assessment -->
+                        <div>
+                            <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px;">
+                                <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+                                    <span style="font-size: 1.05rem;">🏷️</span>
+                                    <strong style="font-size: 0.85rem; color: var(--text-heading);">Most Likely Provenance:</strong>
+                                    <span id="provBadge" class="provenance-tag badge-provenance-native">--</span>
+                                </div>
+                                <span id="provConf" class="confidence-pill conf-high">--</span>
                             </div>
-                            <span id="provConf" class="confidence-pill conf-high">--</span>
+                            <div id="provDetails" style="font-size: 0.78rem; color: var(--text-muted); margin-top: 4px; padding-left: 26px;">--</div>
                         </div>
-                        <div id="provDetails" style="font-size: 0.78rem; color: var(--text-muted); margin-top: 5px;">--</div>
+
+                        <!-- Alternative Possibility (if any) -->
+                        <div id="provAltRow" style="display: none; border-top: 1px solid rgba(255,255,255,0.08); padding-top: 8px; margin-top: 4px;">
+                            <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px;">
+                                <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+                                    <span style="font-size: 0.95rem;">⚡</span>
+                                    <span style="font-size: 0.82rem; color: var(--text-muted); font-weight: 500;">Alternative Possibility:</span>
+                                    <span id="provAltBadge" class="provenance-tag badge-provenance-leaky" style="font-size: 0.76rem; padding: 1px 6px;">--</span>
+                                </div>
+                                <span id="provAltConf" class="confidence-pill conf-mod" style="font-size: 0.68rem;">--</span>
+                            </div>
+                            <div id="provAltDetails" style="font-size: 0.75rem; color: var(--text-muted); margin-top: 3px; padding-left: 24px;">--</div>
+                        </div>
                     </div>
                     <audio id="audioPlayer" controls style="margin-top: 10px;"></audio>
                 </section>
@@ -999,22 +1012,6 @@ HTML_PAGE = """<!DOCTYPE html>
                 document.getElementById('trackTitle').textContent = data.filename;
                 document.getElementById('trackMeta').textContent = `${data.sr.toLocaleString()} Hz | ${data.nyquist_khz.toFixed(1)} kHz Nyquist | ${data.duration_s.toFixed(1)}s sample | Analyzed in ${data.analysis_time}s`;
                 
-                const vBadge = document.getElementById('verdictBadge');
-                vBadge.textContent = data.verdict;
-                if (data.verdict.includes('FAKE') || data.verdict.includes('UPSAMPLED') || data.verdict.includes('ZERO-STUFFED')) {
-                    vBadge.style.background = 'rgba(255, 23, 68, 0.15)';
-                    vBadge.style.borderColor = 'rgba(255, 23, 68, 0.4)';
-                    vBadge.style.color = '#ff1744';
-                } else if (data.verdict.includes('NATIVE')) {
-                    vBadge.style.background = 'rgba(0, 229, 255, 0.15)';
-                    vBadge.style.borderColor = 'rgba(0, 229, 255, 0.4)';
-                    vBadge.style.color = '#00e5ff';
-                } else {
-                    vBadge.style.background = '#21262d';
-                    vBadge.style.borderColor = '#30363d';
-                    vBadge.style.color = '#8b949e';
-                }
-
                 // Dynamic Range badge
                 const drBadge = document.getElementById('drBadge');
                 if (data.dr_score !== undefined && data.dr_score !== null) {
@@ -1072,42 +1069,67 @@ HTML_PAGE = """<!DOCTYPE html>
                 const provBadge = document.getElementById('provBadge');
                 const provConf = document.getElementById('provConf');
                 const provDetails = document.getElementById('provDetails');
+                const provAltRow = document.getElementById('provAltRow');
+                const provAltBadge = document.getElementById('provAltBadge');
+                const provAltConf = document.getElementById('provAltConf');
+                const provAltDetails = document.getElementById('provAltDetails');
 
                 if (data.provenance && data.provenance.label) {
                     provCard.style.display = 'flex';
-                    provBadge.textContent = data.provenance.label;
-                    provBadge.className = `provenance-tag ${data.provenance.badge_class || 'badge-provenance-native'}`;
+                    const primary = data.provenance.primary || data.provenance;
+                    provBadge.textContent = primary.label;
+                    provBadge.className = `provenance-tag ${primary.badge_class || 'badge-provenance-native'}`;
 
-                    const scorePct = Math.round((data.provenance.score || 0.9) * 100);
-                    provConf.textContent = `${data.provenance.confidence} Confidence (${scorePct}%)`;
-                    if (data.provenance.confidence === 'High') {
+                    const scorePct = Math.round((primary.score || 0.9) * 100);
+                    provConf.textContent = `${primary.confidence} Confidence (${scorePct}%)`;
+                    if (primary.confidence === 'High') {
                         provConf.className = 'confidence-pill conf-high';
-                    } else if (data.provenance.confidence === 'Moderate') {
+                    } else if (primary.confidence === 'Moderate') {
                         provConf.className = 'confidence-pill conf-mod';
                     } else {
                         provConf.className = 'confidence-pill conf-low';
                     }
-                    provDetails.textContent = data.provenance.details || '';
+                    provDetails.textContent = primary.details || '';
+
+                    // Alternative possibility row
+                    if (data.provenance.alternative && data.provenance.alternative.label) {
+                        const alt = data.provenance.alternative;
+                        provAltRow.style.display = 'block';
+                        provAltBadge.textContent = alt.label;
+                        provAltBadge.className = `provenance-tag ${alt.badge_class || 'badge-provenance-leaky'}`;
+                        const altPct = Math.round((alt.score || 0.7) * 100);
+                        provAltConf.textContent = `${alt.confidence} (${altPct}%)`;
+                        if (alt.confidence === 'High') {
+                            provAltConf.className = 'confidence-pill conf-high';
+                        } else if (alt.confidence === 'Moderate') {
+                            provAltConf.className = 'confidence-pill conf-mod';
+                        } else {
+                            provAltConf.className = 'confidence-pill conf-low';
+                        }
+                        provAltDetails.textContent = alt.details || '';
+                    } else {
+                        provAltRow.style.display = 'none';
+                    }
 
                     // Update track item badge in left sidebar if clear
                     if (fileEl) {
                         const topRow = fileEl.querySelector('.file-top');
                         let provTag = topRow.querySelector('.file-prov-tag');
-                        if (data.provenance.confidence !== 'Low' && !data.provenance.label.includes('Unclear')) {
+                        if (primary.confidence !== 'Low' && !primary.label.includes('Unclear')) {
                             if (!provTag) {
                                 provTag = document.createElement('span');
-                                provTag.className = `file-prov-tag ${data.provenance.badge_class}`;
+                                provTag.className = `file-prov-tag ${primary.badge_class}`;
                                 provTag.style.cssText = 'font-size: 0.68rem; padding: 1px 5px; border-radius: 3px; font-weight: 600; flex-shrink: 0;';
                                 topRow.insertBefore(provTag, topRow.lastElementChild);
                             }
-                            let shortLabel = data.provenance.label
+                            let shortLabel = primary.label
                                 .replace(' Master', '')
                                 .replace(' Source', '')
                                 .replace(' Material', '')
                                 .replace(' (Leaky SRC / DAC)', ' (Leaky)')
                                 .replace('from ', '');
                             provTag.textContent = shortLabel;
-                            provTag.className = `file-prov-tag ${data.provenance.badge_class}`;
+                            provTag.className = `file-prov-tag ${primary.badge_class}`;
                         } else if (provTag) {
                             provTag.remove();
                         }

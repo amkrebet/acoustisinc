@@ -204,23 +204,21 @@ def analyze_audio_forensics(y, sr):
                 report.append("  -> Strong spectral mirror imaging detected above 22.05 kHz.")
             
     # Forensic Cutoff & Upsampling Detection
-    if sr >= 88200 and not is_zero_stuffed:
+    if sr >= 48000 and not is_zero_stuffed:
         idx_floor_start = np.argmin(np.abs(freqs - (0.82 * nyquist)))
         idx_floor_end = np.argmin(np.abs(freqs - (0.96 * nyquist)))
         noise_floor_rms = np.median(rms_dbfs[idx_floor_start:idx_floor_end])
         noise_floor_peak = np.median(peak_dbfs[idx_floor_start:idx_floor_end])
-        
-        spec_db = 20.0 * np.log10(np.maximum(stft_norm, 1e-12))
-        mean_spec_db = np.mean(spec_db, axis=1)
+        noise_floor_spec = np.median(mean_spec_db[idx_floor_start:idx_floor_end])
 
         idx_20k = np.argmin(np.abs(freqs - 20000))
         idx_22k = np.argmin(np.abs(freqs - 22050))
         idx_23k = np.argmin(np.abs(freqs - 23000))
         idx_24k = np.argmin(np.abs(freqs - 24000))
         idx_25k = np.argmin(np.abs(freqs - 25000))
-        idx_30k = np.argmin(np.abs(freqs - 30000))
-        idx_40k = np.argmin(np.abs(freqs - 40000))
-        idx_42k = np.argmin(np.abs(freqs - 42000))
+        idx_30k = np.argmin(np.abs(freqs - 30000)) if nyquist > 30000 else None
+        idx_40k = np.argmin(np.abs(freqs - 40000)) if nyquist > 40000 else None
+        idx_42k = np.argmin(np.abs(freqs - 42000)) if nyquist > 42000 else None
         idx_45k = np.argmin(np.abs(freqs - 45000)) if nyquist > 45000 else None
         idx_46k = np.argmin(np.abs(freqs - 46000)) if nyquist > 46000 else None
         idx_48k = np.argmin(np.abs(freqs - 48000)) if nyquist > 48000 else None
@@ -241,48 +239,37 @@ def analyze_audio_forensics(y, sr):
                 is_96k_cutoff = True
 
         # Check CD Cutoff (44.1 kHz brickwall at 22.05 kHz):
-        drop_20_23 = rms_dbfs[idx_20k] - rms_dbfs[idx_23k]
-        flatness_24_30 = abs(rms_dbfs[idx_24k] - rms_dbfs[idx_30k])
-        if not is_88k_cutoff and not is_96k_cutoff and drop_20_23 > 16.0 and flatness_24_30 < 6.0 and (rms_dbfs[idx_24k] <= noise_floor_rms + 8.0 or rms_dbfs[idx_24k] < -125.0):
+        drop_20_23 = mean_spec_db[idx_20k] - mean_spec_db[idx_23k]
+        if not is_88k_cutoff and not is_96k_cutoff and drop_20_23 > 16.0 and (rms_dbfs[idx_23k] <= noise_floor_rms + 8.0 or mean_spec_db[idx_23k] < -125.0):
             is_cd_cutoff = True
 
         # Check 48k Cutoff (48 kHz brickwall at 24.0 kHz):
-        drop_22_25 = rms_dbfs[idx_22k] - rms_dbfs[idx_25k]
-        flatness_26_30 = abs(rms_dbfs[np.argmin(np.abs(freqs - 26000))] - rms_dbfs[idx_30k])
-        if not is_cd_cutoff and not is_88k_cutoff and not is_96k_cutoff and drop_22_25 > 16.0 and flatness_26_30 < 6.0 and (rms_dbfs[idx_25k] <= noise_floor_rms + 8.0 or rms_dbfs[idx_25k] < -125.0):
-            is_48k_cutoff = True
+        if nyquist > 25000:
+            drop_22_25 = mean_spec_db[idx_22k] - mean_spec_db[idx_25k]
+            if not is_cd_cutoff and not is_88k_cutoff and not is_96k_cutoff and drop_22_25 > 16.0 and (rms_dbfs[idx_25k] <= noise_floor_rms + 8.0 or mean_spec_db[idx_25k] < -125.0):
+                is_48k_cutoff = True
 
         if is_cd_cutoff:
             is_upsampled = True
             detected_base_hz = 22050
             effective_cutoff_hz = 22050.0
-            report.append("\nASSESSMENT: [FAKE HI-RES / UPSAMPLED CD SOURCE]")
-            report.append("  -> Brick-wall filter attenuation detected near ~22.05 kHz.")
         elif is_48k_cutoff:
             is_upsampled = True
             detected_base_hz = 24000
             effective_cutoff_hz = 24000.0
-            report.append("\nASSESSMENT: [UPSAMPLED 48 kHz SOURCE]")
-            report.append("  -> Sharp attenuation detected near ~24.0 kHz.")
         elif is_88k_cutoff:
             is_upsampled = True
             detected_base_hz = 44100
             effective_cutoff_hz = 44100.0
-            report.append("\nASSESSMENT: [UPSAMPLED 88.2 kHz SOURCE]")
-            report.append("  -> Sharp attenuation detected near ~44.1 kHz (88.2 kHz Master).")
         elif is_96k_cutoff:
             is_upsampled = True
             detected_base_hz = 48000
             effective_cutoff_hz = 48000.0
-            report.append("\nASSESSMENT: [UPSAMPLED 96 kHz SOURCE]")
-            report.append("  -> Sharp attenuation detected near ~48.0 kHz (96 kHz Master).")
         else:
             above_floor = (rms_dbfs > (noise_floor_rms + 5.0)) | (mean_spec_db > (np.median(mean_spec_db[idx_floor_start:idx_floor_end]) + 5.0))
             valid_idx = np.where(above_floor)[0]
             effective_bw_hz = freqs[valid_idx[-1]] if len(valid_idx) > 0 else 20000.0
             effective_cutoff_hz = min(nyquist, max(20000.0, effective_bw_hz))
-            report.append("\nASSESSMENT: [NATIVE HI-RES MATERIAL]")
-            report.append("  -> Continuous harmonic energy extending well into the ultrasonic band.")
 
     report.insert(3, f"Effective Signal Bandwidth: ~{effective_cutoff_hz/1000:.1f} kHz")
 
@@ -355,24 +342,26 @@ def analyze_audio_forensics(y, sr):
     # Checks for leaky reconstruction filters folding across candidate Nyquist boundaries:
     # 16.0 kHz (32k base), 22.05 kHz (44.1k base), 24.0 kHz (48k base), 32.0 kHz (64k base), 44.1 kHz (88.2k base), 48.0 kHz (96k base)
     candidates_fn = [16000, 22050, 24000, 32000, 44100, 48000]
-    leaky_detection = None
+    leaky_hits = []
 
     for f_n in candidates_fn:
-        if f_n + 1500 > nyquist or (f_n - 1500) < 5000:
+        if f_n + 1200 > nyquist or (f_n - 1500) < 5000:
             continue
 
         i_base = np.argmin(np.abs(freqs - (f_n - 1500)))
         i_notch = np.argmin(np.abs(freqs - f_n))
-        i_rebound = np.argmin(np.abs(freqs - (f_n + 800)))
+        i_rebound = np.argmin(np.abs(freqs - (f_n + 700)))
 
         notch_drop = mean_spec_db[i_base] - mean_spec_db[i_notch]
         rebound_rise = mean_spec_db[i_rebound] - mean_spec_db[i_notch]
 
         # Calculate cross-temporal correlation across the folding axis f_n
         corrs = []
-        for delta in np.linspace(300, 1500, 8):
+        for delta in np.linspace(200, 1500, 8):
             f1 = f_n - delta
             f2 = f_n + delta
+            if f2 > nyquist:
+                continue
             i1 = np.argmin(np.abs(freqs - f1))
             i2 = np.argmin(np.abs(freqs - f2))
             t1 = stft_mag[i1, :]
@@ -384,71 +373,99 @@ def analyze_audio_forensics(y, sr):
 
         avg_corr = float(np.mean(corrs)) if corrs else 0.0
 
-        if rebound_rise > 2.0 and (avg_corr > 0.60 or notch_drop > 8.0):
-            base_rate_khz = (f_n * 2) / 1000.0
-            leaky_detection = {
-                "base_rate_khz": base_rate_khz,
+        if (rebound_rise > 2.0 or (notch_drop > 15.0 and avg_corr > 0.55)) and (avg_corr > 0.55 or notch_drop > 8.0):
+            leaky_hits.append({
+                "base_rate_khz": (f_n * 2) / 1000.0,
                 "f_n_khz": f_n / 1000.0,
                 "rebound_db": rebound_rise,
                 "notch_drop_db": notch_drop,
                 "mirror_corr": avg_corr
-            }
-            break
+            })
+
+    primary_prov = None
+    alt_prov = None
 
     if is_zero_stuffed:
-        provenance_info = {
+        primary_prov = {
             "label": "Raw Zero-Stuffed / NOS Source",
             "confidence": "High",
             "score": 0.98,
             "badge_class": "badge-provenance-fake",
             "details": "Literal zero-stuffing or strong unfiltered imaging detected above 22.05 kHz."
         }
-    elif leaky_detection is not None:
-        c_score = leaky_detection["mirror_corr"]
+    elif is_cd_cutoff:
+        drop_val = drop_20_23 if 'drop_20_23' in locals() else 20.0
+        primary_prov = {
+            "label": "Upsampled from 44.1 kHz Master",
+            "confidence": "High",
+            "score": 0.94,
+            "badge_class": "badge-provenance-upsampled",
+            "details": f"Sharp anti-aliasing cutoff at 22.05 kHz ({drop_val:.1f} dB drop) into container noise floor."
+        }
+        if leaky_hits and leaky_hits[0]["mirror_corr"] > 0.55:
+            mc = leaky_hits[0]["mirror_corr"]
+            alt_prov = {
+                "label": "44.1 kHz Master (Leaky Filter Residual)",
+                "confidence": "Moderate",
+                "score": round(mc, 2),
+                "badge_class": "badge-provenance-leaky",
+                "details": f"Residual spectral leakage across 22.05 kHz with r={mc:+.2f} mirror correlation."
+            }
+    elif is_88k_cutoff:
+        primary_prov = {
+            "label": "Upsampled from 88.2 kHz Master",
+            "confidence": "High",
+            "score": 0.95,
+            "badge_class": "badge-provenance-upsampled",
+            "details": "Sharp anti-aliasing cutoff at 44.1 kHz into baseline dither noise floor."
+        }
+        if leaky_hits and leaky_hits[0]["mirror_corr"] > 0.55:
+            mc = leaky_hits[0]["mirror_corr"]
+            alt_prov = {
+                "label": "88.2 kHz Master (Leaky Filter Residual)",
+                "confidence": "Moderate",
+                "score": round(mc, 2),
+                "badge_class": "badge-provenance-leaky",
+                "details": f"Residual spectral leakage across 44.1 kHz with r={mc:+.2f} mirror correlation."
+            }
+    elif is_96k_cutoff:
+        primary_prov = {
+            "label": "Upsampled from 96.0 kHz Master",
+            "confidence": "High",
+            "score": 0.95,
+            "badge_class": "badge-provenance-upsampled",
+            "details": "Sharp anti-aliasing cutoff at 48.0 kHz into baseline dither noise floor."
+        }
+    elif is_48k_cutoff:
+        primary_prov = {
+            "label": "Upsampled from 48.0 kHz Source",
+            "confidence": "High",
+            "score": 0.95,
+            "badge_class": "badge-provenance-upsampled",
+            "details": "Sharp anti-aliasing cutoff at 24.0 kHz into container noise floor."
+        }
+    elif leaky_hits:
+        h = leaky_hits[0]
+        c_score = h["mirror_corr"]
         conf = "High" if c_score > 0.75 else "Moderate"
-        base_khz = leaky_detection["base_rate_khz"]
-        fn_khz = leaky_detection["f_n_khz"]
-        provenance_info = {
+        base_khz = h["base_rate_khz"]
+        fn_khz = h["f_n_khz"]
+        primary_prov = {
             "label": f"{base_khz:.1f} kHz Master (Leaky SRC / DAC)",
             "confidence": conf,
             "score": round(min(0.98, max(0.70, c_score)), 2),
             "badge_class": "badge-provenance-leaky",
             "details": f"{base_khz:.1f} kHz filter notch at {fn_khz:.2f} kHz with mirrored spectral imaging (r={c_score:+.2f})."
         }
-    elif is_88k_cutoff:
-        provenance_info = {
-            "label": "Upsampled from 88.2 kHz Master",
-            "confidence": "High",
-            "score": 0.95,
+        alt_prov = {
+            "label": f"Upsampled from {base_khz:.1f} kHz Master",
+            "confidence": "Moderate",
+            "score": 0.65,
             "badge_class": "badge-provenance-upsampled",
-            "details": "Sharp anti-aliasing cutoff at 44.1 kHz into container baseline dither noise floor."
-        }
-    elif is_96k_cutoff:
-        provenance_info = {
-            "label": "Upsampled from 96.0 kHz Master",
-            "confidence": "High",
-            "score": 0.95,
-            "badge_class": "badge-provenance-upsampled",
-            "details": "Sharp anti-aliasing cutoff at 48.0 kHz into container baseline dither noise floor."
-        }
-    elif is_cd_cutoff:
-        provenance_info = {
-            "label": "Upsampled from 44.1 kHz CD",
-            "confidence": "High",
-            "score": 0.95,
-            "badge_class": "badge-provenance-upsampled",
-            "details": "Brick-wall cutoff at 22.05 kHz into container noise floor."
-        }
-    elif is_48k_cutoff:
-        provenance_info = {
-            "label": "Upsampled from 48.0 kHz Source",
-            "confidence": "High",
-            "score": 0.95,
-            "badge_class": "badge-provenance-upsampled",
-            "details": "Brick-wall cutoff at 24.0 kHz into container noise floor."
+            "details": f"Sharp attenuation near {fn_khz:.2f} kHz with filter skirt artifacts."
         }
     elif nyquist <= 22050:
-        provenance_info = {
+        primary_prov = {
             "label": f"Native {sr/1000:.1f} kHz CD Master",
             "confidence": "High",
             "score": 0.95,
@@ -457,7 +474,7 @@ def analyze_audio_forensics(y, sr):
         }
     elif sr == 48000:
         if effective_cutoff_hz >= 23500.0:
-            provenance_info = {
+            primary_prov = {
                 "label": "Native 48.0 kHz Master",
                 "confidence": "High",
                 "score": 0.90,
@@ -465,7 +482,7 @@ def analyze_audio_forensics(y, sr):
                 "details": f"Continuous harmonic extension up to {effective_cutoff_hz/1000:.1f} kHz Nyquist limit."
             }
         elif effective_cutoff_hz >= 21500.0:
-            provenance_info = {
+            primary_prov = {
                 "label": "Native 48.0 kHz Material",
                 "confidence": "Moderate",
                 "score": 0.75,
@@ -473,7 +490,7 @@ def analyze_audio_forensics(y, sr):
                 "details": f"Natural acoustic roll-off extending to ~{effective_cutoff_hz/1000:.1f} kHz."
             }
         else:
-            provenance_info = {
+            primary_prov = {
                 "label": "Unclear / Mixed Source",
                 "confidence": "Low",
                 "score": 0.40,
@@ -482,7 +499,7 @@ def analyze_audio_forensics(y, sr):
             }
     else:
         if effective_cutoff_hz >= 26000.0:
-            provenance_info = {
+            primary_prov = {
                 "label": f"Native {sr/1000:.1f} kHz Master",
                 "confidence": "High",
                 "score": 0.92,
@@ -490,7 +507,7 @@ def analyze_audio_forensics(y, sr):
                 "details": f"Continuous acoustic harmonic bandwidth reaching ~{effective_cutoff_hz/1000:.1f} kHz."
             }
         elif effective_cutoff_hz >= 21000.0:
-            provenance_info = {
+            primary_prov = {
                 "label": f"Native {sr/1000:.1f} kHz Material",
                 "confidence": "Moderate",
                 "score": 0.75,
@@ -498,7 +515,7 @@ def analyze_audio_forensics(y, sr):
                 "details": f"Smooth ultrasonic roll-off up to ~{effective_cutoff_hz/1000:.1f} kHz."
             }
         else:
-            provenance_info = {
+            primary_prov = {
                 "label": "Unclear / Mixed Source",
                 "confidence": "Low",
                 "score": 0.40,
@@ -506,8 +523,21 @@ def analyze_audio_forensics(y, sr):
                 "details": "Bandwidth limited without clear brickwall or mirror characteristics."
             }
 
-    report.append(f"\nESTIMATED PROVENANCE : {provenance_info['label']} [{provenance_info['confidence']} Confidence: {int(provenance_info['score']*100)}%]")
-    report.append(f"  -> {provenance_info['details']}")
+    provenance_info = {
+        "primary": primary_prov,
+        "alternative": alt_prov,
+        "label": primary_prov["label"],
+        "confidence": primary_prov["confidence"],
+        "score": primary_prov["score"],
+        "badge_class": primary_prov["badge_class"],
+        "details": primary_prov["details"]
+    }
+
+    report.append(f"\nESTIMATED PROVENANCE : {primary_prov['label']} [{primary_prov['confidence']} Confidence: {int(primary_prov['score']*100)}%]")
+    report.append(f"  -> {primary_prov['details']}")
+    if alt_prov:
+        report.append(f"  -> ALTERNATIVE POSSIBILITY: {alt_prov['label']} [{alt_prov['confidence']} Confidence: {int(alt_prov['score']*100)}%]")
+        report.append(f"     {alt_prov['details']}")
 
     return spec_db, freqs, peak_dbfs, rms_dbfs, "\n".join(report), dr_metrics, provenance_info
 
