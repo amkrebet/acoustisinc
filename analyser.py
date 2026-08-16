@@ -352,27 +352,49 @@ def analyze_audio_forensics(y, sr):
     report.append(f"Peak Signal Level            : {peak_db:.2f} dBFS")
 
     # 5. Estimated Provenance Analysis (Lineage, Base Rates & Resampling Fingerprint)
-    has_notch_rebound_44k = False
-    mirror_corr_44k = 0.0
-    if sr >= 48000:
-        notch_drop = mean_spec_db[idx_20k] - mean_spec_db[idx_22k]
-        idx_228k = np.argmin(np.abs(freqs - 22800))
-        rebound = mean_spec_db[idx_228k] - mean_spec_db[idx_22k]
+    # Universal Multi-Boundary Mirror & Notch Rebound Scanner:
+    # Checks for leaky reconstruction filters folding across candidate Nyquist boundaries:
+    # 16.0 kHz (32k base), 22.05 kHz (44.1k base), 24.0 kHz (48k base), 32.0 kHz (64k base), 44.1 kHz (88.2k base), 48.0 kHz (96k base)
+    candidates_fn = [16000, 22050, 24000, 32000, 44100, 48000]
+    leaky_detection = None
 
+    for f_n in candidates_fn:
+        if f_n + 1500 > nyquist or (f_n - 1500) < 5000:
+            continue
+
+        i_base = np.argmin(np.abs(freqs - (f_n - 1500)))
+        i_notch = np.argmin(np.abs(freqs - f_n))
+        i_rebound = np.argmin(np.abs(freqs - (f_n + 800)))
+
+        notch_drop = mean_spec_db[i_base] - mean_spec_db[i_notch]
+        rebound_rise = mean_spec_db[i_rebound] - mean_spec_db[i_notch]
+
+        # Calculate cross-temporal correlation across the folding axis f_n
         corrs = []
-        for f_base in np.linspace(20600, 21800, 10):
-            f_mirror = 44100.0 - f_base
-            i1 = np.argmin(np.abs(freqs - f_base))
-            i2 = np.argmin(np.abs(freqs - f_mirror))
+        for delta in np.linspace(300, 1500, 8):
+            f1 = f_n - delta
+            f2 = f_n + delta
+            i1 = np.argmin(np.abs(freqs - f1))
+            i2 = np.argmin(np.abs(freqs - f2))
             t1 = stft_mag[i1, :]
             t2 = stft_mag[i2, :]
             if np.std(t1) > 1e-8 and np.std(t2) > 1e-8:
                 c = np.corrcoef(t1, t2)[0, 1]
                 if not np.isnan(c):
                     corrs.append(c)
-        mirror_corr_44k = float(np.mean(corrs)) if corrs else 0.0
-        if rebound > 2.0 and (mirror_corr_44k > 0.60 or notch_drop > 8.0):
-            has_notch_rebound_44k = True
+
+        avg_corr = float(np.mean(corrs)) if corrs else 0.0
+
+        if rebound_rise > 2.0 and (avg_corr > 0.60 or notch_drop > 8.0):
+            base_rate_khz = (f_n * 2) / 1000.0
+            leaky_detection = {
+                "base_rate_khz": base_rate_khz,
+                "f_n_khz": f_n / 1000.0,
+                "rebound_db": rebound_rise,
+                "notch_drop_db": notch_drop,
+                "mirror_corr": avg_corr
+            }
+            break
 
     if is_zero_stuffed:
         provenance_info = {
@@ -382,14 +404,17 @@ def analyze_audio_forensics(y, sr):
             "badge_class": "badge-provenance-fake",
             "details": "Literal zero-stuffing or strong unfiltered imaging detected above 22.05 kHz."
         }
-    elif has_notch_rebound_44k:
-        conf = "High" if mirror_corr_44k > 0.75 else "Moderate"
+    elif leaky_detection is not None:
+        c_score = leaky_detection["mirror_corr"]
+        conf = "High" if c_score > 0.75 else "Moderate"
+        base_khz = leaky_detection["base_rate_khz"]
+        fn_khz = leaky_detection["f_n_khz"]
         provenance_info = {
-            "label": "44.1 kHz Master (Leaky SRC / DAC)",
+            "label": f"{base_khz:.1f} kHz Master (Leaky SRC / DAC)",
             "confidence": conf,
-            "score": round(min(0.98, max(0.70, mirror_corr_44k)), 2),
+            "score": round(min(0.98, max(0.70, c_score)), 2),
             "badge_class": "badge-provenance-leaky",
-            "details": f"44.1 kHz filter notch at 22.05 kHz with mirrored spectral imaging (r={mirror_corr_44k:+.2f})."
+            "details": f"{base_khz:.1f} kHz filter notch at {fn_khz:.2f} kHz with mirrored spectral imaging (r={c_score:+.2f})."
         }
     elif is_88k_cutoff:
         provenance_info = {
