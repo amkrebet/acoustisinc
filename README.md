@@ -57,6 +57,27 @@ It delivers:
 
 ---
 
+## 🔬 Filter Topology & Impulse Response Analysis
+
+AcoustiSinc implements four mathematical reconstruction filter topologies in strict 64-bit double precision (`float64` / `complex128` / OpenCL `double2`), catering to different musical genres and recording provenances:
+
+![AcoustiSinc Filter Topology & Impulse Response Analysis](acoustisinc_filter_impulse_comparison_v1.png)
+
+### Filter Topology Comparison
+
+| Filter Mode | CLI Flags | Time-Domain Impulse Profile | Pre-Ringing | Post-Ringing | Phase Linearity | Best Musical Fit |
+| :--- | :--- | :--- | :---: | :---: | :---: | :--- |
+| **Linear Phase (Standard)** | `--phase linear` | Symmetric $\text{sinc}(x)$ | Present | Present (Equal) | **Strict Linear** (0° phase shift) | Electronic music, synthesizers, multi-track studio stems. |
+| **Linear Phase + Apodizing** | `--phase linear --apod` | Symmetric with cosine transition taper | Attenuated | Attenuated (Equal) | **Strict Linear** (0° phase shift) | Hot/compressed modern pop & rock masters. |
+| **Minimum Phase (Standard)** | `--phase min` | Asymmetric causal impulse | **Zero (0.00%)** | Natural exponential decay | Minimum Phase (Non-linear) | Acoustic instruments, percussion, classical, jazz, vocals, natural soundstage imaging. |
+| **Minimum Phase + Apodizing** | `--phase min --apod` | Asymmetric causal with smooth cutoff | **Zero (0.00%)** | Rapid decaying post-ringing | Minimum Phase (Non-linear) | Early digital CD transfers (1980s–90s) with harsh studio ADC ringing. |
+
+#### Acoustic & Psychoacoustic Insights
+1. **Zero Pre-Ringing in Minimum Phase**: In acoustic physics, sound cannot precede the physical impact that generates it. Linear-phase filters introduce acausal backward-in-time oscillations before transients. Human hearing has almost zero backward temporal masking ($<5\text{ ms}$), rendering pre-ringing audible as artificial "digital smear". Minimum-phase filtering shifts all energy into the causal domain ($t \ge 0$), delivering instantaneous transient impact and authentic soundstage localization.
+2. **Apodizing High-Frequency Taper**: Early studio ADCs often used steep anti-aliasing brickwall filters with severe passband ripple. The `--apodizing` mode introduces a smooth roll-off transition band near $20.05\text{ kHz}$, cleanly eliminating pre-existing ADC ringing and stopband Gibbs overshoot.
+
+---
+
 ## 🛡️ Intersample Headroom & Dynamic Gain Structure
 
 Upsampling band-limited audio reconstructs the continuous analog waveform between discrete digital samples. On heavily mastered or brick-wall limited audio, this natural mathematical curve reconstruction creates **intersample true-peak overshoots** that easily exceed $0\text{ dBFS}$.
