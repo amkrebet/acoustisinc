@@ -183,6 +183,7 @@ __kernel void init_apodizing_filter(
 """
 
 CL_SINC_PROGRAM = None
+CL_KERNELS = {}
 GPU_FILTER_CACHE = {}
 
 def get_sinc_program(ctx):
@@ -190,6 +191,12 @@ def get_sinc_program(ctx):
     if CL_SINC_PROGRAM is None:
         CL_SINC_PROGRAM = cl.Program(ctx, OPENCL_SINC_SRC).build()
     return CL_SINC_PROGRAM
+
+def get_sinc_kernel(ctx, kernel_name):
+    prg = get_sinc_program(ctx)
+    if kernel_name not in CL_KERNELS:
+        CL_KERNELS[kernel_name] = cl.Kernel(prg, kernel_name)
+    return CL_KERNELS[kernel_name]
 
 def get_gpu_filter_kernel(queue, fast_output_len, padded_len, in_len, scale_factor, phase_mode="linear", apodizing=False):
     p = phase_mode.lower()
@@ -206,14 +213,17 @@ def get_gpu_filter_kernel(queue, fast_output_len, padded_len, in_len, scale_fact
     if len(GPU_FILTER_CACHE) > 8:
         GPU_FILTER_CACHE.clear()
 
-    prg = get_sinc_program(queue.context)
     transition_bins = max(16, int((in_len - 1) * 2000.0 / (22050.0 if in_len > 22050 else 44100.0))) if apodizing else max(16, int((in_len - 1) * 250.0 / (22050.0 if in_len > 22050 else 44100.0)))
     k_cutoff = in_len - 1
 
     if is_min:
         # Minimum Phase Kernel (with or without Apodizing transition shaping)
+        k_init = get_sinc_kernel(queue.context, "init_min_phase_log_mag")
+        k_window = get_sinc_kernel(queue.context, "apply_cepstral_window")
+        k_exp = get_sinc_kernel(queue.context, "complex_exp_inplace")
+
         gpu_log_mag = cla.empty(queue, (padded_len,), dtype=np.complex128)
-        prg.init_min_phase_log_mag(
+        k_init(
             queue, (padded_len,), None,
             gpu_log_mag.data, np.uint64(padded_len), np.uint64(k_cutoff), np.uint64(transition_bins)
         )
@@ -222,7 +232,7 @@ def get_gpu_filter_kernel(queue, fast_output_len, padded_len, in_len, scale_fact
         gpu_cep = irfftn(gpu_log_mag, ndim=1, norm=0)
         
         # Apply causal step window + normalization in-place
-        prg.apply_cepstral_window(
+        k_window(
             queue, (fast_output_len,), None,
             gpu_cep.data, np.uint64(fast_output_len)
         )
@@ -231,7 +241,7 @@ def get_gpu_filter_kernel(queue, fast_output_len, padded_len, in_len, scale_fact
         d_kernel = rfftn(gpu_cep, ndim=1)
         
         # In-place complex exponential: exp(u + i*v)
-        prg.complex_exp_inplace(
+        k_exp(
             queue, (padded_len,), None,
             d_kernel.data, np.uint64(padded_len)
         )
@@ -240,8 +250,9 @@ def get_gpu_filter_kernel(queue, fast_output_len, padded_len, in_len, scale_fact
         del gpu_log_mag, gpu_cep
     else:
         # Linear Phase Apodizing Kernel
+        k_apod = get_sinc_kernel(queue.context, "init_apodizing_filter")
         d_kernel = cla.empty(queue, (padded_len,), dtype=np.complex128)
-        prg.init_apodizing_filter(
+        k_apod(
             queue, (padded_len,), None,
             d_kernel.data, np.uint64(padded_len), np.uint64(in_len), np.uint64(transition_bins)
         )
@@ -282,8 +293,7 @@ def upsample_multichannel_gpu(pcm_data, scale_factor, queue, phase_mode="linear"
     kernel_data = d_kernel.data if d_kernel is not None else gpu_freq.data
 
     gpu_padded = cla.empty(queue, (num_channels, padded_spectrum_shape), dtype=np.complex128)
-    prg = get_sinc_program(queue.context)
-    sinc_kernel = cl.Kernel(prg, "sinc_interpolate_multichannel_gpu")
+    sinc_kernel = get_sinc_kernel(queue.context, "sinc_interpolate_multichannel_gpu")
     
     sinc_kernel(
         queue, (padded_spectrum_shape, num_channels), None,
@@ -841,6 +851,12 @@ def process_album_folder(source_album_dir, dest_album_dir, queue, phase_mode, di
         else:
             album_success = True
 
+    # Drain any remaining background writers for this album to maintain low RAM footprint
+    for fut in pass_futures:
+        try: fut.result()
+        except Exception as e:
+            print(f"   [Async Writer Notice]: {e}")
+
     GPU_FILTER_CACHE.clear()
     clear_vkfftapp_cache()
     gc.collect()
@@ -880,6 +896,7 @@ def main():
     dither_mode = "none" if args.no_dither else args.dither
     tmp_dir = os.path.abspath(args.tmp_dir)
     os.makedirs(tmp_dir, exist_ok=True)
+    os.makedirs(target_dir, exist_ok=True)
 
     print(f"\n=======================================================")
     print(f"ACOUSTISINC: 64-BIT GPU SINC AUDIO UPSAMPLER")
@@ -898,7 +915,6 @@ def main():
     queue = cl.CommandQueue(ctx)
 
     if os.path.isfile(source_path):
-        os.makedirs(target_dir, exist_ok=True)
         gain_factor, pk = scan_album([source_path])
         clipped, out_peak, fut = process_track(source_path, target_dir, gain_factor, pk, queue, args.phase, dither_mode, tmp_dir, apodizing=args.apodizing)
         if clipped and out_peak > PEAK_TARGET_LIN:
@@ -923,7 +939,19 @@ def main():
     for idx, album_dir in enumerate(album_directories, 1):
         dest_album_dir = get_destination_dir(album_dir, source_path, target_dir)
         print(f"\n==================================================\n[Album {idx}/{len(album_directories)}]")
-        process_album_folder(album_dir, dest_album_dir, queue, args.phase, dither_mode, tmp_dir, apodizing=args.apodizing)
+        try:
+            process_album_folder(album_dir, dest_album_dir, queue, args.phase, dither_mode, tmp_dir, apodizing=args.apodizing)
+        except Exception as e:
+            err_msg = f"[Album {idx} Skipped on Error]: {album_dir}\nDetails: {e}"
+            print(f"\n{err_msg}\n>>> Continuing to next album...")
+            try:
+                with open(os.path.join(target_dir, "upsample_errors.log"), "a", encoding="utf-8") as ef:
+                    ef.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {err_msg}\n")
+            except Exception:
+                pass
+            GPU_FILTER_CACHE.clear()
+            clear_vkfftapp_cache()
+            gc.collect()
 
     file_writer_pool.shutdown(wait=True)
     print("\n>>> All recursive album batches completed cleanly!")
