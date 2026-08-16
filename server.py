@@ -162,18 +162,9 @@ def analyze_file_on_demand(filepath):
         spec_db, freqs, peak_dbfs, rms_dbfs, assessment_text, dr_metrics = analyze_audio_forensics(data, sr)
 
         nyquist = sr / 2.0
-        duration_s = len(data) / float(sr)
-
-        # Perceptual Tilt on audible band (0-20 kHz)
-        ref_freq = 1000.0
-        freqs_clamped = np.clip(freqs, 10.0, 20000.0)
-        slope_tilt_db = 3.0 * np.log2(freqs_clamped / ref_freq)
-        audible_mask = (freqs <= 20000.0)
-
+        # True, uncolored physical dBFS spectral traces
         display_peak = np.copy(peak_dbfs)
         display_rms = np.copy(rms_dbfs)
-        display_peak[audible_mask] = np.minimum(peak_dbfs[audible_mask] + slope_tilt_db[audible_mask], 0.0)
-        display_rms[audible_mask] = np.minimum(rms_dbfs[audible_mask] + slope_tilt_db[audible_mask], 0.0)
 
         step = max(1, len(freqs) // 2048)
         curve_freqs_khz = (freqs[::step] / 1000.0).round(3).tolist()

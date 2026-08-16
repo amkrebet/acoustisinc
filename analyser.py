@@ -324,18 +324,9 @@ def generate_html5_report(y, sr, audio_filename, output_html, spec_db, freqs, pe
     Generates a single self-contained, publication-grade interactive HTML5 report with zoom controls.
     """
     nyquist = sr / 2.0
-    duration_s = len(y) / float(sr)
-    
-    # Band-Limited Perceptual Tilt for audible band (0-20 kHz)
-    ref_freq = 1000.0
-    freqs_clamped = np.clip(freqs, 10.0, 20000.0)
-    slope_tilt_db = 3.0 * np.log2(freqs_clamped / ref_freq)
-    audible_mask = (freqs <= 20000.0)
-    
+    # True, uncolored physical dBFS spectral traces
     display_peak = np.copy(peak_dbfs)
     display_rms = np.copy(rms_dbfs)
-    display_peak[audible_mask] = np.minimum(peak_dbfs[audible_mask] + slope_tilt_db[audible_mask], 0.0)
-    display_rms[audible_mask] = np.minimum(rms_dbfs[audible_mask] + slope_tilt_db[audible_mask], 0.0)
     
     # Downsample curve data for 60fps interactive HTML Canvas (keep ~2048 high-precision points)
     step = max(1, len(freqs) // 2048)
