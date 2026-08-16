@@ -167,6 +167,10 @@ def analyze_audio_forensics(y, sr):
     
     is_zero_stuffed = False
     is_upsampled = False
+    is_cd_cutoff = False
+    is_48k_cutoff = False
+    is_88k_cutoff = False
+    is_96k_cutoff = False
     detected_base_hz = 0
     effective_cutoff_hz = nyquist
     
@@ -221,11 +225,6 @@ def analyze_audio_forensics(y, sr):
         idx_46k = np.argmin(np.abs(freqs - 46000)) if nyquist > 46000 else None
         idx_48k = np.argmin(np.abs(freqs - 48000)) if nyquist > 48000 else None
         idx_50k = np.argmin(np.abs(freqs - 50000)) if nyquist > 50000 else None
-
-        is_cd_cutoff = False
-        is_48k_cutoff = False
-        is_88k_cutoff = False
-        is_96k_cutoff = False
 
         # Spectrogram-aligned decibel drops (immune to isolated transient spikes)
         if nyquist > 60000:
