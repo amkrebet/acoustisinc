@@ -213,42 +213,49 @@ def analyze_audio_forensics(y, sr):
         idx_26k = np.argmin(np.abs(freqs - 26000))
         idx_30k = np.argmin(np.abs(freqs - 30000))
         idx_32k = np.argmin(np.abs(freqs - 32000))
-        idx_44k = np.argmin(np.abs(freqs - 44000))
-        idx_48k = np.argmin(np.abs(freqs - 48000)) if nyquist > 48000 else None
-        idx_50k = np.argmin(np.abs(freqs - 50000)) if nyquist > 48000 else None
-        idx_52k = np.argmin(np.abs(freqs - 52000)) if nyquist > 48000 else None
-        idx_60k = np.argmin(np.abs(freqs - 60000)) if nyquist > 48000 else None
+        idx_42k = np.argmin(np.abs(freqs - 42000))
+        idx_45k = np.argmin(np.abs(freqs - 45000)) if nyquist > 45000 else None
+        idx_46k = np.argmin(np.abs(freqs - 46000)) if nyquist > 46000 else None
+        idx_50k = np.argmin(np.abs(freqs - 50000)) if nyquist > 50000 else None
+        idx_52k = np.argmin(np.abs(freqs - 52000)) if nyquist > 52000 else None
+        idx_60k = np.argmin(np.abs(freqs - 60000)) if nyquist > 60000 else None
+
+        is_cd_cutoff = False
+        is_48k_cutoff = False
+        is_88k_cutoff = False
+        is_96k_cutoff = False
+
+        # Check higher Nyquist boundaries first in >96k containers (e.g. 176.4k, 192k):
+        if nyquist > 60000:
+            # 96 kHz Master Cutoff (near 48 kHz):
+            drop_46_50 = rms_dbfs[idx_46k] - rms_dbfs[idx_50k]
+            flatness_52_60 = abs(rms_dbfs[idx_52k] - rms_dbfs[idx_60k])
+            if drop_46_50 > 10.0 and flatness_52_60 < 6.0 and (rms_dbfs[idx_50k] <= noise_floor_rms + 8.0 or rms_dbfs[idx_50k] < -110.0):
+                is_96k_cutoff = True
+
+            # 88.2 kHz Master Cutoff (near 44.1 kHz):
+            drop_42_45 = rms_dbfs[idx_42k] - rms_dbfs[idx_45k]
+            flatness_46_60 = abs(rms_dbfs[idx_46k] - rms_dbfs[idx_60k])
+            if not is_96k_cutoff and drop_42_45 > 7.0 and flatness_46_60 < 6.0 and (rms_dbfs[idx_45k] <= noise_floor_rms + 8.0 or rms_dbfs[idx_45k] < -110.0):
+                is_88k_cutoff = True
+
+        # Check CD Cutoff (44.1 kHz brickwall at 22.05 kHz):
+        drop_20_23 = rms_dbfs[idx_20k] - rms_dbfs[idx_23k]
+        flatness_24_30 = abs(rms_dbfs[idx_24k] - rms_dbfs[idx_30k])
+        if not is_88k_cutoff and not is_96k_cutoff and drop_20_23 > 16.0 and flatness_24_30 < 6.0 and (rms_dbfs[idx_24k] <= noise_floor_rms + 8.0):
+            is_cd_cutoff = True
+
+        # Check 48k Cutoff (48 kHz brickwall at 24.0 kHz):
+        drop_22_25 = rms_dbfs[idx_22k] - rms_dbfs[idx_25k]
+        flatness_26_32 = abs(rms_dbfs[idx_26k] - rms_dbfs[idx_32k])
+        if not is_cd_cutoff and not is_88k_cutoff and not is_96k_cutoff and drop_22_25 > 16.0 and flatness_26_32 < 6.0 and (rms_dbfs[idx_26k] <= noise_floor_rms + 8.0):
+            is_48k_cutoff = True
 
         # Measure continuous effective signal bandwidth (where signal is >= floor + 5dB)
         above_floor = (rms_dbfs > (noise_floor_rms + 5.0)) | (peak_dbfs > (noise_floor_peak + 7.0))
         valid_idx = np.where(above_floor)[0]
         effective_bw_hz = freqs[valid_idx[-1]] if len(valid_idx) > 0 else 20000.0
         effective_cutoff_hz = min(nyquist, max(20000.0, effective_bw_hz))
-
-        is_cd_cutoff = False
-        is_48k_cutoff = False
-        is_96k_cutoff = False
-
-        # 1. Check CD Cutoff (44.1 kHz brickwall):
-        # Steep drop across 20k-23k (> 18 dB), post-cutoff floor is flat, and energy at 24k is low
-        drop_20_23 = rms_dbfs[idx_20k] - rms_dbfs[idx_23k]
-        flatness_24_30 = abs(rms_dbfs[idx_24k] - rms_dbfs[idx_30k])
-        if drop_20_23 > 18.0 and flatness_24_30 < 6.0 and (rms_dbfs[idx_24k] < noise_floor_rms + 10.0 or rms_dbfs[idx_24k] < -110.0):
-            is_cd_cutoff = True
-
-        # 2. Check 48k Cutoff (48 kHz brickwall):
-        # Steep drop across 22k-25k (> 18 dB), post-cutoff floor is flat, and energy at 26k is low
-        drop_22_25 = rms_dbfs[idx_22k] - rms_dbfs[idx_25k]
-        flatness_26_32 = abs(rms_dbfs[idx_26k] - rms_dbfs[idx_32k])
-        if not is_cd_cutoff and drop_22_25 > 18.0 and flatness_26_32 < 6.0 and (rms_dbfs[idx_26k] < noise_floor_rms + 10.0 or rms_dbfs[idx_26k] < -110.0):
-            is_48k_cutoff = True
-
-        # 3. Check 96k Cutoff (96 kHz brickwall in >= 176.4/192k containers):
-        if not is_cd_cutoff and not is_48k_cutoff and idx_48k and nyquist > 60000:
-            drop_44_50 = rms_dbfs[idx_44k] - rms_dbfs[idx_50k]
-            flatness_52_60 = abs(rms_dbfs[idx_52k] - rms_dbfs[idx_60k])
-            if drop_44_50 > 18.0 and flatness_52_60 < 6.0 and (rms_dbfs[idx_52k] < noise_floor_rms + 10.0 or rms_dbfs[idx_52k] < -110.0):
-                is_96k_cutoff = True
 
         if is_cd_cutoff:
             is_upsampled = True
@@ -262,6 +269,12 @@ def analyze_audio_forensics(y, sr):
             effective_cutoff_hz = 24000.0
             report.append("\nASSESSMENT: [UPSAMPLED 48 kHz SOURCE]")
             report.append("  -> Sharp attenuation detected near ~24.0 kHz.")
+        elif is_88k_cutoff:
+            is_upsampled = True
+            detected_base_hz = 44100
+            effective_cutoff_hz = 44100.0
+            report.append("\nASSESSMENT: [UPSAMPLED 88.2 kHz SOURCE]")
+            report.append("  -> Sharp attenuation detected near ~44.1 kHz (88.2 kHz Master).")
         elif is_96k_cutoff:
             is_upsampled = True
             detected_base_hz = 48000
