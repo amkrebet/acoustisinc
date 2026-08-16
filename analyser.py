@@ -324,6 +324,8 @@ def generate_html5_report(y, sr, audio_filename, output_html, spec_db, freqs, pe
     Generates a single self-contained, publication-grade interactive HTML5 report with zoom controls.
     """
     nyquist = sr / 2.0
+    duration_s = len(y) / float(sr)
+
     # True, uncolored physical dBFS spectral traces
     display_peak = np.copy(peak_dbfs)
     display_rms = np.copy(rms_dbfs)

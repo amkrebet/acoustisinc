@@ -162,6 +162,8 @@ def analyze_file_on_demand(filepath):
         spec_db, freqs, peak_dbfs, rms_dbfs, assessment_text, dr_metrics = analyze_audio_forensics(data, sr)
 
         nyquist = sr / 2.0
+        duration_s = len(data) / float(sr)
+
         # True, uncolored physical dBFS spectral traces
         display_peak = np.copy(peak_dbfs)
         display_rms = np.copy(rms_dbfs)
