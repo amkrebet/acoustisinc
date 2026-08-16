@@ -177,49 +177,98 @@ def analyze_audio_forensics(y, sr):
     if sr >= 88200:
         if zero_ratio > 0.40:
             is_zero_stuffed = True
-            effective_cutoff_hz = 22050
+            effective_cutoff_hz = 22050.0
             report.append("\nASSESSMENT: [RAW ZERO-STUFFED / NO FILTERING]")
             report.append(f"  -> Exact zero padding detected ({zero_ratio*100:.1f}% literal zeros).")
+        else:
+            # Mirror imaging check (unfiltered aliasing):
+            # Check if high ultrasonic band (30k-40k) has loud reflected signal matching audible levels
+            idx_30k = np.argmin(np.abs(freqs - 30000))
+            idx_40k = np.argmin(np.abs(freqs - 40000))
+            mirror_rms_median = np.median(rms_dbfs[idx_30k:idx_40k]) if nyquist >= 44100 else -140.0
             
-        elif (audible_rms_mean - image_power) < 15.0 and image_power > -100.0:
-            is_zero_stuffed = True
-            effective_cutoff_hz = 22050
-            report.append("\nASSESSMENT: [FAKE HI-RES / UNFILTERED ALIASING]")
-            report.append("  -> Strong spectral mirror imaging detected above 22.05 kHz.")
+            # Baseline high ultrasonic floor in top 15% of Nyquist band
+            idx_floor_start = np.argmin(np.abs(freqs - (0.82 * nyquist)))
+            idx_floor_end = np.argmin(np.abs(freqs - (0.96 * nyquist)))
+            noise_floor_rms = np.median(rms_dbfs[idx_floor_start:idx_floor_end])
+            
+            if mirror_rms_median > (audible_rms_mean - 20.0) and mirror_rms_median > -80.0 and (mirror_rms_median - noise_floor_rms) > 20.0:
+                is_zero_stuffed = True
+                effective_cutoff_hz = 22050.0
+                report.append("\nASSESSMENT: [FAKE HI-RES / UNFILTERED ALIASING]")
+                report.append("  -> Strong spectral mirror imaging detected above 22.05 kHz.")
             
     # Forensic Cutoff & Upsampling Detection
     if sr >= 88200 and not is_zero_stuffed:
-        rms_20k = rms_dbfs[np.argmin(np.abs(freqs - 20000))]
-        rms_24k = rms_dbfs[idx_24k]
-        ultrasonic_peak_max = np.max(peak_dbfs[idx_24k:])
-        ultrasonic_rms_mean = np.mean(rms_dbfs[idx_24k:])
+        idx_floor_start = np.argmin(np.abs(freqs - (0.82 * nyquist)))
+        idx_floor_end = np.argmin(np.abs(freqs - (0.96 * nyquist)))
+        noise_floor_rms = np.median(rms_dbfs[idx_floor_start:idx_floor_end])
+        noise_floor_peak = np.median(peak_dbfs[idx_floor_start:idx_floor_end])
         
-        drop_22k = rms_20k - rms_24k
-        drop_24k = rms_dbfs[np.argmin(np.abs(freqs - 23000))] - rms_dbfs[np.argmin(np.abs(freqs - 26000))]
-        drop_48k = 0.0
-        if idx_48k and nyquist > 50000:
-            drop_48k = rms_dbfs[np.argmin(np.abs(freqs - 46000))] - rms_dbfs[np.argmin(np.abs(freqs - 50000))]
-            
-        if (drop_22k > 20.0 or ultrasonic_peak_max < -115.0 or (audible_peak_max - ultrasonic_peak_max) > 40.0) and rms_24k < (audible_rms_mean - 25.0):
+        idx_20k = np.argmin(np.abs(freqs - 20000))
+        idx_22k = np.argmin(np.abs(freqs - 22050))
+        idx_23k = np.argmin(np.abs(freqs - 23000))
+        idx_24k = np.argmin(np.abs(freqs - 24000))
+        idx_25k = np.argmin(np.abs(freqs - 25000))
+        idx_26k = np.argmin(np.abs(freqs - 26000))
+        idx_30k = np.argmin(np.abs(freqs - 30000))
+        idx_32k = np.argmin(np.abs(freqs - 32000))
+        idx_44k = np.argmin(np.abs(freqs - 44000))
+        idx_48k = np.argmin(np.abs(freqs - 48000)) if nyquist > 48000 else None
+        idx_50k = np.argmin(np.abs(freqs - 50000)) if nyquist > 48000 else None
+        idx_52k = np.argmin(np.abs(freqs - 52000)) if nyquist > 48000 else None
+        idx_60k = np.argmin(np.abs(freqs - 60000)) if nyquist > 48000 else None
+
+        # Measure continuous effective signal bandwidth (where signal is >= floor + 5dB)
+        above_floor = (rms_dbfs > (noise_floor_rms + 5.0)) | (peak_dbfs > (noise_floor_peak + 7.0))
+        valid_idx = np.where(above_floor)[0]
+        effective_bw_hz = freqs[valid_idx[-1]] if len(valid_idx) > 0 else 20000.0
+        effective_cutoff_hz = min(nyquist, max(20000.0, effective_bw_hz))
+
+        is_cd_cutoff = False
+        is_48k_cutoff = False
+        is_96k_cutoff = False
+
+        # 1. Check CD Cutoff (44.1 kHz brickwall):
+        # Steep drop across 20k-23k (> 18 dB), post-cutoff floor is flat, and energy at 24k is low
+        drop_20_23 = rms_dbfs[idx_20k] - rms_dbfs[idx_23k]
+        flatness_24_30 = abs(rms_dbfs[idx_24k] - rms_dbfs[idx_30k])
+        if drop_20_23 > 18.0 and flatness_24_30 < 6.0 and (rms_dbfs[idx_24k] < noise_floor_rms + 10.0 or rms_dbfs[idx_24k] < -110.0):
+            is_cd_cutoff = True
+
+        # 2. Check 48k Cutoff (48 kHz brickwall):
+        # Steep drop across 22k-25k (> 18 dB), post-cutoff floor is flat, and energy at 26k is low
+        drop_22_25 = rms_dbfs[idx_22k] - rms_dbfs[idx_25k]
+        flatness_26_32 = abs(rms_dbfs[idx_26k] - rms_dbfs[idx_32k])
+        if not is_cd_cutoff and drop_22_25 > 18.0 and flatness_26_32 < 6.0 and (rms_dbfs[idx_26k] < noise_floor_rms + 10.0 or rms_dbfs[idx_26k] < -110.0):
+            is_48k_cutoff = True
+
+        # 3. Check 96k Cutoff (96 kHz brickwall in >= 176.4/192k containers):
+        if not is_cd_cutoff and not is_48k_cutoff and idx_48k and nyquist > 60000:
+            drop_44_50 = rms_dbfs[idx_44k] - rms_dbfs[idx_50k]
+            flatness_52_60 = abs(rms_dbfs[idx_52k] - rms_dbfs[idx_60k])
+            if drop_44_50 > 18.0 and flatness_52_60 < 6.0 and (rms_dbfs[idx_52k] < noise_floor_rms + 10.0 or rms_dbfs[idx_52k] < -110.0):
+                is_96k_cutoff = True
+
+        if is_cd_cutoff:
             is_upsampled = True
             detected_base_hz = 22050
             effective_cutoff_hz = 22050.0
             report.append("\nASSESSMENT: [FAKE HI-RES / UPSAMPLED CD SOURCE]")
             report.append("  -> Brick-wall filter attenuation detected near ~22.05 kHz.")
-        elif (drop_24k > 20.0 or rms_24k > (ultrasonic_rms_mean + 20.0)) and rms_dbfs[np.argmin(np.abs(freqs - 26000))] < (audible_rms_mean - 25.0):
+        elif is_48k_cutoff:
             is_upsampled = True
             detected_base_hz = 24000
             effective_cutoff_hz = 24000.0
             report.append("\nASSESSMENT: [UPSAMPLED 48 kHz SOURCE]")
             report.append("  -> Sharp attenuation detected near ~24.0 kHz.")
-        elif drop_48k > 20.0 or (idx_48k and rms_dbfs[idx_48k] < (audible_rms_mean - 35.0) and rms_dbfs[np.argmin(np.abs(freqs - 44000))] > -100.0):
+        elif is_96k_cutoff:
             is_upsampled = True
             detected_base_hz = 48000
             effective_cutoff_hz = 48000.0
             report.append("\nASSESSMENT: [UPSAMPLED 96 kHz SOURCE]")
             report.append("  -> Sharp attenuation detected near ~48.0 kHz (96 kHz Master).")
         else:
-            effective_cutoff_hz = nyquist
             report.append("\nASSESSMENT: [NATIVE HI-RES MATERIAL]")
             report.append("  -> Continuous harmonic energy extending well into the ultrasonic band.")
 

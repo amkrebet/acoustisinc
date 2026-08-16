@@ -735,6 +735,9 @@ HTML_PAGE = """<!DOCTYPE html>
             if (player && !player.paused) player.pause();
 
             currentPath = path || '';
+            const searchBox = document.getElementById('searchBox');
+            if (searchBox) searchBox.value = '';
+
             const treeList = document.getElementById('treeList');
             treeList.innerHTML = '<div style="padding: 20px; text-align: center; color: #8b949e;"><div class="spinner" style="margin: 0 auto 10px;"></div>Loading directory...</div>';
 
@@ -747,7 +750,7 @@ HTML_PAGE = """<!DOCTYPE html>
                 currentPath = directoryData.current_path;
                 document.getElementById('pathBar').value = currentPath;
                 renderBreadcrumbs(directoryData.breadcrumbs, directoryData.parent_path);
-                renderDirectory(document.getElementById('searchBox').value.toLowerCase());
+                renderDirectory('');
             } catch (err) {
                 treeList.innerHTML = `<div style="padding: 20px; color: var(--accent-red); text-align: center;">Failed to load directory:<br><small>${err.message}</small></div>`;
             }
