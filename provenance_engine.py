@@ -107,7 +107,65 @@ def detect_mqa_signature(filepath=None, pcm_int32=None, sr=44100):
         except Exception:
             pass
 
-    return details
+def analyze_effective_bit_depth(filepath=None, pcm_int32=None):
+    """
+    Forensically measures actual effective bit depth and detects LSB zero-padding or bit truncation.
+    """
+    res = {
+        "container_bits": 16,
+        "container_subtype": "PCM_16",
+        "effective_bits": 16,
+        "trailing_zero_bits": 0,
+        "is_zero_padded": False,
+        "zero_ratio_lsb8": 0.0,
+        "summary": "16-bit Standard Audio"
+    }
+
+    if filepath and os.path.exists(filepath):
+        try:
+            import soundfile as sf
+            info = sf.info(filepath)
+            res["container_subtype"] = info.subtype
+            res["container_bits"] = 24 if "24" in info.subtype else (32 if "32" in info.subtype else 16)
+            if pcm_int32 is None:
+                frames = min(int(info.samplerate * 30.0), info.frames)
+                pcm_int32, _ = sf.read(filepath, frames=frames, dtype="int32", always_2d=True)
+        except Exception:
+            pass
+
+    if pcm_int32 is not None:
+        try:
+            s24 = pcm_int32 >> 8
+            non_zero = s24[s24 != 0]
+            if len(non_zero) > 0:
+                trailing_zeros = 0
+                for bit in range(24):
+                    mask = 1 << bit
+                    if (np.abs(non_zero) & mask).any():
+                        break
+                    trailing_zeros += 1
+                
+                effective_bits = 24 - trailing_zeros
+                lsb8_zeros = float(np.mean((non_zero & 0xFF) == 0))
+                
+                res["effective_bits"] = effective_bits
+                res["trailing_zero_bits"] = trailing_zeros
+                res["zero_ratio_lsb8"] = lsb8_zeros
+                
+                if res["container_bits"] >= 24 and trailing_zeros >= 4:
+                    res["is_zero_padded"] = True
+                    if trailing_zeros >= 8:
+                        res["summary"] = f"Fake {res['container_bits']}-bit (16-bit Zero-Padded / 8 LSBs Inactive)"
+                    else:
+                        res["summary"] = f"20-bit Master in {res['container_bits']}-bit Container ({trailing_zeros} LSBs Inactive)"
+                elif res["container_bits"] >= 24:
+                    res["summary"] = f"True {res['container_bits']}-bit (Full Dynamic Resolution)"
+                else:
+                    res["summary"] = "Native 16-bit Red Book Master"
+        except Exception:
+            pass
+
+    return res
 
 
 class ProvenanceRuleEngine:
@@ -153,7 +211,7 @@ class ProvenanceRuleEngine:
         self.check_and_reload()
         return self._rules or {}
 
-    def evaluate(self, sr, nyquist, freqs, mean_spec_db, rms_dbfs, peak_dbfs, stft_mag, zero_ratio=0.0, mqa_info=None):
+    def evaluate(self, sr, nyquist, freqs, mean_spec_db, rms_dbfs, peak_dbfs, stft_mag, zero_ratio=0.0, mqa_info=None, bitdepth_info=None):
         """
         Executes rule interpreter against extracted spectral features.
         Returns a structured provenance result dictionary.
@@ -404,13 +462,24 @@ class ProvenanceRuleEngine:
                     "badge_class": "badge-provenance-native",
                     "details": f"Smooth ultrasonic roll-off up to ~{effective_bw_hz/1000:.1f} kHz."
                 }
+        # Check for zero-padded bit depth
+        if bitdepth_info and bitdepth_info.get("is_zero_padded"):
+            tz = bitdepth_info.get("trailing_zero_bits", 8)
+            eff = bitdepth_info.get("effective_bits", 16)
+            cb = bitdepth_info.get("container_bits", 24)
+            pad_summary = f"{eff}-bit Padded"
+            
+            if primary_prov is not None:
+                primary_prov["details"] += f" Note: Container is zero-padded ({tz} inactive LSBs / true {eff}-bit)."
+                if "Native" in primary_prov["label"]:
+                    primary_prov["label"] += f" [{pad_summary}]"
             else:
                 primary_prov = {
-                    "label": "Unclear / Mixed Source",
-                    "confidence": "Low",
-                    "score": 0.40,
-                    "badge_class": "badge-provenance-unclear",
-                    "details": "Bandwidth limited without clear brickwall or mirror characteristics."
+                    "label": f"Fake {cb}-bit Container ({eff}-bit Zero-Padded)",
+                    "confidence": "High",
+                    "score": 0.99,
+                    "badge_class": "badge-provenance-fake",
+                    "details": f"Container claims {cb}-bit resolution, but the lower {tz} bits are 100% inactive. Effective resolution is {eff}-bit."
                 }
 
         return {
@@ -423,7 +492,8 @@ class ProvenanceRuleEngine:
             "details": primary_prov["details"],
             "effective_bw_hz": effective_bw_hz,
             "noise_floor_rms": noise_floor_rms,
-            "noise_floor_spec": noise_floor_spec
+            "noise_floor_spec": noise_floor_spec,
+            "bitdepth": bitdepth_info
         }
 
 

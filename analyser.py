@@ -338,10 +338,19 @@ def analyze_audio_forensics(y, sr, rules_path=None, filepath=None):
     report.append(f"Peak Signal Level            : {peak_db:.2f} dBFS")
 
     # 5. Estimated Provenance Analysis (Interprets configurable declarative rules)
-    from provenance_engine import get_provenance_engine, detect_mqa_signature
+    from provenance_engine import get_provenance_engine, detect_mqa_signature, analyze_effective_bit_depth
     mqa_info = detect_mqa_signature(filepath=filepath, sr=sr) if filepath else None
+    bitdepth_info = analyze_effective_bit_depth(filepath=filepath) if filepath else None
     engine = get_provenance_engine(rules_path if 'rules_path' in locals() else None)
-    provenance_info = engine.evaluate(sr, nyquist, freqs, mean_spec_db, rms_dbfs, peak_dbfs, stft_mag, zero_ratio, mqa_info=mqa_info)
+    provenance_info = engine.evaluate(sr, nyquist, freqs, mean_spec_db, rms_dbfs, peak_dbfs, stft_mag, zero_ratio, mqa_info=mqa_info, bitdepth_info=bitdepth_info)
+
+    if bitdepth_info:
+        cb = bitdepth_info.get("container_bits", 16)
+        eb = bitdepth_info.get("effective_bits", 16)
+        tz = bitdepth_info.get("trailing_zero_bits", 0)
+        summ = bitdepth_info.get("summary", "")
+        report.append(f"\nBIT DEPTH RESOLUTION        : {cb}-bit Container -> {eb}-bit Effective ({tz} LSBs Inactive)")
+        report.append(f"Bit Activity & LSB Profile   : {summ}")
 
     primary_prov = provenance_info["primary"]
     alt_prov = provenance_info["alternative"]

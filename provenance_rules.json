@@ -152,5 +152,28 @@
     "confidence": "High",
     "confidence_score": 0.99,
     "badge_class": "badge-provenance-mqa"
+  },
+  "bitdepth_rules": {
+    "enabled": true,
+    "rules": [
+      {
+        "name": "Zero-Padded 24-bit Container (True 16-bit Master)",
+        "min_container_bits": 24,
+        "max_effective_bits": 16,
+        "confidence": "High",
+        "confidence_score": 0.99,
+        "badge_class": "badge-provenance-fake",
+        "details": "Container is formatted as 24-bit, but the lowest 8 bits are 100% inactive (0x00 zero-padded). Effective resolution is 16-bit."
+      },
+      {
+        "name": "20-bit Master (in 24-bit Container)",
+        "min_container_bits": 24,
+        "max_effective_bits": 20,
+        "confidence": "High",
+        "confidence_score": 0.95,
+        "badge_class": "badge-provenance-leaky",
+        "details": "Container is formatted as 24-bit, but the lowest 4 bits are inactive. Effective resolution is 20-bit (likely HDCD or 20-bit archival transfer)."
+      }
+    ]
   }
 }

@@ -737,6 +737,7 @@ HTML_PAGE = """<!DOCTYPE html>
                         </div>
                         <div style="display: flex; gap: 8px; flex-wrap: wrap; align-items: center;">
                             <div id="mqaBadge" class="badge-provenance-mqa" style="font-size: 0.82rem; padding: 4px 10px; font-weight: 700; letter-spacing: 0.5px; display: none;">MQA</div>
+                            <div id="bitDepthBadge" class="badge-hires" style="font-size: 0.82rem; padding: 4px 10px; font-weight: 600; display: none;">--</div>
                             <div id="drBadge" class="badge-hires" style="font-size: 0.82rem; padding: 4px 10px; display: none;">--</div>
                             <div id="noiseBadge" class="badge-cd" style="font-size: 0.82rem; padding: 4px 10px; display: none;">--</div>
                         </div>
@@ -1026,6 +1027,31 @@ HTML_PAGE = """<!DOCTYPE html>
                     mqaBadge.textContent = data.provenance.label.includes('Studio') ? 'MQA STUDIO' : 'MQA';
                 } else {
                     mqaBadge.style.display = 'none';
+                }
+
+                // Bit Depth Badge
+                const bdBadge = document.getElementById('bitDepthBadge');
+                if (data.provenance && data.provenance.bitdepth) {
+                    const bd = data.provenance.bitdepth;
+                    bdBadge.style.display = 'inline-block';
+                    if (bd.is_zero_padded) {
+                        bdBadge.textContent = `${bd.effective_bits}B PADDED (${bd.container_bits}B)`;
+                        bdBadge.style.background = 'rgba(255, 112, 67, 0.18)';
+                        bdBadge.style.borderColor = 'rgba(255, 112, 67, 0.45)';
+                        bdBadge.style.color = '#ff7043';
+                    } else if (bd.container_bits >= 24) {
+                        bdBadge.textContent = `${bd.effective_bits}-BIT PCM`;
+                        bdBadge.style.background = 'rgba(0, 229, 255, 0.12)';
+                        bdBadge.style.borderColor = 'rgba(0, 229, 255, 0.35)';
+                        bdBadge.style.color = '#00e5ff';
+                    } else {
+                        bdBadge.textContent = '16-BIT PCM';
+                        bdBadge.style.background = 'rgba(139, 148, 158, 0.12)';
+                        bdBadge.style.borderColor = 'rgba(139, 148, 158, 0.35)';
+                        bdBadge.style.color = 'var(--text-muted)';
+                    }
+                } else {
+                    bdBadge.style.display = 'none';
                 }
 
                 // Dynamic Range badge
