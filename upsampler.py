@@ -581,7 +581,7 @@ def get_audio_files(directory):
 
 
 # ==============================================================================
-# PRE-FLIGHT ALBUM SCAN
+# PRE-FLIGHT ALBUM SCAN WITH ADAPTIVE CREST-AWARE HEADROOM
 # ==============================================================================
 
 def inspect_track_fast(filepath):
@@ -589,53 +589,94 @@ def inspect_track_fast(filepath):
         info = sf.info(filepath)
         scale, _ = get_target_scale(info.samplerate)
     except Exception:
-        return 4, 1.0, False
+        return 4, 1.0, 0.1, False
 
+    # Fast Path A: ReplayGain tags
     try:
         audio = File(filepath)
         if audio is not None and audio.tags is not None:
+            peak_val = None
+            gain_val = None
             for key, val in audio.tags.items():
-                if key.upper() == 'REPLAYGAIN_TRACK_PEAK':
+                k_upper = key.upper()
+                if k_upper == 'REPLAYGAIN_TRACK_PEAK':
                     peak_str = val[0] if isinstance(val, list) else str(val)
-                    return scale, float(peak_str), True
+                    peak_val = float(peak_str)
+                elif k_upper == 'REPLAYGAIN_TRACK_GAIN':
+                    gain_str = val[0] if isinstance(val, list) else str(val)
+                    gain_val = float(gain_str.replace('dB', '').strip())
+            
+            if peak_val is not None and gain_val is not None:
+                rms_val = 10.0 ** ((-18.0 - gain_val) / 20.0)
+                return scale, peak_val, rms_val, True
+            elif peak_val is not None:
+                return scale, peak_val, peak_val * 0.25, True
     except Exception:
         pass
 
+    # Fast Path B: Parallel PCM Audio Scan
     try:
         data, _ = sf.read(filepath, dtype='float64')
-        pk = np.max(np.abs(data)) if data.size > 0 else 0.0
-        return scale, pk, False
+        if data.size > 0:
+            pk = float(np.max(np.abs(data)))
+            rms = float(np.sqrt(np.mean(data ** 2)))
+            return scale, pk, rms, False
+        return scale, 0.0, 0.0, False
     except Exception:
-        return scale, 1.0, False
+        return scale, 1.0, 0.1, False
 
 def scan_album(files):
     t_scan = time.time()
     album_max_peak_lin = 0.0
+    min_crest_db = 999.0
     requires_upsampling = False
     all_used_fast_path = True
 
-    print("   Scanning album tracks for global headroom factor...")
+    print("   Scanning album tracks for adaptive headroom factor...")
     max_workers = min(len(files), os.cpu_count() or 4)
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         results = list(executor.map(inspect_track_fast, files))
 
-    for scale, pk, from_tag in results:
+    for scale, pk, rms, from_tag in results:
         if scale > 1: requires_upsampling = True
         if not from_tag: all_used_fast_path = False
         if pk > album_max_peak_lin: album_max_peak_lin = pk
+        
+        if pk > 1e-5 and rms > 1e-7:
+            crest = 20.0 * np.log10(pk / rms)
+            if crest < min_crest_db:
+                min_crest_db = crest
 
     album_max_peak_db = 20 * np.log10(album_max_peak_lin) if album_max_peak_lin > 0 else -999.0
     scan_type = "Metadata Header Tags" if all_used_fast_path else "Parallel PCM Audio Scan"
     
-    print(f"   Album Max Source Peak: {album_max_peak_db:6.2f} dBFS ({scan_type} in {time.time() - t_scan:.3f}s)")
+    if min_crest_db == 999.0:
+        min_crest_db = 14.0  # Default fallback
 
-    est_peak_db = album_max_peak_db + (OVERSHOOT_BUFFER_DB if requires_upsampling else 0)
+    # Adaptive Intersample Headroom Margin based on dynamic crest profile:
+    if min_crest_db >= 16.0:
+        adaptive_margin_db = 1.8
+        genre_profile = "High Dynamic Range (Classical / Acoustic Jazz)"
+    elif min_crest_db >= 12.0:
+        adaptive_margin_db = 2.8
+        genre_profile = "Standard Dynamic Range (Acoustic / Audiophile Master)"
+    elif min_crest_db >= 8.0:
+        adaptive_margin_db = 3.8
+        genre_profile = "Compressed Master (Commercial Pop / Rock)"
+    else:
+        adaptive_margin_db = 4.4
+        genre_profile = "Hyper-Compressed / Brickwall Limited (Club / EDM)"
+
+    print(f"   Album Max Source Peak: {album_max_peak_db:6.2f} dBFS | Min Crest: {min_crest_db:4.1f} dB ({scan_type} in {time.time() - t_scan:.3f}s)")
+    print(f"   Dynamic Profile       : {genre_profile} -> Calibrated Intersample Margin: +{adaptive_margin_db:.1f} dB")
+
+    est_peak_db = album_max_peak_db + (adaptive_margin_db if requires_upsampling else 0)
     if est_peak_db > PEAK_TARGET_DB:
         gain_factor = 10 ** ((PEAK_TARGET_DB - est_peak_db) / 20.0)
     else:
         gain_factor = 1.0
 
-    print(f"   Calculated Headroom Gain Multiplier: {gain_factor:.6f}")
+    print(f"   Calculated Headroom Gain Multiplier: {gain_factor:.6f} ({20*np.log10(gain_factor):+.2f} dB)")
     return gain_factor, album_max_peak_lin
 
 

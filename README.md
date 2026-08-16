@@ -53,11 +53,15 @@ Upsampling band-limited audio reconstructs the continuous analog waveform betwee
 
 AcoustiSinc uses an intelligent **2-Stage Dynamic Gain Architecture** to guarantee absolute zero intersample clipping while preserving maximum dynamic range:
 
-### Stage 1: Pre-Flight Album Headroom Scan
-- Prior to upsampling, all audio tracks in an album folder are scanned in parallel to measure the global album peak (`album_max_peak_db`).
-- An initial calculated gain normalization factor is applied with a calibrated $+2.4\text{ dB}$ intersample crest margin:
+### Stage 1: Adaptive Crest-Aware Album Headroom Pre-Scan
+- Prior to upsampling, all audio tracks in an album folder are scanned in parallel to measure the global album peak (`album_max_peak_db`) and dynamic **Crest Factor ($\text{Peak} - \text{RMS}$)**.
+- The engine dynamically assigns a calibrated intersample headroom margin based on the recording's dynamic profile:
+  - **Classical & Acoustic Jazz** ($\text{Crest} \ge 16\text{ dB}$): Calibrated to **$+1.8\text{ dB}$** to preserve maximum volume, resolution, and SNR.
+  - **Standard Audiophile Masters** ($\text{Crest } 12 - 16\text{ dB}$): Calibrated to **$+2.8\text{ dB}$**.
+  - **Commercial Pop & Rock** ($\text{Crest } 8 - 12\text{ dB}$): Calibrated to **$+3.8\text{ dB}$**.
+  - **Hyper-Compressed / Brickwall Masters** ($\text{Crest} < 8\text{ dB}$): Calibrated to **$+4.4\text{ dB}$** to prevent mid-album aborts and retries.
 
-$$\text{Initial Gain Factor} = \frac{10^{-0.3 / 20}}{10^{(\text{Album Peak}_{\text{dBFS}} + 2.4) / 20}}$$
+$$\text{Initial Gain Factor} = \frac{10^{-0.3 / 20}}{10^{(\text{Album Peak}_{\text{dBFS}} + \text{Adaptive Margin}_{\text{dB}}) / 20}}$$
 
 - Preserves 100% of relative inter-track volume relationships across the entire album.
 
