@@ -31,6 +31,7 @@ from analyser import analyze_audio_forensics, encode_spectrogram_and_lookup
 
 # Default root directory for initial browsing
 INITIAL_ROOT = os.getcwd()
+ACTIVE_RULES_PATH = None
 
 
 def format_bytes(size):
@@ -140,7 +141,7 @@ def get_directory_contents(target_path):
     }
 
 
-def analyze_file_on_demand(filepath):
+def analyze_file_on_demand(filepath, rules_path=None):
     """
     Performs on-demand DSP analysis with strict 64-bit double precision.
     """
@@ -159,7 +160,7 @@ def analyze_file_on_demand(filepath):
             data[:taper_len] *= taper
             data[-taper_len:] *= taper[::-1]
 
-        spec_db, freqs, peak_dbfs, rms_dbfs, assessment_text, dr_metrics, provenance_info = analyze_audio_forensics(data, sr)
+        spec_db, freqs, peak_dbfs, rms_dbfs, assessment_text, dr_metrics, provenance_info = analyze_audio_forensics(data, sr, rules_path=rules_path or ACTIVE_RULES_PATH)
 
         nyquist = sr / 2.0
         duration_s = len(data) / float(sr)
@@ -1829,16 +1830,20 @@ class ForensicWebHandler(BaseHTTPRequestHandler):
 
 
 def main():
-    global INITIAL_ROOT
+    global INITIAL_ROOT, ACTIVE_RULES_PATH
     parser = argparse.ArgumentParser(description="Hi-Res Audio Forensic Explorer Web Server")
     parser.add_argument("--root", default=os.getcwd(), help="Initial directory to browse (default: current working directory)")
     parser.add_argument("--port", type=int, default=8765, help="HTTP server port (default: 8765)")
     parser.add_argument("--host", default="0.0.0.0", help="HTTP server host (default: 0.0.0.0)")
+    parser.add_argument("--rules", default=None, help="Path to custom provenance rules configuration JSON")
     args = parser.parse_args()
 
     INITIAL_ROOT = os.path.abspath(os.path.expanduser(args.root))
     if not os.path.exists(INITIAL_ROOT):
         INITIAL_ROOT = os.getcwd()
+
+    if args.rules:
+        ACTIVE_RULES_PATH = os.path.abspath(os.path.expanduser(args.rules))
 
     server_address = (args.host, args.port)
     httpd = ThreadingHTTPServer(server_address, ForensicWebHandler)
@@ -1850,6 +1855,8 @@ def main():
     print(f"Network URL : http://{args.host}:{args.port}")
     print(f"Mode        : Multi-Threaded Concurrent I/O")
     print(f"Precision   : 64-bit Double Precision (Strict float64)")
+    if ACTIVE_RULES_PATH:
+        print(f"Rules Path  : {ACTIVE_RULES_PATH}")
     print(f"Status      : Live & Ready for On-Demand Analysis")
     print(f"=======================================================\n")
 

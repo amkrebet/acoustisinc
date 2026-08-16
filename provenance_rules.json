@@ -1,0 +1,150 @@
+{
+  "version": "1.0",
+  "description": "Hi-Res Audio Forensic Provenance Rule Configuration",
+  "folding_boundaries": [
+    {
+      "name": "32.0 kHz Broadcast / DAT",
+      "base_rate_hz": 32000,
+      "nyquist_hz": 16000,
+      "min_container_sr": 44100,
+      "rebound_threshold_db": 2.0,
+      "notch_depth_threshold_db": 8.0,
+      "min_mirror_correlation": 0.55,
+      "high_confidence_corr": 0.75,
+      "badge_class": "badge-provenance-leaky"
+    },
+    {
+      "name": "44.1 kHz CD / Red Book",
+      "base_rate_hz": 44100,
+      "nyquist_hz": 22050,
+      "min_container_sr": 48000,
+      "rebound_threshold_db": 2.0,
+      "notch_depth_threshold_db": 8.0,
+      "min_mirror_correlation": 0.55,
+      "high_confidence_corr": 0.75,
+      "badge_class": "badge-provenance-leaky"
+    },
+    {
+      "name": "48.0 kHz Production / Synth",
+      "base_rate_hz": 48000,
+      "nyquist_hz": 24000,
+      "min_container_sr": 88200,
+      "rebound_threshold_db": 2.0,
+      "notch_depth_threshold_db": 8.0,
+      "min_mirror_correlation": 0.55,
+      "high_confidence_corr": 0.75,
+      "badge_class": "badge-provenance-leaky"
+    },
+    {
+      "name": "64.0 kHz Legacy Hardware DSP",
+      "base_rate_hz": 64000,
+      "nyquist_hz": 32000,
+      "min_container_sr": 88200,
+      "rebound_threshold_db": 2.0,
+      "notch_depth_threshold_db": 8.0,
+      "min_mirror_correlation": 0.55,
+      "high_confidence_corr": 0.75,
+      "badge_class": "badge-provenance-leaky"
+    },
+    {
+      "name": "88.2 kHz Master",
+      "base_rate_hz": 88200,
+      "nyquist_hz": 44100,
+      "min_container_sr": 176400,
+      "rebound_threshold_db": 2.0,
+      "notch_depth_threshold_db": 8.0,
+      "min_mirror_correlation": 0.55,
+      "high_confidence_corr": 0.75,
+      "badge_class": "badge-provenance-leaky"
+    },
+    {
+      "name": "96.0 kHz Master",
+      "base_rate_hz": 96000,
+      "nyquist_hz": 48000,
+      "min_container_sr": 176400,
+      "rebound_threshold_db": 2.0,
+      "notch_depth_threshold_db": 8.0,
+      "min_mirror_correlation": 0.55,
+      "high_confidence_corr": 0.75,
+      "badge_class": "badge-provenance-leaky"
+    }
+  ],
+  "cutoff_rules": [
+    {
+      "id": "cutoff_88k",
+      "name": "Upsampled from 88.2 kHz Master",
+      "target_base_hz": 88200,
+      "min_container_nyquist_hz": 60000,
+      "f_low_hz": 40000,
+      "f_high_hz": 45000,
+      "min_spec_drop_db": 8.0,
+      "min_rms_drop_db": 4.5,
+      "max_stopband_level_dbfs": -100.0,
+      "confidence": "High",
+      "confidence_score": 0.95,
+      "badge_class": "badge-provenance-upsampled"
+    },
+    {
+      "id": "cutoff_96k",
+      "name": "Upsampled from 96.0 kHz Master",
+      "target_base_hz": 96000,
+      "min_container_nyquist_hz": 60000,
+      "f_low_hz": 46000,
+      "f_high_hz": 50000,
+      "min_spec_drop_db": 8.0,
+      "min_rms_drop_db": 5.0,
+      "max_stopband_level_dbfs": -100.0,
+      "confidence": "High",
+      "confidence_score": 0.95,
+      "badge_class": "badge-provenance-upsampled"
+    },
+    {
+      "id": "cutoff_44k",
+      "name": "Upsampled from 44.1 kHz Master",
+      "target_base_hz": 44100,
+      "min_container_sr": 48000,
+      "f_low_hz": 20000,
+      "f_high_hz": 23000,
+      "min_spec_drop_db": 16.0,
+      "noise_floor_margin_db": 8.0,
+      "absolute_noise_ceiling_dbfs": -125.0,
+      "confidence": "High",
+      "confidence_score": 0.94,
+      "badge_class": "badge-provenance-upsampled"
+    },
+    {
+      "id": "cutoff_48k",
+      "name": "Upsampled from 48.0 kHz Source",
+      "target_base_hz": 48000,
+      "min_container_nyquist_hz": 25000,
+      "f_low_hz": 22000,
+      "f_high_hz": 25000,
+      "min_spec_drop_db": 16.0,
+      "noise_floor_margin_db": 8.0,
+      "absolute_noise_ceiling_dbfs": -125.0,
+      "confidence": "High",
+      "confidence_score": 0.95,
+      "badge_class": "badge-provenance-upsampled"
+    }
+  ],
+  "zero_stuffing": {
+    "zero_ratio_threshold": 0.40,
+    "ultrasonic_mirror_margin_db": 20.0,
+    "ultrasonic_rms_floor_dbfs": -80.0,
+    "confidence": "High",
+    "confidence_score": 0.98,
+    "badge_class": "badge-provenance-fake",
+    "details": "Literal zero-stuffing or strong unfiltered imaging detected above 22.05 kHz."
+  },
+  "native_rules": {
+    "redbook_max_nyquist_hz": 22050,
+    "sr_48k_high_confidence_bw_hz": 23500,
+    "sr_48k_mod_confidence_bw_hz": 21500,
+    "hires_high_confidence_bw_hz": 26000,
+    "hires_mod_confidence_bw_hz": 21000
+  },
+  "alternative_rules": {
+    "enable_alternative_hypotheses": true,
+    "mirror_leakage_min_corr": 0.55
+  }
+}

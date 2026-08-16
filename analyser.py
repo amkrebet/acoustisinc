@@ -126,7 +126,7 @@ def calculate_dynamic_range_metrics(y, sr):
     }
 
 
-def analyze_audio_forensics(y, sr):
+def analyze_audio_forensics(y, sr, rules_path=None):
     """
     Executes automated forensic analysis using strict 64-bit double precision.
     """
@@ -337,201 +337,13 @@ def analyze_audio_forensics(y, sr):
     report.append(f"Peak-to-RMS Crest Factor     : {crest_db:.2f} dB")
     report.append(f"Peak Signal Level            : {peak_db:.2f} dBFS")
 
-    # 5. Estimated Provenance Analysis (Lineage, Base Rates & Resampling Fingerprint)
-    # Universal Multi-Boundary Mirror & Notch Rebound Scanner:
-    # Checks for leaky reconstruction filters folding across candidate Nyquist boundaries:
-    # 16.0 kHz (32k base), 22.05 kHz (44.1k base), 24.0 kHz (48k base), 32.0 kHz (64k base), 44.1 kHz (88.2k base), 48.0 kHz (96k base)
-    candidates_fn = [16000, 22050, 24000, 32000, 44100, 48000]
-    leaky_hits = []
+    # 5. Estimated Provenance Analysis (Interprets configurable declarative rules)
+    from provenance_engine import get_provenance_engine
+    engine = get_provenance_engine(rules_path if 'rules_path' in locals() else None)
+    provenance_info = engine.evaluate(sr, nyquist, freqs, mean_spec_db, rms_dbfs, peak_dbfs, stft_mag, zero_ratio)
 
-    for f_n in candidates_fn:
-        if f_n + 1200 > nyquist or (f_n - 1500) < 5000:
-            continue
-
-        i_base = np.argmin(np.abs(freqs - (f_n - 1500)))
-        i_notch = np.argmin(np.abs(freqs - f_n))
-        i_rebound = np.argmin(np.abs(freqs - (f_n + 700)))
-
-        notch_drop = mean_spec_db[i_base] - mean_spec_db[i_notch]
-        rebound_rise = mean_spec_db[i_rebound] - mean_spec_db[i_notch]
-
-        # Calculate cross-temporal correlation across the folding axis f_n
-        corrs = []
-        for delta in np.linspace(200, 1500, 8):
-            f1 = f_n - delta
-            f2 = f_n + delta
-            if f2 > nyquist:
-                continue
-            i1 = np.argmin(np.abs(freqs - f1))
-            i2 = np.argmin(np.abs(freqs - f2))
-            t1 = stft_mag[i1, :]
-            t2 = stft_mag[i2, :]
-            if np.std(t1) > 1e-8 and np.std(t2) > 1e-8:
-                c = np.corrcoef(t1, t2)[0, 1]
-                if not np.isnan(c):
-                    corrs.append(c)
-
-        avg_corr = float(np.mean(corrs)) if corrs else 0.0
-
-        if (rebound_rise > 2.0 or (notch_drop > 15.0 and avg_corr > 0.55)) and (avg_corr > 0.55 or notch_drop > 8.0):
-            leaky_hits.append({
-                "base_rate_khz": (f_n * 2) / 1000.0,
-                "f_n_khz": f_n / 1000.0,
-                "rebound_db": rebound_rise,
-                "notch_drop_db": notch_drop,
-                "mirror_corr": avg_corr
-            })
-
-    primary_prov = None
-    alt_prov = None
-
-    if is_zero_stuffed:
-        primary_prov = {
-            "label": "Raw Zero-Stuffed / NOS Source",
-            "confidence": "High",
-            "score": 0.98,
-            "badge_class": "badge-provenance-fake",
-            "details": "Literal zero-stuffing or strong unfiltered imaging detected above 22.05 kHz."
-        }
-    elif is_cd_cutoff:
-        drop_val = drop_20_23 if 'drop_20_23' in locals() else 20.0
-        primary_prov = {
-            "label": "Upsampled from 44.1 kHz Master",
-            "confidence": "High",
-            "score": 0.94,
-            "badge_class": "badge-provenance-upsampled",
-            "details": f"Sharp anti-aliasing cutoff at 22.05 kHz ({drop_val:.1f} dB drop) into container noise floor."
-        }
-        if leaky_hits and leaky_hits[0]["mirror_corr"] > 0.55:
-            mc = leaky_hits[0]["mirror_corr"]
-            alt_prov = {
-                "label": "44.1 kHz Master (Leaky Filter Residual)",
-                "confidence": "Moderate",
-                "score": round(mc, 2),
-                "badge_class": "badge-provenance-leaky",
-                "details": f"Residual spectral leakage across 22.05 kHz with r={mc:+.2f} mirror correlation."
-            }
-    elif is_88k_cutoff:
-        primary_prov = {
-            "label": "Upsampled from 88.2 kHz Master",
-            "confidence": "High",
-            "score": 0.95,
-            "badge_class": "badge-provenance-upsampled",
-            "details": "Sharp anti-aliasing cutoff at 44.1 kHz into baseline dither noise floor."
-        }
-        if leaky_hits and leaky_hits[0]["mirror_corr"] > 0.55:
-            mc = leaky_hits[0]["mirror_corr"]
-            alt_prov = {
-                "label": "88.2 kHz Master (Leaky Filter Residual)",
-                "confidence": "Moderate",
-                "score": round(mc, 2),
-                "badge_class": "badge-provenance-leaky",
-                "details": f"Residual spectral leakage across 44.1 kHz with r={mc:+.2f} mirror correlation."
-            }
-    elif is_96k_cutoff:
-        primary_prov = {
-            "label": "Upsampled from 96.0 kHz Master",
-            "confidence": "High",
-            "score": 0.95,
-            "badge_class": "badge-provenance-upsampled",
-            "details": "Sharp anti-aliasing cutoff at 48.0 kHz into baseline dither noise floor."
-        }
-    elif is_48k_cutoff:
-        primary_prov = {
-            "label": "Upsampled from 48.0 kHz Source",
-            "confidence": "High",
-            "score": 0.95,
-            "badge_class": "badge-provenance-upsampled",
-            "details": "Sharp anti-aliasing cutoff at 24.0 kHz into container noise floor."
-        }
-    elif leaky_hits:
-        h = leaky_hits[0]
-        c_score = h["mirror_corr"]
-        conf = "High" if c_score > 0.75 else "Moderate"
-        base_khz = h["base_rate_khz"]
-        fn_khz = h["f_n_khz"]
-        primary_prov = {
-            "label": f"{base_khz:.1f} kHz Master (Leaky SRC / DAC)",
-            "confidence": conf,
-            "score": round(min(0.98, max(0.70, c_score)), 2),
-            "badge_class": "badge-provenance-leaky",
-            "details": f"{base_khz:.1f} kHz filter notch at {fn_khz:.2f} kHz with mirrored spectral imaging (r={c_score:+.2f})."
-        }
-        alt_prov = {
-            "label": f"Upsampled from {base_khz:.1f} kHz Master",
-            "confidence": "Moderate",
-            "score": 0.65,
-            "badge_class": "badge-provenance-upsampled",
-            "details": f"Sharp attenuation near {fn_khz:.2f} kHz with filter skirt artifacts."
-        }
-    elif nyquist <= 22050:
-        primary_prov = {
-            "label": f"Native {sr/1000:.1f} kHz CD Master",
-            "confidence": "High",
-            "score": 0.95,
-            "badge_class": "badge-provenance-native",
-            "details": f"Standard Red Book container with full {sr/1000:.1f} kHz audible passband."
-        }
-    elif sr == 48000:
-        if effective_cutoff_hz >= 23500.0:
-            primary_prov = {
-                "label": "Native 48.0 kHz Master",
-                "confidence": "High",
-                "score": 0.90,
-                "badge_class": "badge-provenance-native",
-                "details": f"Continuous harmonic extension up to {effective_cutoff_hz/1000:.1f} kHz Nyquist limit."
-            }
-        elif effective_cutoff_hz >= 21500.0:
-            primary_prov = {
-                "label": "Native 48.0 kHz Material",
-                "confidence": "Moderate",
-                "score": 0.75,
-                "badge_class": "badge-provenance-native",
-                "details": f"Natural acoustic roll-off extending to ~{effective_cutoff_hz/1000:.1f} kHz."
-            }
-        else:
-            primary_prov = {
-                "label": "Unclear / Mixed Source",
-                "confidence": "Low",
-                "score": 0.40,
-                "badge_class": "badge-provenance-unclear",
-                "details": "Bandwidth limited without clear brickwall or mirror characteristics."
-            }
-    else:
-        if effective_cutoff_hz >= 26000.0:
-            primary_prov = {
-                "label": f"Native {sr/1000:.1f} kHz Master",
-                "confidence": "High",
-                "score": 0.92,
-                "badge_class": "badge-provenance-native",
-                "details": f"Continuous acoustic harmonic bandwidth reaching ~{effective_cutoff_hz/1000:.1f} kHz."
-            }
-        elif effective_cutoff_hz >= 21000.0:
-            primary_prov = {
-                "label": f"Native {sr/1000:.1f} kHz Material",
-                "confidence": "Moderate",
-                "score": 0.75,
-                "badge_class": "badge-provenance-native",
-                "details": f"Smooth ultrasonic roll-off up to ~{effective_cutoff_hz/1000:.1f} kHz."
-            }
-        else:
-            primary_prov = {
-                "label": "Unclear / Mixed Source",
-                "confidence": "Low",
-                "score": 0.40,
-                "badge_class": "badge-provenance-unclear",
-                "details": "Bandwidth limited without clear brickwall or mirror characteristics."
-            }
-
-    provenance_info = {
-        "primary": primary_prov,
-        "alternative": alt_prov,
-        "label": primary_prov["label"],
-        "confidence": primary_prov["confidence"],
-        "score": primary_prov["score"],
-        "badge_class": primary_prov["badge_class"],
-        "details": primary_prov["details"]
-    }
+    primary_prov = provenance_info["primary"]
+    alt_prov = provenance_info["alternative"]
 
     report.append(f"\nESTIMATED PROVENANCE : {primary_prov['label']} [{primary_prov['confidence']} Confidence: {int(primary_prov['score']*100)}%]")
     report.append(f"  -> {primary_prov['details']}")
@@ -1496,6 +1308,7 @@ def main():
     parser = argparse.ArgumentParser(description="Hi-Fi News Style Acoustic Spectrum & Forensic Analyzer (HTML5 Edition)")
     parser.add_argument("file", help="Path to FLAC/WAV audio file")
     parser.add_argument("--out", default=None, help="Output HTML path (default: filename_spectrum.html)")
+    parser.add_argument("--rules", default=None, help="Path to custom provenance rules configuration JSON")
     args = parser.parse_args()
 
     filepath = os.path.abspath(args.file)
@@ -1515,6 +1328,8 @@ def main():
     print(f"HI-FI NEWS SPECTRUM & FORENSIC ANALYZER (HTML5 V4.2)")
     print(f"Target File: {os.path.basename(filepath)}")
     print(f"Precision  : 64-bit Double Precision (Strict)")
+    if args.rules:
+        print(f"Rules Path : {args.rules}")
     print(f"==================================================")
 
     data, sr = sf.read(filepath, dtype='float64', start=0, stop=60*192000)
@@ -1528,7 +1343,7 @@ def main():
         data[:taper_len] *= taper
         data[-taper_len:] *= taper[::-1]
 
-    spec_db, freqs, peak_dbfs, rms_dbfs, assessment_text, dr_metrics, provenance_info = analyze_audio_forensics(data, sr)
+    spec_db, freqs, peak_dbfs, rms_dbfs, assessment_text, dr_metrics, provenance_info = analyze_audio_forensics(data, sr, rules_path=args.rules)
     
     print("\n" + assessment_text)
     print("----------------------------\n")
