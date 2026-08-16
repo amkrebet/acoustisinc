@@ -159,7 +159,7 @@ def analyze_file_on_demand(filepath):
             data[:taper_len] *= taper
             data[-taper_len:] *= taper[::-1]
 
-        spec_db, freqs, peak_dbfs, rms_dbfs, assessment_text, dr_metrics = analyze_audio_forensics(data, sr)
+        spec_db, freqs, peak_dbfs, rms_dbfs, assessment_text, dr_metrics, provenance_info = analyze_audio_forensics(data, sr)
 
         nyquist = sr / 2.0
         duration_s = len(data) / float(sr)
@@ -192,6 +192,7 @@ def analyze_file_on_demand(filepath):
             "nyquist_khz": nyquist / 1000.0,
             "duration_s": duration_s,
             "verdict": verdict,
+            "provenance": provenance_info,
             "noise_profile": noise_profile,
             "dr_score": dr_metrics.get("dr_score", 0),
             "dr_val": dr_metrics.get("dr_val", 0.0),
@@ -462,6 +463,71 @@ HTML_PAGE = """<!DOCTYPE html>
             padding: 1px 6px;
             border-radius: 3px;
         }
+        /* Provenance Banners & Badges */
+        .provenance-banner {
+            display: flex;
+            flex-direction: column;
+            padding: 12px 16px;
+            border-radius: 6px;
+            background: rgba(22, 27, 34, 0.85);
+            border: 1px solid var(--border);
+            margin-top: 12px;
+        }
+        .provenance-tag {
+            font-size: 0.82rem;
+            font-weight: 600;
+            padding: 2px 8px;
+            border-radius: 4px;
+            display: inline-block;
+        }
+        .badge-provenance-native {
+            background: rgba(0, 229, 255, 0.12);
+            border: 1px solid rgba(0, 229, 255, 0.4);
+            color: var(--accent-cyan);
+        }
+        .badge-provenance-leaky {
+            background: rgba(255, 171, 0, 0.12);
+            border: 1px solid rgba(255, 171, 0, 0.4);
+            color: #ffab00;
+        }
+        .badge-provenance-upsampled {
+            background: rgba(255, 23, 68, 0.12);
+            border: 1px solid rgba(255, 23, 68, 0.4);
+            color: var(--accent-red);
+        }
+        .badge-provenance-fake {
+            background: rgba(255, 23, 68, 0.2);
+            border: 1px solid var(--accent-red);
+            color: var(--accent-red);
+        }
+        .badge-provenance-unclear {
+            background: rgba(139, 148, 158, 0.12);
+            border: 1px solid rgba(139, 148, 158, 0.4);
+            color: var(--text-muted);
+        }
+        .confidence-pill {
+            font-size: 0.72rem;
+            font-weight: 600;
+            padding: 2px 8px;
+            border-radius: 10px;
+            background: #21262d;
+            border: 1px solid #30363d;
+            display: inline-block;
+        }
+        .conf-high {
+            color: var(--accent-green);
+            border-color: rgba(174, 234, 0, 0.4);
+            background: rgba(174, 234, 0, 0.08);
+        }
+        .conf-mod {
+            color: var(--accent-yellow);
+            border-color: rgba(255, 234, 0, 0.4);
+            background: rgba(255, 234, 0, 0.08);
+        }
+        .conf-low {
+            color: #8b949e;
+            border-color: rgba(139, 148, 158, 0.4);
+        }
         /* Right Pane: Lab & Visualizer */
         .workspace {
             flex: 1;
@@ -671,7 +737,19 @@ HTML_PAGE = """<!DOCTYPE html>
                             <div id="noiseBadge" class="badge-cd" style="font-size: 0.82rem; padding: 4px 10px; display: none;">--</div>
                         </div>
                     </div>
-                    <audio id="audioPlayer" controls></audio>
+                    <!-- Estimated Provenance Banner -->
+                    <div id="provenanceCard" class="provenance-banner" style="display: none;">
+                        <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px;">
+                            <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+                                <span style="font-size: 1.05rem;">🏷️</span>
+                                <strong style="font-size: 0.85rem; color: var(--text-heading);">Estimated Provenance:</strong>
+                                <span id="provBadge" class="provenance-tag badge-provenance-native">--</span>
+                            </div>
+                            <span id="provConf" class="confidence-pill conf-high">--</span>
+                        </div>
+                        <div id="provDetails" style="font-size: 0.78rem; color: var(--text-muted); margin-top: 5px;">--</div>
+                    </div>
+                    <audio id="audioPlayer" controls style="margin-top: 10px;"></audio>
                 </section>
 
                 <!-- Panel 1: Spectrogram Heatmap -->
@@ -987,6 +1065,55 @@ HTML_PAGE = """<!DOCTYPE html>
                     }
                 } else {
                     nBadge.style.display = 'none';
+                }
+
+                // Estimated Provenance Banner & Badges
+                const provCard = document.getElementById('provenanceCard');
+                const provBadge = document.getElementById('provBadge');
+                const provConf = document.getElementById('provConf');
+                const provDetails = document.getElementById('provDetails');
+
+                if (data.provenance && data.provenance.label) {
+                    provCard.style.display = 'flex';
+                    provBadge.textContent = data.provenance.label;
+                    provBadge.className = `provenance-tag ${data.provenance.badge_class || 'badge-provenance-native'}`;
+
+                    const scorePct = Math.round((data.provenance.score || 0.9) * 100);
+                    provConf.textContent = `${data.provenance.confidence} Confidence (${scorePct}%)`;
+                    if (data.provenance.confidence === 'High') {
+                        provConf.className = 'confidence-pill conf-high';
+                    } else if (data.provenance.confidence === 'Moderate') {
+                        provConf.className = 'confidence-pill conf-mod';
+                    } else {
+                        provConf.className = 'confidence-pill conf-low';
+                    }
+                    provDetails.textContent = data.provenance.details || '';
+
+                    // Update track item badge in left sidebar if clear
+                    if (fileEl) {
+                        const topRow = fileEl.querySelector('.file-top');
+                        let provTag = topRow.querySelector('.file-prov-tag');
+                        if (data.provenance.confidence !== 'Low' && !data.provenance.label.includes('Unclear')) {
+                            if (!provTag) {
+                                provTag = document.createElement('span');
+                                provTag.className = `file-prov-tag ${data.provenance.badge_class}`;
+                                provTag.style.cssText = 'font-size: 0.68rem; padding: 1px 5px; border-radius: 3px; font-weight: 600; flex-shrink: 0;';
+                                topRow.insertBefore(provTag, topRow.lastElementChild);
+                            }
+                            let shortLabel = data.provenance.label
+                                .replace(' Master', '')
+                                .replace(' Source', '')
+                                .replace(' Material', '')
+                                .replace(' (Leaky SRC / DAC)', ' (Leaky)')
+                                .replace('from ', '');
+                            provTag.textContent = shortLabel;
+                            provTag.className = `file-prov-tag ${data.provenance.badge_class}`;
+                        } else if (provTag) {
+                            provTag.remove();
+                        }
+                    }
+                } else {
+                    provCard.style.display = 'none';
                 }
 
                 // Audio stream player

@@ -151,6 +151,7 @@ def analyze_audio_forensics(y, sr):
     rms_dbfs = 10.0 * np.log10(np.maximum(power_linear, 1e-24))
     
     spec_db = 20.0 * np.log10(np.maximum(stft_norm, 1e-12))
+    mean_spec_db = np.mean(spec_db, axis=1)
     freqs = librosa.fft_frequencies(sr=sr, n_fft=n_fft)
     
     idx_20k = np.argmin(np.abs(freqs - 20000))
@@ -350,7 +351,141 @@ def analyze_audio_forensics(y, sr):
     report.append(f"Peak-to-RMS Crest Factor     : {crest_db:.2f} dB")
     report.append(f"Peak Signal Level            : {peak_db:.2f} dBFS")
 
-    return spec_db, freqs, peak_dbfs, rms_dbfs, "\n".join(report), dr_metrics
+    # 5. Estimated Provenance Analysis (Lineage, Base Rates & Resampling Fingerprint)
+    has_notch_rebound_44k = False
+    mirror_corr_44k = 0.0
+    if sr >= 48000:
+        notch_drop = mean_spec_db[idx_20k] - mean_spec_db[idx_22k]
+        idx_228k = np.argmin(np.abs(freqs - 22800))
+        rebound = mean_spec_db[idx_228k] - mean_spec_db[idx_22k]
+
+        corrs = []
+        for f_base in np.linspace(20600, 21800, 10):
+            f_mirror = 44100.0 - f_base
+            i1 = np.argmin(np.abs(freqs - f_base))
+            i2 = np.argmin(np.abs(freqs - f_mirror))
+            t1 = stft_mag[i1, :]
+            t2 = stft_mag[i2, :]
+            if np.std(t1) > 1e-8 and np.std(t2) > 1e-8:
+                c = np.corrcoef(t1, t2)[0, 1]
+                if not np.isnan(c):
+                    corrs.append(c)
+        mirror_corr_44k = float(np.mean(corrs)) if corrs else 0.0
+        if rebound > 2.0 and (mirror_corr_44k > 0.60 or notch_drop > 8.0):
+            has_notch_rebound_44k = True
+
+    if is_zero_stuffed:
+        provenance_info = {
+            "label": "Raw Zero-Stuffed / NOS Source",
+            "confidence": "High",
+            "score": 0.98,
+            "badge_class": "badge-provenance-fake",
+            "details": "Literal zero-stuffing or strong unfiltered imaging detected above 22.05 kHz."
+        }
+    elif has_notch_rebound_44k:
+        conf = "High" if mirror_corr_44k > 0.75 else "Moderate"
+        provenance_info = {
+            "label": "44.1 kHz Master (Leaky SRC / DAC)",
+            "confidence": conf,
+            "score": round(min(0.98, max(0.70, mirror_corr_44k)), 2),
+            "badge_class": "badge-provenance-leaky",
+            "details": f"44.1 kHz filter notch at 22.05 kHz with mirrored spectral imaging (r={mirror_corr_44k:+.2f})."
+        }
+    elif is_88k_cutoff:
+        provenance_info = {
+            "label": "Upsampled from 88.2 kHz Master",
+            "confidence": "High",
+            "score": 0.95,
+            "badge_class": "badge-provenance-upsampled",
+            "details": "Sharp anti-aliasing cutoff at 44.1 kHz into container baseline dither noise floor."
+        }
+    elif is_96k_cutoff:
+        provenance_info = {
+            "label": "Upsampled from 96.0 kHz Master",
+            "confidence": "High",
+            "score": 0.95,
+            "badge_class": "badge-provenance-upsampled",
+            "details": "Sharp anti-aliasing cutoff at 48.0 kHz into container baseline dither noise floor."
+        }
+    elif is_cd_cutoff:
+        provenance_info = {
+            "label": "Upsampled from 44.1 kHz CD",
+            "confidence": "High",
+            "score": 0.95,
+            "badge_class": "badge-provenance-upsampled",
+            "details": "Brick-wall cutoff at 22.05 kHz into container noise floor."
+        }
+    elif is_48k_cutoff:
+        provenance_info = {
+            "label": "Upsampled from 48.0 kHz Source",
+            "confidence": "High",
+            "score": 0.95,
+            "badge_class": "badge-provenance-upsampled",
+            "details": "Brick-wall cutoff at 24.0 kHz into container noise floor."
+        }
+    elif nyquist <= 22050:
+        provenance_info = {
+            "label": f"Native {sr/1000:.1f} kHz CD Master",
+            "confidence": "High",
+            "score": 0.95,
+            "badge_class": "badge-provenance-native",
+            "details": f"Standard Red Book container with full {sr/1000:.1f} kHz audible passband."
+        }
+    elif sr == 48000:
+        if effective_cutoff_hz >= 23500.0:
+            provenance_info = {
+                "label": "Native 48.0 kHz Master",
+                "confidence": "High",
+                "score": 0.90,
+                "badge_class": "badge-provenance-native",
+                "details": f"Continuous harmonic extension up to {effective_cutoff_hz/1000:.1f} kHz Nyquist limit."
+            }
+        elif effective_cutoff_hz >= 21500.0:
+            provenance_info = {
+                "label": "Native 48.0 kHz Material",
+                "confidence": "Moderate",
+                "score": 0.75,
+                "badge_class": "badge-provenance-native",
+                "details": f"Natural acoustic roll-off extending to ~{effective_cutoff_hz/1000:.1f} kHz."
+            }
+        else:
+            provenance_info = {
+                "label": "Unclear / Mixed Source",
+                "confidence": "Low",
+                "score": 0.40,
+                "badge_class": "badge-provenance-unclear",
+                "details": "Bandwidth limited without clear brickwall or mirror characteristics."
+            }
+    else:
+        if effective_cutoff_hz >= 26000.0:
+            provenance_info = {
+                "label": f"Native {sr/1000:.1f} kHz Master",
+                "confidence": "High",
+                "score": 0.92,
+                "badge_class": "badge-provenance-native",
+                "details": f"Continuous acoustic harmonic bandwidth reaching ~{effective_cutoff_hz/1000:.1f} kHz."
+            }
+        elif effective_cutoff_hz >= 21000.0:
+            provenance_info = {
+                "label": f"Native {sr/1000:.1f} kHz Material",
+                "confidence": "Moderate",
+                "score": 0.75,
+                "badge_class": "badge-provenance-native",
+                "details": f"Smooth ultrasonic roll-off up to ~{effective_cutoff_hz/1000:.1f} kHz."
+            }
+        else:
+            provenance_info = {
+                "label": "Unclear / Mixed Source",
+                "confidence": "Low",
+                "score": 0.40,
+                "badge_class": "badge-provenance-unclear",
+                "details": "Bandwidth limited without clear brickwall or mirror characteristics."
+            }
+
+    report.append(f"\nESTIMATED PROVENANCE : {provenance_info['label']} [{provenance_info['confidence']} Confidence: {int(provenance_info['score']*100)}%]")
+    report.append(f"  -> {provenance_info['details']}")
+
+    return spec_db, freqs, peak_dbfs, rms_dbfs, "\n".join(report), dr_metrics, provenance_info
 
 
 def encode_spectrogram_and_lookup(spec_db, width=1600, height=800, lookup_w=600, lookup_h=300):
@@ -1339,7 +1474,7 @@ def main():
         data[:taper_len] *= taper
         data[-taper_len:] *= taper[::-1]
 
-    spec_db, freqs, peak_dbfs, rms_dbfs, assessment_text, dr_metrics = analyze_audio_forensics(data, sr)
+    spec_db, freqs, peak_dbfs, rms_dbfs, assessment_text, dr_metrics, provenance_info = analyze_audio_forensics(data, sr)
     
     print("\n" + assessment_text)
     print("----------------------------\n")
