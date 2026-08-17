@@ -435,7 +435,7 @@ class BoundedThreadPoolExecutor(ThreadPoolExecutor):
             self._semaphore.release()
             raise
 
-file_writer_pool = BoundedThreadPoolExecutor(max_workers=2, max_queue_size=2)
+file_writer_pool = BoundedThreadPoolExecutor(max_workers=1, max_queue_size=1)
 
 
 # ==============================================================================
