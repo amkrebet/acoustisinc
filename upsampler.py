@@ -34,6 +34,7 @@ from PIL import Image
 from mutagen import File
 from mutagen.flac import FLAC, Picture
 from concurrent.futures import ThreadPoolExecutor
+from provenance_engine import load_audio_resilient, probe_audio_info_resilient
 
 try:
     import psutil
@@ -586,8 +587,8 @@ def get_audio_files(directory):
 
 def inspect_track_fast(filepath):
     try:
-        info = sf.info(filepath)
-        scale, _ = get_target_scale(info.samplerate)
+        info = probe_audio_info_resilient(filepath)
+        scale, _ = get_target_scale(info['samplerate'])
     except Exception:
         return 4, 1.0, 0.1, False
 
@@ -614,7 +615,7 @@ def inspect_track_fast(filepath):
     except Exception:
         pass
 
-    # Fast Path B: Chunked Streaming PCM Audio Scan (Memory-Safe)
+    # Fast Path B: Chunked Streaming PCM Audio Scan (Memory-Safe with Resilient Fallback)
     try:
         with sf.SoundFile(filepath) as f:
             pk = 0.0
@@ -633,6 +634,14 @@ def inspect_track_fast(filepath):
             rms = float(np.sqrt(sum_sq / max(1, total_samples)))
             return scale, pk, rms, False
     except Exception:
+        try:
+            data, _ = load_audio_resilient(filepath, dtype='float64')
+            if data is not None and data.size > 0:
+                pk = float(np.max(np.abs(data)))
+                rms = float(np.sqrt(np.mean(data ** 2)))
+                return scale, pk, rms, False
+        except Exception:
+            pass
         return scale, 1.0, 0.1, False
 
 def scan_album(files):
@@ -707,8 +716,11 @@ def process_track(filepath, dest_dir, gain_factor, album_max_peak_lin, queue, ph
         return False, 0.0, None
 
     try: 
-        data, samplerate = sf.read(filepath, dtype='float64')
+        data, samplerate = load_audio_resilient(filepath, dtype='float64')
     except Exception: 
+        return False, 0.0, None
+        
+    if data is None or data.size == 0:
         return False, 0.0, None
         
     if data.ndim == 1: 

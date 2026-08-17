@@ -5,10 +5,121 @@ Strict 64-bit Double Precision (float64) DSP Pipeline Integration
 
 import os
 import json
+import subprocess
+import soundfile as sf
 import numpy as np
 
 
 DEFAULT_RULES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "provenance_rules.json")
+
+
+def probe_audio_info_resilient(filepath):
+    """
+    Probes audio file sample rate, channels, frames, and subtype.
+    Uses soundfile as primary, falling back to ffprobe on header/stream corruption.
+    Returns: dict with 'samplerate', 'channels', 'frames', 'subtype', 'duration'
+    """
+    try:
+        info = sf.info(filepath)
+        return {
+            'samplerate': info.samplerate,
+            'channels': info.channels,
+            'frames': info.frames,
+            'subtype': info.subtype,
+            'duration': info.duration
+        }
+    except Exception:
+        pass
+
+    # Fallback to ffprobe
+    try:
+        cmd_probe = [
+            "ffprobe", "-v", "error",
+            "-select_streams", "a:0",
+            "-show_entries", "stream=sample_rate,channels,duration,bits_per_raw_sample",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            filepath
+        ]
+        out = subprocess.check_output(cmd_probe, text=True, stderr=subprocess.DEVNULL).strip().split()
+        if len(out) >= 2:
+            sr = int(out[0])
+            channels = int(out[1])
+            duration = float(out[2]) if len(out) > 2 and out[2] != 'N/A' else 0.0
+            frames = int(duration * sr)
+            bits = int(out[3]) if len(out) > 3 and out[3] != 'N/A' else 16
+            subtype = f"PCM_{bits}"
+            return {
+                'samplerate': sr,
+                'channels': channels,
+                'frames': frames,
+                'subtype': subtype,
+                'duration': duration
+            }
+    except Exception:
+        pass
+
+    return {
+        'samplerate': 44100,
+        'channels': 2,
+        'frames': 0,
+        'subtype': 'PCM_16',
+        'duration': 0.0
+    }
+
+
+def load_audio_resilient(filepath, dtype='float64', start=0, stop=None, frames=None):
+    """
+    Resilient Multi-Tier Audio Loader:
+    1. Primary: Fast native libsndfile (soundfile).
+    2. Fallback: Subprocess stream pipe via FFmpeg with error concealment for damaged headers,
+       improper ID3 tags prepended to FLAC, corrupted seektables, or truncated streams.
+    Returns: (data: np.ndarray, samplerate: int)
+    """
+    # Tier 1: Try Fast Native libsndfile
+    try:
+        if stop is not None or frames is not None:
+            data, sr = sf.read(filepath, dtype=dtype, start=start, stop=stop, frames=frames, always_2d=True)
+            if data is not None and data.size > 0:
+                return data, sr
+        else:
+            data, sr = sf.read(filepath, dtype=dtype, always_2d=True)
+            if data is not None and data.size > 0:
+                return data, sr
+    except Exception:
+        pass
+
+    # Tier 2: FFmpeg Error-Concealed Pipe Fallback
+    try:
+        info = probe_audio_info_resilient(filepath)
+        sr = info['samplerate']
+        channels = info['channels']
+
+        if dtype == 'int32':
+            fmt = 's32le'
+            codec = 'pcm_s32le'
+            np_dt = np.int32
+        else:
+            fmt = 'f64le'
+            codec = 'pcm_f64le'
+            np_dt = np.float64
+
+        cmd_decode = ["ffmpeg", "-v", "error", "-i", filepath]
+        if start > 0:
+            cmd_decode.extend(["-ss", str(start / sr)])
+        if frames is not None:
+            cmd_decode.extend(["-frames:a", str(frames)])
+        elif stop is not None and stop > start:
+            cmd_decode.extend(["-t", str((stop - start) / sr)])
+
+        cmd_decode.extend(["-f", fmt, "-acodec", codec, "-"])
+        raw_bytes = subprocess.check_output(cmd_decode, stderr=subprocess.DEVNULL)
+        if len(raw_bytes) > 0:
+            data = np.frombuffer(raw_bytes, dtype=np_dt).reshape(-1, channels)
+            return data, sr
+    except Exception:
+        pass
+
+    return np.zeros((0, 2), dtype=np.float64 if dtype == 'float64' else np.int32), 44100
 
 
 def original_sample_rate_decoder(c: int) -> int:
@@ -63,10 +174,9 @@ def detect_mqa_signature(filepath=None, pcm_int32=None, sr=44100):
     # 2. Audio Bitstream check (36-bit magic word 0xbe0498c88)
     if filepath and os.path.exists(filepath) and pcm_int32 is None:
         try:
-            import soundfile as sf
-            info = sf.info(filepath)
-            frames = min(int(info.samplerate * 6.0), info.frames)
-            pcm_int32, _ = sf.read(filepath, frames=frames, dtype="int32", always_2d=True)
+            info = probe_audio_info_resilient(filepath)
+            frames = min(int(info['samplerate'] * 6.0), info['frames'] if info['frames'] > 0 else int(info['samplerate'] * 6.0))
+            pcm_int32, _ = load_audio_resilient(filepath, frames=frames, dtype="int32")
         except Exception:
             pass
 
@@ -123,13 +233,12 @@ def analyze_effective_bit_depth(filepath=None, pcm_int32=None):
 
     if filepath and os.path.exists(filepath):
         try:
-            import soundfile as sf
-            info = sf.info(filepath)
-            res["container_subtype"] = info.subtype
-            res["container_bits"] = 24 if "24" in info.subtype else (32 if "32" in info.subtype else 16)
+            info = probe_audio_info_resilient(filepath)
+            res["container_subtype"] = info['subtype']
+            res["container_bits"] = 24 if "24" in info['subtype'] else (32 if "32" in info['subtype'] else 16)
             if pcm_int32 is None:
-                frames = min(int(info.samplerate * 30.0), info.frames)
-                pcm_int32, _ = sf.read(filepath, frames=frames, dtype="int32", always_2d=True)
+                frames = min(int(info['samplerate'] * 30.0), info['frames'] if info['frames'] > 0 else int(info['samplerate'] * 30.0))
+                pcm_int32, _ = load_audio_resilient(filepath, frames=frames, dtype="int32")
         except Exception:
             pass
 

@@ -27,6 +27,7 @@ import numpy as np
 
 # Core DSP functions
 from analyser import analyze_audio_forensics, encode_spectrogram_and_lookup
+from provenance_engine import load_audio_resilient, probe_audio_info_resilient
 
 
 # Default root directory for initial browsing
@@ -107,13 +108,13 @@ def get_directory_contents(target_path):
                     "is_hires": False
                 }
                 try:
-                    info = sf.info(full_path)
-                    file_meta["samplerate"] = info.samplerate
-                    file_meta["channels"] = info.channels
-                    file_meta["duration_s"] = info.duration
-                    file_meta["duration_str"] = format_seconds(info.duration)
-                    file_meta["is_hires"] = info.samplerate > 48000
-                    file_meta["subtype"] = info.subtype
+                    info = probe_audio_info_resilient(full_path)
+                    file_meta["samplerate"] = info['samplerate']
+                    file_meta["channels"] = info['channels']
+                    file_meta["duration_s"] = info['duration']
+                    file_meta["duration_str"] = format_seconds(info['duration'])
+                    file_meta["is_hires"] = info['samplerate'] > 48000
+                    file_meta["subtype"] = info['subtype']
                 except Exception:
                     pass
 
@@ -150,7 +151,7 @@ def analyze_file_on_demand(filepath, rules_path=None):
 
     try:
         t0 = time.time()
-        data, sr = sf.read(filepath, dtype='float64', start=0, stop=60*192000)
+        data, sr = load_audio_resilient(filepath, dtype='float64', start=0, stop=60*192000)
         if data.ndim > 1:
             data = np.mean(data, axis=1)
 

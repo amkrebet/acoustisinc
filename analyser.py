@@ -25,6 +25,7 @@ import librosa
 import scipy.signal as signal
 import matplotlib
 from PIL import Image
+from provenance_engine import load_audio_resilient, probe_audio_info_resilient
 
 
 def calculate_dynamic_range_metrics(y, sr):
@@ -1342,7 +1343,7 @@ def main():
         print(f"Rules Path : {args.rules}")
     print(f"==================================================")
 
-    data, sr = sf.read(filepath, dtype='float64', start=0, stop=60*192000)
+    data, sr = load_audio_resilient(filepath, dtype='float64', start=0, stop=60*192000)
     if data.ndim > 1:
         data = np.mean(data, axis=1)
 
