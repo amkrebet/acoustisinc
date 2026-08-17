@@ -614,14 +614,24 @@ def inspect_track_fast(filepath):
     except Exception:
         pass
 
-    # Fast Path B: Parallel PCM Audio Scan
+    # Fast Path B: Chunked Streaming PCM Audio Scan (Memory-Safe)
     try:
-        data, _ = sf.read(filepath, dtype='float64')
-        if data.size > 0:
-            pk = float(np.max(np.abs(data)))
-            rms = float(np.sqrt(np.mean(data ** 2)))
+        with sf.SoundFile(filepath) as f:
+            pk = 0.0
+            sum_sq = 0.0
+            total_samples = 0
+            block_size = 65536
+            while f.tell() < f.frames:
+                block = f.read(block_size, dtype='float64')
+                if block.size == 0:
+                    break
+                block_pk = float(np.max(np.abs(block)))
+                if block_pk > pk:
+                    pk = block_pk
+                sum_sq += float(np.sum(block ** 2))
+                total_samples += block.size
+            rms = float(np.sqrt(sum_sq / max(1, total_samples)))
             return scale, pk, rms, False
-        return scale, 0.0, 0.0, False
     except Exception:
         return scale, 1.0, 0.1, False
 
