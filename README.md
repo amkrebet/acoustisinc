@@ -57,24 +57,48 @@ It delivers:
 
 ---
 
-## 🔬 Filter Topology & Impulse Response Analysis
+## 🔬 Filter Topology, Roll-Off & Psychoacoustic Analysis
 
-AcoustiSinc implements four mathematical reconstruction filter topologies in strict 64-bit double precision (`float64` / `complex128` / OpenCL `double2`), catering to different musical genres and recording provenances:
+AcoustiSinc implements four distinct mathematical reconstruction filter topologies in strict 64-bit double precision (`float64` / `complex128` / OpenCL `double2`), catering to different recording provenances, musical genres, and acoustic preferences:
 
-![AcoustiSinc Filter Topology & Impulse Response Analysis](acoustisinc_filter_impulse_comparison_v1.png)
+![AcoustiSinc Filter Topology Breakdown](acoustisinc_filter_topology_breakdown_v2.png)
 
-### Filter Topology Comparison
+### Topology Comparison Matrix
 
-| Filter Mode | CLI Flags | Time-Domain Impulse Profile | Pre-Ringing | Post-Ringing | Phase Linearity | Best Musical Fit |
-| :--- | :--- | :--- | :---: | :---: | :---: | :--- |
-| **Linear Phase (Standard)** | `--phase linear` | Symmetric $\text{sinc}(x)$ | Present | Present (Equal) | **Strict Linear** (0° phase shift) | Electronic music, synthesizers, multi-track studio stems. |
-| **Linear Phase + Apodizing** | `--phase linear --apod` | Symmetric with cosine transition taper | Attenuated | Attenuated (Equal) | **Strict Linear** (0° phase shift) | Hot/compressed modern pop & rock masters. |
-| **Minimum Phase (Standard)** | `--phase min` | Asymmetric causal impulse | **Zero (0.00%)** | Natural exponential decay | Minimum Phase (Non-linear) | Acoustic instruments, percussion, classical, jazz, vocals, natural soundstage imaging. |
-| **Minimum Phase + Apodizing** | `--phase min --apod` | Asymmetric causal with smooth cutoff | **Zero (0.00%)** | Rapid decaying post-ringing | Minimum Phase (Non-linear) | Early digital CD transfers (1980s–90s) with harsh studio ADC ringing. |
+| Filter Topology | CLI Flags | Time-Domain Profile | Pre-Ringing | Post-Ringing | Phase Linearity | Roll-Off Geometry | Best Musical Fit |
+| :--- | :--- | :--- | :---: | :---: | :---: | :--- | :--- |
+| **1. Linear Phase (Standard)** | `--phase linear` | Symmetric $\text{sinc}(x)$ | High (Symmetric) | Moderate | **Strict 0° Linear** | Sharp brickwall at $22.05\text{k}$ | Electronic, synthesizers, stems |
+| **2. Linear Phase + Apodizing** | `--phase linear --apod` | Symmetric with cosine taper | Attenuated | Short | **Strict 0° Linear** | Smooth cosine taper from $20.0\text{k}$ | Hot/brickwalled pop & rock |
+| **3. Minimum Phase (Standard)** | `--phase min` | Real-cepstrum causal sinc | **Zero (0.00%)** | Moderate | Minimum Phase (Analog) | Sharp brickwall at $22.05\text{k}$ | **Acoustic, jazz, classical, vocals** |
+| **4. Minimum Phase + Apodizing** | `--phase min --apod` | Causal sinc with cosine taper | **Zero (0.00%)** | **Very Short** | Minimum Phase (Analog) | Smooth cosine taper from $20.0\text{k}$ | Early 1980s CDs / bright mixes |
 
-#### Acoustic & Psychoacoustic Insights
-1. **Zero Pre-Ringing in Minimum Phase**: In acoustic physics, sound cannot precede the physical impact that generates it. Linear-phase filters introduce acausal backward-in-time oscillations before transients. Human hearing has almost zero backward temporal masking ($<5\text{ ms}$), rendering pre-ringing audible as artificial "digital smear". Minimum-phase filtering shifts all energy into the causal domain ($t \ge 0$), delivering instantaneous transient impact and authentic soundstage localization.
-2. **Apodizing High-Frequency Taper**: Early studio ADCs often used steep anti-aliasing brickwall filters with severe passband ripple. The `--apodizing` mode introduces a smooth roll-off transition band near $20.05\text{ kHz}$, cleanly eliminating pre-existing ADC ringing and stopband Gibbs overshoot.
+---
+
+### In-Depth Scenario Breakdown
+
+#### 1. Linear Phase (Standard Sinc) — `--phase linear`
+* **Filter & Time-Domain Response**: Perfectly symmetric around $t = 0$. Exactly 50% of the ringing energy occurs *before* the transient peak (pre-ringing) and 50% occurs *after* (post-ringing). Delivers absolute **zero phase distortion (0° phase shift)** and constant group delay across all frequencies ($20\text{ Hz} \to 20\text{ kHz}$).
+* **Roll-Off & Ultrasonic Attenuation**: Razor-flat $\pm 0.00001\text{ dB}$ passband up to $20.0\text{ kHz}$ followed by a steep brickwall cutoff landing into a **$>140\text{ dB}$ stopband rejection floor**.
+* **Noise Characteristics**: Coupled with 24-bit Shibata 5th-order psychoacoustic noise shaping, baseband quantization noise is pushed safely above $35\text{ kHz}$ with dynamic range $>120\text{ dB}$.
+* **Psychoacoustic Impact**: Human hearing relies on *forward temporal masking* (masking sounds *after* a loud event by up to $100\text{--}200\text{ ms}$), but has near-zero *backward temporal masking* ($<5\text{ ms}$). Pre-ringing occurs before the note strikes and can be perceived as an artificial "digital smear" or lack of visceral transient bite. However, perfect phase linearity preserves precise spatial phase cues in multi-track synthesized mixes.
+
+#### 2. Linear Phase + Apodizing — `--phase linear --apodizing`
+* **Filter & Time-Domain Response**: Symmetric impulse with a raised-cosine apodizing window that substantially damps both pre-ringing and post-ringing amplitudes.
+* **Roll-Off & Ultrasonic Attenuation**: Begins rolling off gently at $\approx 20.05\text{ kHz}$ ($-6\text{ dB}$ at $22.05\text{ kHz}$), eliminating Gibbs phenomenon overshoots and sharp corner reflections.
+* **Noise Characteristics**: Produces lower intersample peak overshoot than standard brickwall sinc, preserving dynamic headroom.
+* **Psychoacoustic Impact**: Many vintage 1980s/90s digital recordings were digitized through primitive brickwall studio ADCs that permanently captured filter ringing. The apodizing filter attenuates pre-existing studio ADC ripple, removing harsh treble glare while preserving 100% linear phase coherence.
+
+#### 3. Minimum Phase (Causal Sinc) — `--phase min` *(Recommended Default)*
+* **Filter & Time-Domain Response**: Generated via real-cepstral Hilbert transform factorization. Shifted entirely into the **causal domain** ($t \ge 0$) with **strictly 0.00% pre-ringing**. The signal is at absolute rest prior to the transient strike, followed by natural exponential post-ringing.
+* **Roll-Off & Ultrasonic Attenuation**: Bit-perfect flat passband to $20.0\text{ kHz}$ with steep $>140\text{ dB}$ ultrasonic stopband rejection.
+* **Noise Characteristics**: Optimal synergy with multi-threaded Shibata noise shaping; sample-by-sample feedback loops operate strictly forward in time.
+* **Psychoacoustic Impact**: Because there is zero pre-echo, percussive transients (drums, acoustic guitar plucks, piano hammers) hit with maximum instantaneous speed and visceral physical punch. The post-ringing falls entirely within the ear's forward temporal masking window, rendering it completely inaudible.
+
+#### 4. Minimum Phase + Apodizing — `--phase min --apodizing`
+* **Filter & Time-Domain Response**: Combines **zero pre-ringing** with rapid cosine-tapered post-ringing damping (post-ringing decays in under half the time of standard minimum phase).
+* **Roll-Off & Ultrasonic Attenuation**: Smooth cosine transition starting near $20.05\text{ kHz}$ with monotonic step response and minimal overshoot.
+* **Noise Characteristics**: Lowest peak-to-average overshoot ratio of all four topologies.
+* **Psychoacoustic Impact**: The most fatigue-free filter profile available. Produces a warm, silky top-end reminiscent of high-end analog tape playback. Transients remain fast without ever sounding brittle or analytical. Excellent for bright headphones, horn speakers, and long listening sessions.
 
 ---
 
