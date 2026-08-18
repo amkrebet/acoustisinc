@@ -165,16 +165,18 @@ __kernel void complex_exp_inplace(
 __kernel void init_apodizing_filter(
     __global double2 *filter_spec,
     const ulong padded_len,
-    const ulong in_len,
+    const ulong cutoff_bin,
     const ulong transition_bins
 ) {
     ulong gid = get_global_id(0);
     if (gid >= padded_len) return;
 
-    double mag_val = 1.0;
-    ulong start_taper = (in_len > transition_bins) ? (in_len - transition_bins) : 0;
+    double mag_val = 0.0;
+    ulong start_taper = (cutoff_bin > transition_bins) ? (cutoff_bin - transition_bins) : 0;
 
-    if (gid >= start_taper && gid < in_len && transition_bins > 0) {
+    if (gid < start_taper) {
+        mag_val = 1.0;
+    } else if (gid >= start_taper && gid < cutoff_bin && transition_bins > 0) {
         double progress = (double)(gid - start_taper) / (double)(transition_bins > 1 ? (transition_bins - 1) : 1);
         mag_val = 0.5 * (1.0 + cos(progress * M_PI));
     }
@@ -199,14 +201,22 @@ def get_sinc_kernel(ctx, kernel_name):
         CL_KERNELS[kernel_name] = cl.Kernel(prg, kernel_name)
     return CL_KERNELS[kernel_name]
 
-def get_gpu_filter_kernel(queue, fast_output_len, padded_len, in_len, scale_factor, phase_mode="linear", apodizing=False):
+def get_gpu_filter_kernel(queue, fast_output_len, padded_len, in_len, scale_factor, phase_mode="linear", apodizing=False, cutoff_hz=None, src_sr=None, steep=False):
     p = phase_mode.lower()
     is_min = p in ['min', 'minimum']
     
+    k_cutoff = in_len - 1
+    if cutoff_hz is not None and src_sr is not None:
+        f_nyq = src_sr / 2.0
+        if cutoff_hz < f_nyq:
+            k_cutoff = int((cutoff_hz / f_nyq) * (in_len - 1))
+            k_cutoff = max(1, min(in_len - 1, k_cutoff))
+            apodizing = True
+
     if not is_min and not apodizing:
         return None, 0
 
-    key = (padded_len, in_len, scale_factor, is_min, apodizing)
+    key = (padded_len, in_len, k_cutoff, scale_factor, is_min, apodizing, steep)
     if key in GPU_FILTER_CACHE:
         return GPU_FILTER_CACHE[key], 1
 
@@ -214,8 +224,9 @@ def get_gpu_filter_kernel(queue, fast_output_len, padded_len, in_len, scale_fact
     if len(GPU_FILTER_CACHE) > 8:
         GPU_FILTER_CACHE.clear()
 
-    transition_bins = max(16, int((in_len - 1) * 2000.0 / (22050.0 if in_len > 22050 else 44100.0))) if apodizing else max(16, int((in_len - 1) * 250.0 / (22050.0 if in_len > 22050 else 44100.0)))
-    k_cutoff = in_len - 1
+    trans_bw = 500.0 if steep else 2000.0
+    ref_nyq = (src_sr / 2.0) if src_sr is not None else (22050.0 if in_len > 22050 else 44100.0)
+    transition_bins = max(16, int((in_len - 1) * trans_bw / ref_nyq)) if (apodizing or cutoff_hz) else max(16, int((in_len - 1) * 250.0 / ref_nyq))
 
     if is_min:
         # Minimum Phase Kernel (with or without Apodizing transition shaping)
@@ -255,7 +266,7 @@ def get_gpu_filter_kernel(queue, fast_output_len, padded_len, in_len, scale_fact
         d_kernel = cla.empty(queue, (padded_len,), dtype=np.complex128)
         k_apod(
             queue, (padded_len,), None,
-            d_kernel.data, np.uint64(padded_len), np.uint64(in_len), np.uint64(transition_bins)
+            d_kernel.data, np.uint64(padded_len), np.uint64(k_cutoff), np.uint64(transition_bins)
         )
         queue.finish()
 
@@ -267,7 +278,7 @@ def get_gpu_filter_kernel(queue, fast_output_len, padded_len, in_len, scale_fact
 # GPU SINC UPSAMPLER ENGINE (BATCHED MULTI-CHANNEL IN VRAM)
 # ==============================================================================
 
-def upsample_multichannel_gpu(pcm_data, scale_factor, queue, phase_mode="linear", apodizing=False):
+def upsample_multichannel_gpu(pcm_data, scale_factor, queue, phase_mode="linear", apodizing=False, cutoff_hz=None, src_sr=None, steep=False):
     """
     Batched multi-channel GPU sinc upsampler using 64-bit double precision.
     Processes all channels simultaneously in a single GPU submission.
@@ -290,7 +301,7 @@ def upsample_multichannel_gpu(pcm_data, scale_factor, queue, phase_mode="linear"
     gpu_freq = rfftn(gpu_in, ndim=1)
 
     # 3. Sinc Zero-Padding + Filter Multiplication entirely inside VRAM
-    d_kernel, apply_filter = get_gpu_filter_kernel(queue, fast_output_len, padded_spectrum_shape, fft_in_shape, scale_factor, phase_mode, apodizing)
+    d_kernel, apply_filter = get_gpu_filter_kernel(queue, fast_output_len, padded_spectrum_shape, fft_in_shape, scale_factor, phase_mode, apodizing, cutoff_hz, src_sr, steep)
     kernel_data = d_kernel.data if d_kernel is not None else gpu_freq.data
 
     gpu_padded = cla.empty(queue, (num_channels, padded_spectrum_shape), dtype=np.complex128)
@@ -705,7 +716,7 @@ def scan_album(files):
 # TRACK PROCESSOR
 # ==============================================================================
 
-def process_track(filepath, dest_dir, gain_factor, album_max_peak_lin, queue, phase_mode, dither_mode, tmp_dir, apodizing=False, mqa_mode='adaptive'):
+def process_track(filepath, dest_dir, gain_factor, album_max_peak_lin, queue, phase_mode, dither_mode, tmp_dir, apodizing=False, mqa_mode='adaptive', cutoff_hz=None, steep=False):
     t0 = time.time()
     def elapsed(): return f"[+{time.time() - t0:6.2f}s]"
 
@@ -752,7 +763,10 @@ def process_track(filepath, dest_dir, gain_factor, album_max_peak_lin, queue, ph
 
     is_min = phase_mode.lower() in ['min', 'minimum']
     phase_label = "MINIMUM PHASE" if is_min else "LINEAR PHASE"
-    filter_label = f"{phase_label} APODIZING" if apodizing else phase_label
+    if cutoff_hz:
+        filter_label = f"{phase_label} APODIZING (Cutoff: {cutoff_hz:,.0f}Hz)"
+    else:
+        filter_label = f"{phase_label} APODIZING" if apodizing else phase_label
 
     print(f"\n{elapsed()} --------------------------------------------------")
     print(f"{elapsed()} Processing {filename}")
@@ -792,9 +806,9 @@ def process_track(filepath, dest_dir, gain_factor, album_max_peak_lin, queue, ph
             if len(chunk_pcm) < SAFE_CHUNK_LEN:
                 chunk_buf = np.zeros((SAFE_CHUNK_LEN, num_channels), dtype=np.float64)
                 chunk_buf[:len(chunk_pcm), :] = chunk_pcm
-                upsampled_chunk = upsample_multichannel_gpu(chunk_buf, scale_factor, queue, phase_mode, apodizing)
+                upsampled_chunk = upsample_multichannel_gpu(chunk_buf, scale_factor, queue, phase_mode, apodizing, cutoff_hz=cutoff_hz, src_sr=samplerate, steep=steep)
             else:
-                upsampled_chunk = upsample_multichannel_gpu(chunk_pcm, scale_factor, queue, phase_mode, apodizing)
+                upsampled_chunk = upsample_multichannel_gpu(chunk_pcm, scale_factor, queue, phase_mode, apodizing, cutoff_hz=cutoff_hz, src_sr=samplerate, steep=steep)
             
             left_guard = (pos - src_start) * scale_factor
             valid_len = min(chunk_size, orig_samples - pos) * scale_factor
@@ -809,7 +823,7 @@ def process_track(filepath, dest_dir, gain_factor, album_max_peak_lin, queue, ph
         gc.collect()
         print(f"{elapsed()} Batched GPU Sinc Chunking complete in {time.time() - t_gpu:.3f}s")
     else:
-        output_data = upsample_multichannel_gpu(data, scale_factor, queue, phase_mode, apodizing)
+        output_data = upsample_multichannel_gpu(data, scale_factor, queue, phase_mode, apodizing, cutoff_hz=cutoff_hz, src_sr=samplerate, steep=steep)
         print(f"{elapsed()} Batched GPU Sinc complete in {time.time() - t_gpu:.3f}s")
 
     del data
@@ -858,7 +872,7 @@ def process_track(filepath, dest_dir, gain_factor, album_max_peak_lin, queue, ph
 # ALBUM BATCH CONTROLLER WITH RETRY AUTO-HEALING
 # ==============================================================================
 
-def process_album_folder(source_album_dir, dest_album_dir, queue, phase_mode, dither_mode, tmp_dir, apodizing=False, mqa_mode='adaptive'):
+def process_album_folder(source_album_dir, dest_album_dir, queue, phase_mode, dither_mode, tmp_dir, apodizing=False, mqa_mode='adaptive', cutoff_hz=None, steep=False):
     print(f"\n==================================================")
     print(f"Directory:   {source_album_dir}")
     print(f"Destination: {dest_album_dir}")
@@ -889,7 +903,7 @@ def process_album_folder(source_album_dir, dest_album_dir, queue, phase_mode, di
 
         for idx, f in enumerate(files, 1):
             print(f"\n--- Track [{idx}/{len(files)}] ---")
-            clipped, out_peak, fut = process_track(f, dest_album_dir, gain_factor, album_max_peak_lin, queue, phase_mode, dither_mode, tmp_dir, apodizing=apodizing, mqa_mode=mqa_mode)
+            clipped, out_peak, fut = process_track(f, dest_album_dir, gain_factor, album_max_peak_lin, queue, phase_mode, dither_mode, tmp_dir, apodizing=apodizing, mqa_mode=mqa_mode, cutoff_hz=cutoff_hz, steep=steep)
             if fut is not None:
                 pass_futures.append(fut)
             if clipped:
@@ -953,6 +967,10 @@ def main():
     parser.add_argument("-o", "--output-dir", default=None, help="Explicit target output directory")
     parser.add_argument("--phase", choices=['linear', 'min', 'minimum'], default='linear', help="Filter phase mode: linear (symmetric) or min (minimum phase, causal)")
     parser.add_argument("--apodizing", "--apod", action="store_true", help="Enable Apodizing transition band to attenuate pre-existing studio ADC ringing")
+    parser.add_argument("--cutoff", "--apodize", type=float, default=None, help="Custom low-pass reconstruction filter cutoff frequency in Hz (e.g. 20700, 21500, 22050, 44100)")
+    parser.add_argument("--steep", action="store_true", help="Use sharp transition band (500 Hz) instead of standard 2 kHz taper")
+    parser.add_argument("--filter", choices=['linear-phase', 'min-phase', 'linear', 'min'], default=None, help="Filter mode alias")
+    parser.add_argument("--precision", choices=['float64', 'double', 'double2'], default='float64', help="Precision mode (default: strict float64)")
     parser.add_argument("--dither", choices=['shibata', 'high_rate', 'none'], default='shibata', help="Dither & noise shaping mode (default: shibata)")
     parser.add_argument("--no-dither", action="store_true", help="Disable dither and noise shaping")
     parser.add_argument("--mqa", choices=['adaptive', 'simple', 'strip', 'ignore'], default='adaptive', help="MQA processing mode: adaptive (companded high-fidelity unfold), simple (linear unfold), strip (strip MQA payload and re-dither), ignore (treat as raw unaltered PCM)")
@@ -963,6 +981,15 @@ def main():
     if not os.path.exists(source_path):
         print(f"[Error] Source path not found: {source_path}")
         sys.exit(1)
+
+    if args.filter:
+        if args.filter in ['min-phase', 'min']:
+            args.phase = 'min'
+        elif args.filter in ['linear-phase', 'linear']:
+            args.phase = 'linear'
+
+    if args.cutoff:
+        args.apodizing = True
 
     is_min = args.phase.lower() in ['min', 'minimum']
     phase_name = "MINIMUM PHASE" if is_min else "LINEAR PHASE"
@@ -990,7 +1017,8 @@ def main():
     print(f"Destination Path: {target_dir}")
     print(f"Filter Topology : {topology_name}")
     print(f"Phase Mode      : {phase_name}")
-    print(f"Apodizing Filter: {'ENABLED (Anti-ADC Ringing)' if args.apodizing else 'DISABLED (Standard Sinc Bandwidth)'}")
+    print(f"Cutoff Frequency: {f'{args.cutoff:,.0f} Hz' if args.cutoff else 'Nyquist Bandwidth'}")
+    print(f"Apodizing Filter: {'ENABLED' if args.apodizing else 'DISABLED (Full Sinc Bandwidth)'}")
     print(f"Noise Shaping   : {dither_mode.upper()} (In-Register Double Precision)")
     print(f"MQA Processing  : {args.mqa.upper()}")
     print(f"FLAC Compression: Level 5 (Strict)")
@@ -1002,13 +1030,13 @@ def main():
 
     if os.path.isfile(source_path):
         gain_factor, pk = scan_album([source_path])
-        clipped, out_peak, fut = process_track(source_path, target_dir, gain_factor, pk, queue, args.phase, dither_mode, tmp_dir, apodizing=args.apodizing, mqa_mode=args.mqa)
+        clipped, out_peak, fut = process_track(source_path, target_dir, gain_factor, pk, queue, args.phase, dither_mode, tmp_dir, apodizing=args.apodizing, mqa_mode=args.mqa, cutoff_hz=args.cutoff, steep=args.steep)
         if clipped and out_peak > PEAK_TARGET_LIN:
             overshoot_ratio = PEAK_TARGET_LIN / out_peak
             safety_margin_lin = 10.0 ** (-0.2 / 20.0)
             gain_factor *= (overshoot_ratio * safety_margin_lin)
             print(f">>> Retrying single file with exact calculated Gain Factor: {gain_factor:.6f}")
-            process_track(source_path, target_dir, gain_factor, pk, queue, args.phase, dither_mode, tmp_dir, apodizing=args.apodizing, mqa_mode=args.mqa)
+            process_track(source_path, target_dir, gain_factor, pk, queue, args.phase, dither_mode, tmp_dir, apodizing=args.apodizing, mqa_mode=args.mqa, cutoff_hz=args.cutoff, steep=args.steep)
         file_writer_pool.shutdown(wait=True)
         return
 
@@ -1028,7 +1056,7 @@ def main():
         print(f"\n==================================================")
         print(f"[Album {idx}/{len(album_directories)}]")
         try:
-            process_album_folder(alb_dir, dest_alb, queue, args.phase, dither_mode, tmp_dir, apodizing=args.apodizing, mqa_mode=args.mqa)
+            process_album_folder(alb_dir, dest_alb, queue, args.phase, dither_mode, tmp_dir, apodizing=args.apodizing, mqa_mode=args.mqa, cutoff_hz=args.cutoff, steep=args.steep)
         except Exception as e:
             err_msg = f"[Album {idx} Skipped on Error]: {alb_dir}\nDetails: {e}"
             print(f"\n{err_msg}\n>>> Continuing to next album...")
