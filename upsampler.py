@@ -30,11 +30,14 @@ import pyopencl as cl
 import pyopencl.array as cla
 from pyvkfft.fft import rfftn, irfftn, clear_vkfftapp_cache
 import io
+import re
 from PIL import Image
 from mutagen import File
 from mutagen.flac import FLAC, Picture
 from concurrent.futures import ThreadPoolExecutor
 from provenance_engine import load_audio_resilient, probe_audio_info_resilient
+from analyser import analyze_audio_forensics
+from report_generator import generate_comparative_report
 
 try:
     import psutil
@@ -970,12 +973,142 @@ def process_album_folder(source_album_dir, dest_album_dir, queue, phase_mode, di
     gc.collect()
     print(f"\n>>> Directory completed cleanly! (Gain Factor: {gain_factor:.6f})")
 
+    # Generate Full Before & After Comparative Upsampling Report
+    pairs = [(f, os.path.join(dest_album_dir, os.path.basename(f))) for f in files]
+    alb_name = os.path.basename(source_album_dir) or "Album"
+    applied_recipe = {
+        "cli_params": f"--phase {phase_mode} --dither {dither_mode}" + (f" --cutoff {int(cutoff_hz)}" if cutoff_hz else "") + (f" --mqa {mqa_mode}" if mqa_mode != 'adaptive' else "") + (" --steep" if steep else ""),
+        "topology_name": f"{phase_mode.upper()} APODIZING" if (apodizing or cutoff_hz) else f"{phase_mode.upper()}",
+        "gain_factor": gain_factor,
+        "gain_db": 20.0 * np.log10(gain_factor)
+    }
+    try:
+        html_rep, md_rep = generate_comparative_report(pairs, alb_name, applied_recipe, dest_album_dir)
+        if html_rep:
+            print(f"\n   📊 [Comparative Upsampling Report Generated]")
+            print(f"      Interactive HTML Report: {html_rep}")
+            print(f"      Markdown Summary Report: {md_rep}")
+    except Exception as e:
+        print(f"   [Notice] Could not generate comparative report: {e}")
+
+
+def audit_and_resolve_recommendation(source_path, files, args):
+    """
+    Forensic pre-scan that audits source audio and resolves DSP parameters
+    based on --use-recommended={auto|ask}.
+    """
+    if args.use_recommended not in ['auto', 'ask']:
+        return args
+
+    print(f"\n=======================================================")
+    print(f"🔬 RUNNING FORENSIC DSP AUDIT & PROVENANCE ANALYSIS")
+    print(f"=======================================================")
+
+    sample_file = files[0] if files else source_path
+    try:
+        data, sr = sf.read(sample_file, frames=int(192000 * 25), dtype='float64', always_2d=True)
+    except Exception:
+        data, sr = load_audio_resilient(sample_file, dtype='float64', frames=int(192000 * 25))
+    if data.ndim > 1:
+        data = np.mean(data, axis=1)
+
+    _, _, _, _, assessment_text, dr_metrics, prov_info = analyze_audio_forensics(
+        data, sr, filepath=sample_file
+    )
+
+    primary = prov_info.get("primary", {})
+    label = primary.get("label", "Standard Master")
+    rec = prov_info.get("recommendation", {})
+    vis = prov_info.get("visual_morphology", {})
+    pk = vis.get("primary_knee", {})
+
+    print(f"Source Provenance : {label} [{primary.get('confidence', 'High')} Confidence]")
+    if pk and pk.get("is_brickwall_knee"):
+        print(f"Detected Knee     : {pk.get('freq_khz', 0):.1f} kHz (Slope: {pk.get('steepest_slope_db_per_khz', 0):.1f} dB/kHz | Drop: {pk.get('drop_db', 0):.1f} dB)")
+
+    if rec:
+        print(f"Recommended Action: {rec.get('action', 'Direct Sinc Upsampling')}")
+        print(f"Recommended DSP   : {rec.get('dsp_params', '--phase min --dither shibata')}")
+        print(f"Technical Rationale: {rec.get('details', '')}")
+    else:
+        print(f"Recommended DSP   : --phase min --dither shibata")
+    print(f"=======================================================\n")
+
+    # Extract recommended params
+    rec_phase = 'min'
+    rec_apodizing = False
+    rec_cutoff = None
+    rec_dither = 'shibata'
+    rec_mqa = 'adaptive'
+    rec_steep = False
+
+    if rec:
+        if rec.get("filter_cutoff_khz"):
+            rec_cutoff = rec["filter_cutoff_khz"] * 1000.0
+            rec_apodizing = True
+        params_str = rec.get("dsp_params", "")
+        if "--phase min" in params_str or "--filter min" in params_str:
+            rec_phase = 'min'
+        elif "--phase linear" in params_str:
+            rec_phase = 'linear'
+        if "--mqa" in params_str:
+            m = re.search(r"--mqa\s+(\w+)", params_str)
+            if m: rec_mqa = m.group(1)
+        if "--steep" in params_str:
+            rec_steep = True
+
+    if args.use_recommended == 'ask':
+        dsp_str = rec.get("dsp_params", f"--phase {rec_phase} --dither {rec_dither}")
+        try:
+            choice = input(f"Apply recommended DSP recipe [{dsp_str}]? [Y/n/edit]: ").strip().lower()
+        except EOFError:
+            choice = 'y'
+
+        if choice in ['', 'y', 'yes']:
+            print(f">>> Adopting recommended DSP recipe: {dsp_str}\n")
+            args.phase = rec_phase
+            args.apodizing = rec_apodizing
+            args.cutoff = rec_cutoff
+            args.dither = rec_dither
+            args.mqa = rec_mqa
+            args.steep = rec_steep
+        elif choice in ['e', 'edit']:
+            custom_input = input("Enter custom CLI flags (e.g. --cutoff 21000 --phase linear): ").strip()
+            if "--cutoff" in custom_input or "--apodize" in custom_input:
+                m = re.search(r"--(?:cutoff|apodize)\s+(\d+)", custom_input)
+                if m:
+                    args.cutoff = float(m.group(1))
+                    args.apodizing = True
+            if "--phase" in custom_input:
+                m = re.search(r"--phase\s+(\w+)", custom_input)
+                if m: args.phase = m.group(1)
+            if "--dither" in custom_input:
+                m = re.search(r"--dither\s+(\w+)", custom_input)
+                if m: args.dither = m.group(1)
+            if "--mqa" in custom_input:
+                m = re.search(r"--mqa\s+(\w+)", custom_input)
+                if m: args.mqa = m.group(1)
+        else:
+            print(">>> Skipping recommendations. Using explicit/default command line arguments.\n")
+    elif args.use_recommended == 'auto':
+        print(f">>> Automatically applying recommended DSP recipe: {rec.get('dsp_params', '--phase min --dither shibata')}\n")
+        args.phase = rec_phase
+        args.apodizing = rec_apodizing
+        args.cutoff = rec_cutoff
+        args.dither = rec_dither
+        args.mqa = rec_mqa
+        args.steep = rec_steep
+
+    return args
+
+
 def main():
     parser = argparse.ArgumentParser(description="AcoustiSinc: GPU-Accelerated 64-Bit Sinc Audio Upsampler")
     parser.add_argument("source", help="Source audio file or root directory containing album folders")
     parser.add_argument("target", nargs="?", default=None, help="Target output directory (optional, default: <source>_upsampled_<topology>)")
     parser.add_argument("-o", "--output-dir", default=None, help="Explicit target output directory")
     parser.add_argument("-f", "--force", action="store_true", help="Force re-processing and overwrite existing target output files")
+    parser.add_argument("--use-recommended", "--use-rec", choices=['auto', 'ask', 'none'], default='none', const='auto', nargs='?', help="Analyze audio forensics and apply recommended DSP recipe: 'auto' (silent auto-apply) or 'ask' (interactive prompt)")
     parser.add_argument("--phase", choices=['linear', 'min', 'minimum'], default='linear', help="Filter phase mode: linear (symmetric) or min (minimum phase, causal)")
     parser.add_argument("--apodizing", "--apod", action="store_true", help="Enable Apodizing transition band to attenuate pre-existing studio ADC ringing")
     parser.add_argument("--cutoff", "--apodize", type=float, default=None, help="Custom low-pass reconstruction filter cutoff frequency in Hz (e.g. 20700, 21500, 22050, 44100)")
@@ -992,6 +1125,15 @@ def main():
     if not os.path.exists(source_path):
         print(f"[Error] Source path not found: {source_path}")
         sys.exit(1)
+
+    # Discover files for pre-flight audit
+    if os.path.isfile(source_path):
+        all_src_files = [source_path]
+    else:
+        all_src_files = get_audio_files(source_path)
+
+    # Audit & resolve recommendations if requested
+    args = audit_and_resolve_recommendation(source_path, all_src_files, args)
 
     if args.filter:
         if args.filter in ['min-phase', 'min']:
@@ -1064,6 +1206,22 @@ def main():
             print(f">>> Retrying single file with exact calculated Gain Factor: {gain_factor:.6f}")
             process_track(source_path, target_dir, gain_factor, pk, queue, args.phase, dither_mode, tmp_dir, apodizing=args.apodizing, mqa_mode=args.mqa, cutoff_hz=args.cutoff, steep=args.steep, force=args.force)
         file_writer_pool.shutdown(wait=True)
+
+        dest_file = os.path.join(target_dir, os.path.basename(source_path))
+        applied_recipe = {
+            "cli_params": f"--phase {args.phase} --dither {dither_mode}" + (f" --cutoff {int(args.cutoff)}" if args.cutoff else "") + (f" --mqa {args.mqa}" if args.mqa != 'adaptive' else "") + (" --steep" if args.steep else ""),
+            "topology_name": topology_name,
+            "gain_factor": gain_factor,
+            "gain_db": 20.0 * np.log10(gain_factor)
+        }
+        try:
+            html_rep, md_rep = generate_comparative_report([(source_path, dest_file)], os.path.basename(source_path), applied_recipe, target_dir)
+            if html_rep:
+                print(f"\n   📊 [Comparative Upsampling Report Generated]")
+                print(f"      Interactive HTML Report: {html_rep}")
+                print(f"      Markdown Summary Report: {md_rep}")
+        except Exception as e:
+            print(f"   [Notice] Could not generate comparative report: {e}")
         return
 
     # Discover all subdirectories containing FLAC or WAV files

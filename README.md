@@ -42,19 +42,22 @@ Open **`http://localhost:8765`** in your browser.
 
 ### 2. Run the GPU Sinc Upsampler (`upsampler.py`)
 
-Upsample individual tracks, album folders, or full libraries using your preferred filter profile:
+Upsample individual tracks, album folders, or full libraries using manual parameters or automated forensic recipes:
 
 ```bash
-# 1. Minimum-Phase Apodizing (Recommended for 44.1k/48k CD masters — eliminates pre-ringing & cleans ADC ringing)
-python upsampler.py "/Music/Hi-Res/Album" "/Music/Hi-Res/Album_Upsampled" --phase min --apodizing
+# 1. Automated Forensic Recipe (Silent auto-apply best-practice parameters)
+python upsampler.py "/Music/Hi-Res/Album" --use-recommended=auto
 
-# 2. Pure Minimum-Phase (Zero pre-ringing, full sinc bandwidth)
+# 2. Interactive Forensic Recipe (Audit and prompt before applying)
+python upsampler.py "/Music/Hi-Res/Album" --use-recommended=ask
+
+# 3. Minimum-Phase Apodizing with Custom Cutoff (e.g. 20.7 kHz legacy ADC cleanup)
+python upsampler.py "/Music/Hi-Res/Album" --cutoff 20700 --phase min --dither shibata
+
+# 4. Pure Minimum-Phase (Zero pre-ringing, full sinc bandwidth)
 python upsampler.py "/Music/Hi-Res/Album" --phase min
 
-# 3. Linear-Phase Apodizing (Symmetric phase, smooth roll-off)
-python upsampler.py "/Music/Hi-Res/Album" --phase linear --apodizing
-
-# 4. Pure Linear-Phase Sinc (Default: symmetric phase, bit-perfect passband up to Nyquist)
+# 5. Pure Linear-Phase Sinc (Default: symmetric phase, bit-perfect passband up to Nyquist)
 python upsampler.py "/Music/Hi-Res/Album"
 ```
 
@@ -64,14 +67,25 @@ python upsampler.py "/Music/Hi-Res/Album"
 
 | Parameter | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `source` | **Mandatory** | *(None)* | Path to a single audio track (`.flac`/`.wav`) or directory of albums. |
-| `target` *(or `-o`, `--output-dir`)* | *Optional* | `<source>_upsampled_<topology>` | Destination root directory. Preserves source folder hierarchy. |
+| `source` | **Mandatory** | *(None)* | Path to a single audio track (`.flac`/`.wav`) or root directory containing albums. |
+| `target` *(or `-o`, `--output-dir`)* | *Optional* | `<source>_upsampled_<topology>` | Destination directory. Multi-tier safety guards strictly prevent overwriting originals. |
+| `--use-recommended` | *Optional* | `none` | Audits audio provenance and resolves DSP recipe: `auto` (silent apply) or `ask` (interactive prompt). |
+| `-f`, `--force` | *Optional* | `False` | Forces re-processing and overwrites existing destination files. |
+| `--cutoff`, `--apodize` | *Optional* | `None` | Sets custom low-pass reconstruction filter cutoff frequency in Hz (e.g. `20700`, `21500`, `22050`). |
+| `--steep` | *Optional* | `False` | Uses a steep transition band (500 Hz) instead of the standard 2 kHz cosine taper. |
 | `--phase` | *Optional* | `linear` | Filter phase mode: `linear` (symmetric) or `min` (causal, zero pre-ringing). |
 | `--apodizing`, `--apod` | *Optional* | `False` | Enables raised-cosine apodizing transition band to attenuate ADC ringing. |
 | `--dither` | *Optional* | `shibata` | 24-bit psychoacoustic noise shaping profile: `shibata`, `high_rate`, or `none`. |
 | `--no-dither` | *Optional* | `False` | Disables dither and noise shaping (raw truncation). |
 | `--mqa` | *Optional* | `adaptive` | MQA processing: `adaptive` (companded unfold), `strip` (strip LSB hash), `simple`, `ignore`. |
 | `--tmp-dir` | *Optional* | `/tmp/upsample_scratch` | Fast NVMe scratch directory for 64-bit memory-mapped buffers. |
+
+---
+
+### 📊 Comparative Before & After Reports
+Every upsampling run automatically generates self-contained comparative reports written directly to the target folder:
+* **`UPSAMPLING_REPORT.html`**: Interactive HTML5 report with side-by-side spectrograms, spectral energy distribution curves, and TT Dynamic Range meters.
+* **`UPSAMPLING_REPORT.md`**: Markdown summary table with track-by-track bit-depth, peak levels, and LUFS mastering receipts.
 
 ---
 
