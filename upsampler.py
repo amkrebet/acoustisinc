@@ -545,11 +545,13 @@ def save_and_tag_async(wip_path, dest_path, int32_data, target_rate, filepath, t
 def get_target_scale(samplerate):
     if samplerate == 44100: return 4, 176400
     elif samplerate == 88200: return 2, 176400
-    elif samplerate == 176400: return 1, 176400
+    elif samplerate >= 176400 and (samplerate % 44100 == 0): return 1, samplerate
     elif samplerate == 48000: return 4, 192000
     elif samplerate == 96000: return 2, 192000
-    elif samplerate == 192000: return 1, 192000
-    else: return 4, samplerate * 4
+    elif samplerate >= 192000 and (samplerate % 48000 == 0): return 1, samplerate
+    elif samplerate <= 48000: return 4, samplerate * 4
+    elif samplerate <= 96000: return 2, samplerate * 2
+    else: return 1, samplerate
 
 def is_memmap_necessary(orig_samples, scale_factor, num_channels):
     target_samples = orig_samples * scale_factor
