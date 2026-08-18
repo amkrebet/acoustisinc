@@ -130,7 +130,15 @@ def calculate_dynamic_range_metrics(y, sr):
 def analyze_audio_forensics(y, sr, rules_path=None, filepath=None):
     """
     Executes automated forensic analysis using strict 64-bit double precision.
+    Automatically accelerates via OpenCL/VkFFT GPU with seamless CPU fallback.
     """
+    try:
+        from gpu_analyser import gpu_engine, analyze_audio_forensics_accelerated
+        if gpu_engine.enabled:
+            return analyze_audio_forensics_accelerated(y, sr, rules_path=rules_path, filepath=filepath)
+    except Exception:
+        pass
+
     nyquist = sr / 2.0
     n_fft = 16384
     hop_length = n_fft // 4
@@ -355,6 +363,17 @@ def analyze_audio_forensics(y, sr, rules_path=None, filepath=None):
 
     primary_prov = provenance_info["primary"]
     alt_prov = provenance_info["alternative"]
+
+    vis = provenance_info.get("visual_morphology", {})
+    if vis:
+        pk = vis.get("primary_knee")
+        knee_str = f"{pk['detected_knee_khz']} kHz (Steepness: {pk['steepest_slope_db_per_khz']} dB/kHz, Curvature: {pk['max_curvature']})" if pk else "Natural Rolloff (No Brickwall Knee)"
+        r_val = vis.get("rhythmic_coherence", 0.0)
+        r_type = "Authentic Wideband Transients" if r_val >= 0.45 else "Stationary Noise / Dither" if vis.get("is_stationary_ultrasonic") else "Standard Signal"
+        r_str = f"r = {r_val:+.3f} ({r_type})"
+        report.append(f"\nVISUAL MORPHOLOGY DYNAMICS  : Curvature Knee: {knee_str}")
+        report.append(f"Rhythmic Cross-Correlation   : {r_str}")
+        report.append(f"Temporal Dynamics (Variance) : Audible: {vis.get('audible_temporal_variance', 0.0):.1f} dB² | Ultrasonic: {vis.get('ultrasonic_temporal_variance', 0.0):.1f} dB²")
 
     report.append(f"\nESTIMATED PROVENANCE : {primary_prov['label']} [{primary_prov['confidence']} Confidence: {int(primary_prov['score']*100)}%]")
     report.append(f"  -> {primary_prov['details']}")

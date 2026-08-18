@@ -5,10 +5,14 @@ HI-RES AUDIO FORENSIC EXPLORER (WEB APPLICATION SERVER)
 ================================================================================
 A real-time on-demand forensic laboratory web application for high-resolution
 audio libraries.
-- Dynamically browse filesystem folders and albums.
-- Real-time on-demand 64-bit double precision DSP forensic analysis.
-- Interactive spectrogram with zoom, pan, coordinates, and exact dB level cursor HUD.
-- Interactive spectrum curves with Peak/RMS traces and Nyquist reference markers.
+- GPU-Accelerated 64-bit double precision DSP with automatic CPU fallback.
+- Whole-folder background pre-processing with progressive real-time UI badge streaming.
+- Immediate badge population upon on-demand track selection.
+- Automatic cache invalidation on folder entry to dynamically recompute graphs and recommendations.
+- Action recommendation engine suggesting optimal least-damaging DSP workflows.
+- Dual hypothesis evaluation (Primary recommendation + Alternative possibility).
+- Interactive spectrogram with WebGL/Canvas zoom, pan, crosshair reticle, and exact dB level cursor HUD.
+- Interactive spectrum curves with Peak/RMS traces, crosshair reticle, dynamic HUD tracking, and context-aware Nyquist markers.
 - Built-in audio streaming player for in-browser listening and visual verification.
 ================================================================================
 """
@@ -21,6 +25,9 @@ import json
 import base64
 import argparse
 import urllib.parse
+import threading
+import queue
+import html
 from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
 import soundfile as sf
 import numpy as np
@@ -28,11 +35,17 @@ import numpy as np
 # Core DSP functions
 from analyser import analyze_audio_forensics, encode_spectrogram_and_lookup
 from provenance_engine import load_audio_resilient, probe_audio_info_resilient
+from gpu_analyser import gpu_engine, analyze_audio_forensics_accelerated
 
 
 # Default root directory for initial browsing
 INITIAL_ROOT = os.getcwd()
 ACTIVE_RULES_PATH = None
+
+# Global in-memory caches
+ANALYSIS_CACHE = {}
+BADGE_CACHE = {}
+CACHE_LOCK = threading.Lock()
 
 
 def format_bytes(size):
@@ -48,7 +61,148 @@ def format_seconds(seconds):
     return f"{m:d}:{s:02d}"
 
 
-def get_directory_contents(target_path):
+def clear_folder_cache(folder_path):
+    """
+    Clears analysis and badge caches for all files within a folder.
+    Ensures that entering a folder always recomputes fresh graphs and recommendations.
+    """
+    if not folder_path:
+        return
+    folder_path = os.path.abspath(folder_path)
+    with CACHE_LOCK:
+        to_del_analysis = [k for k in ANALYSIS_CACHE if k.startswith(folder_path)]
+        for k in to_del_analysis:
+            del ANALYSIS_CACHE[k]
+        to_del_badges = [k for k in BADGE_CACHE if k.startswith(folder_path)]
+        for k in to_del_badges:
+            del BADGE_CACHE[k]
+
+
+def extract_badge_data(res):
+    prov = res.get("provenance", {})
+    primary = prov.get("primary", {})
+    bitdepth = prov.get("bitdepth", {})
+    rec = prov.get("recommendation", {})
+    alt = prov.get("alternative", {})
+    
+    verdict = primary.get("label") or res.get("verdict", "Native Master")
+    badge_class = primary.get("badge_class", "badge-provenance-native")
+    
+    # Shorten verdict for compact badge display
+    short_verdict = verdict
+    if "Upsampled from" in verdict:
+        short_verdict = verdict.replace("Master", "").strip()
+    elif "MQA Studio" in verdict:
+        short_verdict = "MQA Studio"
+    elif "MQA Authenticated" in verdict:
+        short_verdict = "MQA Master"
+    elif "Native" in verdict:
+        short_verdict = verdict.replace("Master", "").strip()
+    elif "Leaky" in verdict:
+        short_verdict = "Leaky SRC"
+    elif "Fake Hi-Res" in verdict:
+        short_verdict = "Fake Hi-Res"
+
+    return {
+        "filepath": res.get("filepath"),
+        "filename": res.get("filename"),
+        "sr": res.get("sr"),
+        "sr_str": f"{res.get('sr', 44100)/1000:.1f}k",
+        "dr_score": res.get("dr_score", 0),
+        "crest_factor_db": res.get("crest_factor_db", 0.0),
+        "verdict": verdict,
+        "short_verdict": short_verdict,
+        "badge_class": badge_class,
+        "confidence": primary.get("confidence", "High"),
+        "effective_bits": bitdepth.get("effective_bits", 16),
+        "container_bits": bitdepth.get("container_bits", 16),
+        "is_zero_padded": bitdepth.get("is_zero_padded", False),
+        "trailing_zero_bits": bitdepth.get("trailing_zero_bits", 0),
+        "is_mqa": bool("MQA" in verdict or (prov.get("mqa") or {}).get("is_mqa")),
+        "recommendation": rec,
+        "alternative": alt
+    }
+
+
+class FolderScanManager:
+    """
+    Manages asynchronous background folder analysis and real-time SSE badge streaming.
+    """
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.active_scan_dir = None
+        self.listeners = {}  # dir -> list of queue.Queue
+        self.active_thread = None
+
+    def add_listener(self, folder_dir, fresh=True):
+        if fresh:
+            clear_folder_cache(folder_dir)
+
+        q = queue.Queue()
+        with self.lock:
+            if folder_dir not in self.listeners:
+                self.listeners[folder_dir] = []
+            self.listeners[folder_dir].append(q)
+
+            # Re-spawn scan worker for fresh re-analysis upon entering folder
+            if self.active_thread is None or not self.active_thread.is_alive() or self.active_scan_dir != folder_dir or fresh:
+                self.active_scan_dir = folder_dir
+                t = threading.Thread(target=self._scan_worker, args=(folder_dir,), daemon=True)
+                self.active_thread = t
+                t.start()
+        return q
+
+    def remove_listener(self, folder_dir, q):
+        with self.lock:
+            if folder_dir in self.listeners and q in self.listeners[folder_dir]:
+                self.listeners[folder_dir].remove(q)
+
+    def _broadcast(self, folder_dir, event_type, data):
+        with self.lock:
+            queues = list(self.listeners.get(folder_dir, []))
+        for q in queues:
+            try:
+                q.put_nowait((event_type, data))
+            except Exception:
+                pass
+
+    def _scan_worker(self, folder_dir):
+        if not os.path.exists(folder_dir) or not os.path.isdir(folder_dir):
+            return
+
+        try:
+            files = [
+                os.path.join(folder_dir, f) for f in sorted(os.listdir(folder_dir))
+                if f.lower().endswith(('.flac', '.wav', '.aiff', '.m4a', '.mp3'))
+                and not f.endswith('.WIP') and not f.startswith('.')
+            ]
+        except Exception:
+            files = []
+
+        # Progressively scan tracks freshly using latest rules & DSP engine
+        for f in files:
+            with self.lock:
+                if self.active_scan_dir != folder_dir:
+                    break  # User moved to another folder
+
+            try:
+                res = analyze_file_on_demand(f, force_fresh=True)
+                if res.get("status") == "ok":
+                    with CACHE_LOCK:
+                        ANALYSIS_CACHE[f] = res
+                        badge_data = extract_badge_data(res)
+                        BADGE_CACHE[f] = badge_data
+                    self._broadcast(folder_dir, "track_badge", badge_data)
+            except Exception:
+                pass
+
+        self._broadcast(folder_dir, "scan_complete", {"folder": folder_dir, "count": len(files)})
+
+
+folder_scan_mgr = FolderScanManager()
+
+
+def get_directory_contents(target_path, fresh=True):
     """
     Lists subdirectories and audio files in target_path with rich metadata.
     """
@@ -57,6 +211,9 @@ def get_directory_contents(target_path):
     if str(target_path).startswith("~"):
         target_path = os.path.expanduser(target_path)
     target_path = os.path.abspath(target_path)
+
+    if fresh:
+        clear_folder_cache(target_path)
 
     if not os.path.exists(target_path):
         return {"error": f"Path does not exist: {target_path}"}
@@ -118,6 +275,10 @@ def get_directory_contents(target_path):
                 except Exception:
                     pass
 
+                with CACHE_LOCK:
+                    if full_path in BADGE_CACHE:
+                        file_meta["badge"] = BADGE_CACHE[full_path]
+
                 files.append(file_meta)
         except Exception:
             continue
@@ -138,20 +299,33 @@ def get_directory_contents(target_path):
         "parent_path": parent_path,
         "breadcrumbs": parts,
         "folders": folders,
-        "files": files
+        "files": files,
+        "gpu_enabled": gpu_engine.enabled,
+        "gpu_device": gpu_engine.device_name
     }
 
 
-def analyze_file_on_demand(filepath, rules_path=None):
+def analyze_file_on_demand(filepath, rules_path=None, force_fresh=True):
     """
     Performs on-demand DSP analysis with strict 64-bit double precision.
+    When force_fresh is True, recomputes spectrograms, curves, and recommendations dynamically.
     """
     if not os.path.exists(filepath):
         return {"status": "error", "message": "File not found"}
 
+    if not force_fresh:
+        with CACHE_LOCK:
+            if filepath in ANALYSIS_CACHE:
+                return ANALYSIS_CACHE[filepath]
+
     try:
         t0 = time.time()
-        data, sr = load_audio_resilient(filepath, dtype='float64', start=0, stop=60*192000)
+        # Fast direct decoding of 25 seconds of audio for instant responsiveness
+        try:
+            data, sr = sf.read(filepath, frames=int(192000 * 25), dtype='float64', always_2d=True)
+        except Exception:
+            data, sr = load_audio_resilient(filepath, dtype='float64', frames=int(192000 * 25))
+
         if data.ndim > 1:
             data = np.mean(data, axis=1)
 
@@ -161,7 +335,10 @@ def analyze_file_on_demand(filepath, rules_path=None):
             data[:taper_len] *= taper
             data[-taper_len:] *= taper[::-1]
 
-        spec_db, freqs, peak_dbfs, rms_dbfs, assessment_text, dr_metrics, provenance_info = analyze_audio_forensics(data, sr, rules_path=rules_path or ACTIVE_RULES_PATH, filepath=filepath)
+        # Automatically uses GPU if available, multi-threaded CPU fallback otherwise
+        spec_db, freqs, peak_dbfs, rms_dbfs, assessment_text, dr_metrics, provenance_info = analyze_audio_forensics(
+            data, sr, rules_path=rules_path or ACTIVE_RULES_PATH, filepath=filepath
+        )
 
         nyquist = sr / 2.0
         duration_s = len(data) / float(sr)
@@ -184,7 +361,7 @@ def analyze_file_on_demand(filepath, rules_path=None):
             if line.startswith("NOISE PROFILE:"):
                 noise_profile = line.replace("NOISE PROFILE:", "").strip().strip("[]")
 
-        return {
+        result = {
             "status": "ok",
             "filename": os.path.basename(filepath),
             "filepath": filepath,
@@ -207,8 +384,18 @@ def analyze_file_on_demand(filepath, rules_path=None):
             "curve_freqs_khz": curve_freqs_khz,
             "curve_peaks": curve_peak_db,
             "curve_rms": curve_rms_db,
-            "analysis_time": round(time.time() - t0, 3)
+            "analysis_time": round(time.time() - t0, 3),
+            "gpu_enabled": gpu_engine.enabled,
+            "gpu_device": gpu_engine.device_name
         }
+
+        badge_data = extract_badge_data(result)
+        result["badge"] = badge_data
+
+        with CACHE_LOCK:
+            ANALYSIS_CACHE[filepath] = result
+            BADGE_CACHE[filepath] = badge_data
+        return result
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
@@ -272,6 +459,23 @@ HTML_PAGE = """<!DOCTYPE html>
             padding: 2px 8px;
             border-radius: 4px;
         }
+        .gpu-badge {
+            background: rgba(0, 229, 255, 0.15);
+            border: 1px solid rgba(0, 229, 255, 0.45);
+            color: var(--accent-cyan);
+            font-size: 0.75rem;
+            font-weight: 600;
+            padding: 3px 8px;
+            border-radius: 4px;
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+        }
+        .gpu-badge.cpu-mode {
+            background: rgba(139, 148, 158, 0.15);
+            border-color: rgba(139, 148, 158, 0.4);
+            color: var(--text-muted);
+        }
         .bookmarks {
             display: flex;
             gap: 8px;
@@ -299,13 +503,14 @@ HTML_PAGE = """<!DOCTYPE html>
         }
         /* Left Pane: Library Explorer */
         .sidebar {
-            width: 420px;
-            min-width: 340px;
+            width: 440px;
+            min-width: 360px;
             background: var(--surface);
             border-right: 1px solid var(--border);
             display: flex;
             flex-direction: column;
             overflow: hidden;
+            height: 100%;
         }
         .nav-bar {
             padding: 12px;
@@ -314,6 +519,13 @@ HTML_PAGE = """<!DOCTYPE html>
             flex-direction: column;
             gap: 8px;
             background: #11141a;
+            flex-shrink: 0;
+        }
+        .nav-top-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 8px;
         }
         .breadcrumbs {
             display: flex;
@@ -321,6 +533,8 @@ HTML_PAGE = """<!DOCTYPE html>
             gap: 4px;
             flex-wrap: wrap;
             font-size: 0.85rem;
+            flex: 1;
+            min-width: 0;
         }
         .crumb {
             color: var(--accent-blue);
@@ -346,12 +560,27 @@ HTML_PAGE = """<!DOCTYPE html>
             border-color: var(--accent-blue);
         }
         .tree-list {
-            flex: 1;
+            flex: 1 1 0;
+            min-height: 0;
             overflow-y: auto;
+            overflow-x: hidden;
             padding: 8px;
             display: flex;
             flex-direction: column;
             gap: 4px;
+        }
+        .tree-list::-webkit-scrollbar {
+            width: 6px;
+        }
+        .tree-list::-webkit-scrollbar-track {
+            background: #0d1117;
+        }
+        .tree-list::-webkit-scrollbar-thumb {
+            background: #30363d;
+            border-radius: 3px;
+        }
+        .tree-list::-webkit-scrollbar-thumb:hover {
+            background: #58a6ff;
         }
         .folder-item {
             display: flex;
@@ -366,6 +595,8 @@ HTML_PAGE = """<!DOCTYPE html>
             overflow: hidden;
             min-width: 0;
             gap: 8px;
+            flex-shrink: 0;
+            min-height: 38px;
         }
         .folder-item:hover {
             background: var(--surface-hover);
@@ -396,6 +627,8 @@ HTML_PAGE = """<!DOCTYPE html>
             transition: all 0.15s ease;
             overflow: hidden;
             min-width: 0;
+            flex-shrink: 0;
+            min-height: 52px;
         }
         .file-item:hover {
             background: var(--surface-hover);
@@ -429,6 +662,45 @@ HTML_PAGE = """<!DOCTYPE html>
             white-space: nowrap;
             will-change: transform;
         }
+        .file-badges {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+            flex-wrap: wrap;
+            flex-shrink: 0;
+        }
+        .badge-tag {
+            font-size: 0.70rem;
+            font-weight: 600;
+            padding: 1px 6px;
+            border-radius: 3px;
+            white-space: nowrap;
+            animation: badge-fade-in 0.25s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+        }
+        @keyframes badge-fade-in {
+            from { opacity: 0; transform: scale(0.92); }
+            to { opacity: 1; transform: scale(1); }
+        }
+        .badge-tag.badge-dr {
+            background: rgba(255, 234, 0, 0.12);
+            border: 1px solid rgba(255, 234, 0, 0.4);
+            color: var(--accent-yellow);
+        }
+        .badge-tag.badge-bits {
+            background: rgba(88, 166, 255, 0.12);
+            border: 1px solid rgba(88, 166, 255, 0.4);
+            color: var(--accent-blue);
+        }
+        .badge-tag.badge-bits-padded {
+            background: rgba(255, 112, 67, 0.18);
+            border: 1px solid rgba(255, 112, 67, 0.45);
+            color: #ff7043;
+        }
+        .badge-tag.badge-sr {
+            background: rgba(0, 229, 255, 0.12);
+            border: 1px solid rgba(0, 229, 255, 0.35);
+            color: var(--accent-cyan);
+        }
         .ticker-active {
             animation: ticker-scroll var(--ticker-duration, 4s) cubic-bezier(0.45, 0.05, 0.55, 0.95) infinite alternate;
         }
@@ -448,31 +720,7 @@ HTML_PAGE = """<!DOCTYPE html>
             font-size: 0.75rem;
             color: var(--text-muted);
         }
-        .badge-hires {
-            background: rgba(0, 229, 255, 0.15);
-            border: 1px solid rgba(0, 229, 255, 0.4);
-            color: var(--accent-cyan);
-            padding: 1px 6px;
-            border-radius: 3px;
-            font-weight: 600;
-        }
-        .badge-cd {
-            background: #21262d;
-            border: 1px solid var(--border);
-            color: #8b949e;
-            padding: 1px 6px;
-            border-radius: 3px;
-        }
         /* Provenance Banners & Badges */
-        .provenance-banner {
-            display: flex;
-            flex-direction: column;
-            padding: 12px 16px;
-            border-radius: 6px;
-            background: rgba(22, 27, 34, 0.85);
-            border: 1px solid var(--border);
-            margin-top: 12px;
-        }
         .provenance-tag {
             font-size: 0.82rem;
             font-weight: 600;
@@ -533,6 +781,71 @@ HTML_PAGE = """<!DOCTYPE html>
             color: #8b949e;
             border-color: rgba(139, 148, 158, 0.4);
         }
+        /* Action Recommendation Box */
+        .action-recommendation-box {
+            margin-top: 12px;
+            padding: 10px 14px;
+            background: rgba(22, 27, 34, 0.95);
+            border: 1px solid #30363d;
+            border-left: 4px solid var(--accent-yellow);
+            border-radius: 6px;
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            font-size: 0.83rem;
+            animation: badge-fade-in 0.2s ease;
+        }
+        .action-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+        .action-title {
+            font-weight: 600;
+            color: var(--text-heading);
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .risk-pill {
+            font-size: 0.70rem;
+            font-weight: 700;
+            padding: 1px 6px;
+            border-radius: 3px;
+            text-transform: uppercase;
+        }
+        .risk-zero {
+            background: rgba(174, 234, 0, 0.15);
+            border: 1px solid rgba(174, 234, 0, 0.4);
+            color: var(--accent-green);
+        }
+        .risk-minimal {
+            background: rgba(88, 166, 255, 0.15);
+            border: 1px solid rgba(88, 166, 255, 0.4);
+            color: var(--accent-blue);
+        }
+        .risk-low {
+            background: rgba(255, 234, 0, 0.15);
+            border: 1px solid rgba(255, 234, 0, 0.4);
+            color: var(--accent-yellow);
+        }
+        .action-details {
+            color: var(--text);
+            line-height: 1.45;
+            font-size: 0.81rem;
+        }
+        .action-code {
+            background: #0d1117;
+            border: 1px solid #21262d;
+            padding: 3px 8px;
+            border-radius: 4px;
+            font-family: ui-monospace, SFMono-Regular, "SF Mono", monospace;
+            font-size: 0.75rem;
+            color: var(--accent-cyan);
+            display: inline-block;
+        }
         /* Right Pane: Lab & Visualizer */
         .workspace {
             flex: 1;
@@ -549,7 +862,7 @@ HTML_PAGE = """<!DOCTYPE html>
             justify-content: center;
             height: 100%;
             color: var(--text-muted);
-            gap: 12px;
+            text-align: center;
         }
         .card {
             background: var(--surface);
@@ -561,308 +874,352 @@ HTML_PAGE = """<!DOCTYPE html>
             display: flex;
             justify-content: space-between;
             align-items: center;
-            flex-wrap: wrap;
-            gap: 10px;
             margin-bottom: 12px;
+            flex-wrap: wrap;
+            gap: 8px;
         }
         .card-title {
-            font-size: 0.95rem;
+            font-size: 1rem;
             font-weight: 600;
             color: var(--text-heading);
         }
-        .toolbar {
-            display: flex;
-            align-items: center;
-            gap: 6px;
-            flex-wrap: wrap;
-        }
-        .btn {
-            background: #21262d;
-            border: 1px solid var(--border);
-            color: var(--text);
-            padding: 4px 10px;
-            font-size: 0.75rem;
-            font-weight: 500;
-            border-radius: 4px;
-            cursor: pointer;
-            transition: all 0.15s ease;
-            user-select: none;
-        }
-        .btn:hover {
-            background: #30363d;
-            color: var(--text-heading);
-            border-color: #8b949e;
-        }
         .canvas-container {
             position: relative;
-            width: 100%;
-            height: 320px;
-            background: #11141a;
+            background: #000;
             border-radius: 6px;
             overflow: hidden;
-            touch-action: none;
+            border: 1px solid var(--border);
+            height: 340px;
+            cursor: crosshair;
         }
         canvas {
             display: block;
             width: 100%;
             height: 100%;
-            cursor: crosshair;
         }
         .hud-overlay {
             position: absolute;
             top: 10px;
             right: 10px;
-            background: rgba(13, 17, 23, 0.9);
-            backdrop-filter: blur(6px);
+            background: rgba(13, 17, 23, 0.88);
+            backdrop-filter: blur(4px);
             border: 1px solid var(--border);
-            border-radius: 6px;
             padding: 6px 12px;
-            font-family: "JetBrains Mono", monospace;
-            font-size: 0.75rem;
+            border-radius: 4px;
+            font-family: monospace;
+            font-size: 0.8rem;
             pointer-events: none;
             display: flex;
-            flex-direction: column;
-            gap: 3px;
+            gap: 12px;
             z-index: 10;
             box-shadow: 0 4px 12px rgba(0,0,0,0.5);
         }
-        .verdict-banner {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            padding: 12px 16px;
-            border-radius: 6px;
-            background: rgba(174, 234, 0, 0.08);
-            border: 1px solid rgba(174, 234, 0, 0.3);
-            margin-bottom: 4px;
-        }
-        .verdict-fake {
-            background: rgba(255, 23, 68, 0.08);
-            border-color: rgba(255, 23, 68, 0.3);
-        }
-        .verdict-native {
-            background: rgba(0, 229, 255, 0.08);
-            border-color: rgba(0, 229, 255, 0.3);
+        .hud-item span {
+            color: var(--text-heading);
+            font-weight: 600;
         }
         .report-box {
             background: #0d1117;
             border: 1px solid var(--border);
             border-radius: 6px;
-            padding: 14px;
-            font-family: "JetBrains Mono", SFMono-Regular, Consolas, monospace;
+            padding: 12px;
+            font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
             font-size: 0.82rem;
-            line-height: 1.5;
-            color: var(--accent-green);
             white-space: pre-wrap;
-            position: relative;
+            line-height: 1.45;
+            color: var(--text);
+            max-height: 220px;
+            overflow-y: auto;
         }
-        .legend-bar {
+        .audio-player-container {
             display: flex;
             align-items: center;
-            justify-content: flex-end;
-            gap: 14px;
-            font-size: 0.75rem;
-            margin-top: 8px;
+            gap: 16px;
+            background: #11141a;
+            padding: 10px 16px;
+            border-radius: 6px;
+            border: 1px solid var(--border);
         }
-        .legend-item {
-            display: flex;
-            align-items: center;
-            gap: 5px;
-        }
-        .legend-dot {
-            width: 8px;
-            height: 8px;
-            border-radius: 2px;
+        audio {
+            flex: 1;
+            height: 36px;
+            outline: none;
         }
         .spinner {
             border: 3px solid rgba(255,255,255,0.1);
             border-top: 3px solid var(--accent-cyan);
             border-radius: 50%;
-            width: 32px;
-            height: 32px;
+            width: 24px;
+            height: 24px;
             animation: spin 0.8s linear infinite;
+            display: inline-block;
         }
         @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
-        audio {
-            width: 100%;
-            height: 36px;
-            outline: none;
-            margin-top: 8px;
-        }
     </style>
 </head>
 <body>
     <header>
         <div class="brand">
-            <span>🔬 Hi-Res Audio Forensic Explorer</span>
-            <span class="brand-badge">HTML5 Dynamic DSP</span>
+            <span>🔬 AcoustiSinc Forensic Lab</span>
+            <span class="brand-badge">Strict 64-Bit Float</span>
+            <span id="gpuStatusBadge" class="gpu-badge">⚡ GPU Initializing...</span>
         </div>
-        <div style="display: flex; align-items: center; gap: 8px; flex: 1; max-width: 680px;">
-            <input type="text" id="pathBar" class="search-box" style="flex: 1; margin: 0; padding: 6px 12px; font-size: 0.85rem;" placeholder="Enter folder path (e.g. /path/to/music or ~)...">
-            <button class="btn" onclick="navigateToPathBar()" style="padding: 6px 12px; font-weight: bold;">Go</button>
-            <button class="btn" onclick="loadDirectory('.')" title="Initial Directory">📍 Start</button>
-            <button class="btn" onclick="loadDirectory('~')" title="User Home">🏠 Home</button>
-            <button class="btn" onclick="loadDirectory('/')" title="Root Filesystem">📂 Root</button>
+        <div class="bookmarks">
+            <button class="btn-bookmark" onclick="loadDirectory('/mnt/PrimaryFS/FLAC_music/music', true)">📁 Music Library</button>
+            <button class="btn-bookmark" onclick="loadDirectory('/mnt/PrimaryFS/FLAC_music/music/Qobuz Downloads', true)">🎧 Qobuz Releases</button>
+            <button class="btn-bookmark" onclick="loadDirectory('/mnt/PrimaryFS/1xxK_min/music', true)">⚡ Upsampled Output</button>
+            <button class="btn-bookmark" onclick="reloadCurrentDirectory(true)" title="Force fresh re-analysis on current folder">🔄 Re-Analyze Folder</button>
         </div>
     </header>
 
     <div class="main-layout">
-        <!-- Sidebar Navigation -->
+        <!-- Sidebar File Browser -->
         <aside class="sidebar">
             <div class="nav-bar">
-                <div class="breadcrumbs" id="breadcrumbs"></div>
-                <input type="text" class="search-box" id="searchBox" placeholder="Filter folders & tracks...">
+                <div class="nav-top-row">
+                    <div class="breadcrumbs" id="breadcrumbs">
+                        <span class="crumb" onclick="loadDirectory('.', true)">&#x21E7; Root</span>
+                    </div>
+                    <button class="btn-bookmark" style="padding: 2px 6px; font-size: 0.72rem;" onclick="reloadCurrentDirectory(true)" title="Re-Analyze Folder">🔄 Refresh</button>
+                </div>
+                <input type="text" class="search-box" id="pathBar" placeholder="Path..." value="" onchange="navigateToPathBar()" />
+                <input type="text" class="search-box" id="searchBox" placeholder="Filter albums & tracks..." />
             </div>
             <div class="tree-list" id="treeList">
-                <div style="padding: 20px; text-align: center; color: #8b949e;">Loading library...</div>
+                <div style="padding: 20px; text-align: center; color: #8b949e;">
+                    <div class="spinner" style="margin: 0 auto 10px;"></div>
+                    Connecting to audio library...
+                </div>
             </div>
         </aside>
 
-        <!-- Main Workspace -->
+        <!-- Right Visual Workspace -->
         <main class="workspace" id="workspace">
             <div class="empty-state" id="emptyState">
-                <svg width="48" height="48" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24">
-                    <path stroke-linecap="round" stroke-linejoin="round" d="M9 19V6l12-3v13M9 19c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zm12-3c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zM9 10l12-3"/>
+                <svg width="48" height="48" fill="none" stroke="currentColor" viewBox="0 0 24 24" style="margin-bottom: 12px; opacity: 0.5;">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M9 19V6l12-3v13M9 19c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zm12-3c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zM9 10l12-3"></path>
                 </svg>
-                <p>Select any audio track from the left panel to execute real-time forensic analysis.</p>
+                <h3>Select a Track for 64-bit Forensic DSP Analysis</h3>
+                <p style="font-size: 0.85rem; margin-top: 4px;">Choose an audio file from the library sidebar to inspect its spectral provenance and true dynamic range.</p>
             </div>
 
-            <!-- Active Analysis Content (hidden until loaded) -->
             <div id="analysisContent" style="display: none; flex-direction: column; gap: 16px;">
-                <!-- Track Overview Card -->
-                <section class="card">
-                    <div class="card-header" style="margin-bottom: 8px;">
-                        <div>
-                            <h2 id="trackTitle" style="font-size: 1.15rem; color: var(--text-heading); word-break: break-all;">Track Title</h2>
-                            <div id="trackMeta" style="font-size: 0.8rem; color: var(--text-muted); margin-top: 4px;">--</div>
+                <!-- Audio Player Banner -->
+                <div class="audio-player-container">
+                    <audio id="audioPlayer" controls preload="metadata"></audio>
+                </div>
+
+                <!-- Provenance Assessment Banner -->
+                <div class="card" id="provenanceCard" style="border-left: 4px solid var(--accent-cyan);">
+                    <div style="display: flex; justify-content: space-between; align-items: flex-start; gap: 12px;">
+                        <div style="flex: 1; min-width: 0;">
+                            <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+                                <span class="provenance-tag badge-provenance-native" id="provTag">NATIVE MASTER</span>
+                                <span class="confidence-pill conf-high" id="provConf">HIGH CONFIDENCE</span>
+                                <span class="brand-badge" id="bitDepthBadge" style="display: none;">24-BIT PCM</span>
+                                <span class="brand-badge" id="mqaBadge" style="display: none; background: rgba(186, 104, 200, 0.18); border-color: rgba(186, 104, 200, 0.45); color: #ce93d8;">MQA</span>
+                            </div>
+                            <h2 id="trackTitle" style="font-size: 1.15rem; color: var(--text-heading); margin-top: 6px;">Track Name</h2>
+                            <p id="provDetails" style="font-size: 0.85rem; color: var(--text); margin-top: 4px;">Assessment details...</p>
+
+                            <!-- Alternative Hypothesis Row -->
+                            <div id="altProvContainer" style="display: none; margin-top: 6px; font-size: 0.80rem; color: var(--text-muted); align-items: center; gap: 8px; flex-wrap: wrap;">
+                                <span style="font-weight: 600; color: #8b949e;">Alternative Hypothesis:</span>
+                                <span class="provenance-tag badge-provenance-upsampled" id="altProvTag" style="font-size: 0.72rem; padding: 1px 6px;">--</span>
+                                <span class="confidence-pill conf-mod" id="altProvConf" style="font-size: 0.68rem; padding: 1px 6px;">--</span>
+                                <span id="altProvDetails" style="font-size: 0.76rem; color: var(--text-muted);">--</span>
+                            </div>
+
+                            <!-- Visual Morphology Metrics Row -->
+                            <div id="visMetricsRow" style="display: none; margin-top: 6px; font-size: 0.76rem; color: var(--text-muted); align-items: center; gap: 6px; flex-wrap: wrap;">
+                                <span class="badge-tag" id="visKneeBadge" style="background: rgba(0, 229, 255, 0.08); border: 1px solid rgba(0, 229, 255, 0.3); color: var(--accent-cyan);" title="Inflection point where steep slope transitions to flat floor">📐 Knee: --</span>
+                                <span class="badge-tag" id="visCorrBadge" style="background: rgba(174, 234, 0, 0.08); border: 1px solid rgba(174, 234, 0, 0.3); color: var(--accent-green);" title="Cross-band correlation between audible rhythm and ultrasonic harmonics">🎵 Coherence: --</span>
+                                <span class="badge-tag" id="visPurityBadge" style="background: rgba(255, 112, 67, 0.08); border: 1px solid rgba(255, 112, 67, 0.3); color: #ff7043;" title="Stopband noise cleanliness, transient crest, and spur analysis">📻 Noise: --</span>
+                                <span class="badge-tag" id="visVarBadge" style="background: rgba(88, 166, 255, 0.08); border: 1px solid rgba(88, 166, 255, 0.3); color: var(--accent-blue);" title="Temporal variance across time slices">📊 Dynamics: --</span>
+                            </div>
+
+                            <!-- Recommended DSP Course of Action Box -->
+                            <div class="action-recommendation-box" id="actionRecBox" style="display: none;">
+                                <div class="action-header">
+                                    <div class="action-title">
+                                        <span id="actionTitlePrefix">💡 Recommended DSP Action:</span>
+                                        <span id="actionName" style="color: var(--accent-cyan); font-weight: 600;">--</span>
+                                    </div>
+                                    <span class="risk-pill risk-minimal" id="actionRisk">MINIMAL RISK</span>
+                                </div>
+                                <div class="action-details" id="actionDesc">--</div>
+                                <div id="actionCodeContainer" style="display: none; margin-top: 2px;">
+                                    <span style="font-size: 0.72rem; color: var(--text-muted); margin-right: 6px;">DSP Flag:</span>
+                                    <code class="action-code" id="actionCode">--</code>
+                                </div>
+                            </div>
                         </div>
-                        <div style="display: flex; gap: 8px; flex-wrap: wrap; align-items: center;">
-                            <div id="mqaBadge" class="badge-provenance-mqa" style="font-size: 0.82rem; padding: 4px 10px; font-weight: 700; letter-spacing: 0.5px; display: none;">MQA</div>
-                            <div id="bitDepthBadge" class="badge-hires" style="font-size: 0.82rem; padding: 4px 10px; font-weight: 600; display: none;">--</div>
-                            <div id="drBadge" class="badge-hires" style="font-size: 0.82rem; padding: 4px 10px; display: none;">--</div>
-                            <div id="noiseBadge" class="badge-cd" style="font-size: 0.82rem; padding: 4px 10px; display: none;">--</div>
+                        <div style="text-align: right; flex-shrink: 0;">
+                            <div style="font-size: 1.25rem; font-weight: 700; color: var(--accent-yellow);" id="drScoreValue">DR14</div>
+                            <div style="font-size: 0.72rem; color: var(--text-muted);" id="crestFactorValue">Crest: 14.5 dB</div>
                         </div>
                     </div>
-                    <!-- Estimated Provenance Banner -->
-                    <div id="provenanceCard" class="provenance-banner" style="display: none; gap: 8px;">
-                        <!-- Primary Assessment -->
-                        <div>
-                            <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px;">
-                                <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
-                                    <span style="font-size: 1.05rem;">🏷️</span>
-                                    <strong style="font-size: 0.85rem; color: var(--text-heading);">Most Likely Provenance:</strong>
-                                    <span id="provBadge" class="provenance-tag badge-provenance-native">--</span>
-                                </div>
-                                <span id="provConf" class="confidence-pill conf-high">--</span>
-                            </div>
-                            <div id="provDetails" style="font-size: 0.78rem; color: var(--text-muted); margin-top: 4px; padding-left: 26px;">--</div>
-                        </div>
+                </div>
 
-                        <!-- Alternative Possibility (if any) -->
-                        <div id="provAltRow" style="display: none; border-top: 1px solid rgba(255,255,255,0.08); padding-top: 8px; margin-top: 4px;">
-                            <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px;">
-                                <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
-                                    <span style="font-size: 0.95rem;">⚡</span>
-                                    <span style="font-size: 0.82rem; color: var(--text-muted); font-weight: 500;">Alternative Possibility:</span>
-                                    <span id="provAltBadge" class="provenance-tag badge-provenance-leaky" style="font-size: 0.76rem; padding: 1px 6px;">--</span>
-                                </div>
-                                <span id="provAltConf" class="confidence-pill conf-mod" style="font-size: 0.68rem;">--</span>
-                            </div>
-                            <div id="provAltDetails" style="font-size: 0.75rem; color: var(--text-muted); margin-top: 3px; padding-left: 24px;">--</div>
-                        </div>
-                    </div>
-                    <audio id="audioPlayer" controls style="margin-top: 10px;"></audio>
-                </section>
-
-                <!-- Panel 1: Spectrogram Heatmap -->
-                <section class="card">
+                <!-- Spectrogram Card -->
+                <div class="card">
                     <div class="card-header">
-                        <span class="card-title">Linear Spectrogram (Time vs Frequency)</span>
-                        <div class="toolbar">
-                            <span style="font-size: 0.75rem; color: #8b949e;">Zoom:</span>
-                            <button class="btn" onclick="zoomSpec(1.35)">+ In</button>
-                            <button class="btn" onclick="zoomSpec(1/1.35)">- Out</button>
-                            <button class="btn" onclick="setSpecPreset('audible')">0-20 kHz</button>
-                            <button class="btn" onclick="setSpecPreset('ultrasonic')">20 kHz+</button>
-                            <button class="btn" onclick="resetSpecZoom()">&#x21BA; Reset</button>
+                        <div>
+                            <span class="card-title">Interactive Spectrogram (16,384-point Blackman-Harris STFT)</span>
+                            <div style="font-size: 0.75rem; color: var(--text-muted); margin-top: 2px;" id="trackMeta">-- Hz | -- kHz Nyquist</div>
+                        </div>
+                        <div style="display: flex; gap: 8px;">
+                            <button class="btn-bookmark" onclick="resetSpecZoom()">Reset View</button>
                         </div>
                     </div>
-                    <div class="canvas-container">
+                    <div class="canvas-container" id="specContainer">
                         <canvas id="spectrogramCanvas"></canvas>
                         <div class="hud-overlay">
-                            <div><span style="color: #8b949e;">Time :</span> <strong id="specHudTime">-- s</strong></div>
-                            <div><span style="color: var(--accent-cyan);">Freq :</span> <strong id="specHudFreq">-- kHz</strong></div>
-                            <div><span style="color: var(--accent-green);">Level:</span> <strong id="specHudDb">-- dBFS</strong></div>
+                            <div class="hud-item">T: <span id="specHudTime">-- s</span></div>
+                            <div class="hud-item">F: <span id="specHudFreq">-- kHz</span></div>
+                            <div class="hud-item">Mag: <span id="specHudDb">-- dBFS</span></div>
                         </div>
                     </div>
-                    <div style="font-size: 0.75rem; color: #8b949e; margin-top: 6px; display: flex; justify-content: space-between;">
-                        <span>💡 Scroll wheel to zoom, click &amp; drag to pan.</span>
-                        <span>0 dBFS &rarr; -165 dBFS</span>
-                    </div>
-                </section>
+                </div>
 
-                <!-- Panel 2: Interactive Spectrum Curve -->
-                <section class="card">
+                <!-- FFT Spectrum Curves Card -->
+                <div class="card">
                     <div class="card-header">
-                        <span class="card-title">Frequency Spectrum &amp; Noise Profile</span>
-                        <div class="toolbar">
-                            <span style="font-size: 0.75rem; color: #8b949e;">Zoom:</span>
-                            <button class="btn" onclick="zoomCurve(1.35)">+ In</button>
-                            <button class="btn" onclick="zoomCurve(1/1.35)">- Out</button>
-                            <button class="btn" onclick="setCurvePreset('audible')">0-20 kHz</button>
-                            <button class="btn" onclick="setCurvePreset('cutoff')">15-25 kHz</button>
-                            <button class="btn" onclick="setCurvePreset('ultrasonic')">20 kHz+</button>
-                            <button class="btn" onclick="resetCurveZoom()">&#x21BA; Reset</button>
+                        <div>
+                            <span class="card-title">Spectral Energy Distribution (Peak-Hold & RMS vs Frequency)</span>
+                            <div id="curveLegend" style="font-size: 0.75rem; color: var(--text-muted); margin-top: 3px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap;">
+                                <span style="color: var(--accent-cyan); font-weight: 600;">— Peak Hold</span>
+                                <span style="color: var(--accent-pink); font-weight: 600;">— RMS Power</span>
+                                <span style="color: #ffab00; font-weight: 600;">-- Container Nyquist</span>
+                                <span id="legendProjectedCutoff" style="color: #00e676; font-weight: 600; display: none;">-- 🎯 Projected Filter</span>
+                            </div>
+                        </div>
+                        <div style="display: flex; gap: 8px;">
+                            <button class="btn-bookmark" onclick="setCurvePreset('audible')">0–20 kHz</button>
+                            <button class="btn-bookmark" onclick="setCurvePreset('cutoff')">15–25 kHz</button>
+                            <button class="btn-bookmark" onclick="setCurvePreset('ultrasonic')">Ultrasonic</button>
+                            <button class="btn-bookmark" onclick="resetCurveZoom()">Full Band</button>
                         </div>
                     </div>
-                    <div class="canvas-container">
+                    <div class="canvas-container" id="curveContainer">
                         <canvas id="spectrumCanvas"></canvas>
                         <div class="hud-overlay">
-                            <div><span style="color: #8b949e;">Freq:</span> <strong id="hudFreq">-- kHz</strong></div>
-                            <div><span style="color: var(--accent-cyan);">Peak:</span> <strong id="hudPeak">-- dBFS</strong></div>
-                            <div><span style="color: var(--accent-pink);">RMS :</span> <strong id="hudRMS">-- dBFS</strong></div>
+                            <div class="hud-item">Freq: <span id="hudFreq">-- kHz</span></div>
+                            <div class="hud-item">Peak: <span id="hudPeak">-- dBFS</span></div>
+                            <div class="hud-item">RMS: <span id="hudRMS">-- dBFS</span></div>
+                            <div class="hud-item" id="hudProjItem" style="display: none;">Proj: <span id="hudProj" style="color: #00e676; font-weight: 600;">-- dBFS</span></div>
                         </div>
                     </div>
-                    <div class="legend-bar">
-                        <div class="legend-item"><div class="legend-dot" style="background: var(--accent-cyan);"></div>Peak Hold</div>
-                        <div class="legend-item"><div class="legend-dot" style="background: var(--accent-pink);"></div>RMS Noise Floor</div>
-                        <div class="legend-item"><div class="legend-dot" style="background: var(--accent-red);"></div>20 kHz Limit</div>
-                        <div class="legend-item"><div class="legend-dot" style="background: var(--accent-yellow);"></div>22.05 kHz CD</div>
-                    </div>
-                </section>
+                </div>
 
-                <!-- Panel 3: Forensic Lab Report Card -->
-                <section class="card">
+                <!-- Lab Assessment Box -->
+                <div class="card">
                     <div class="card-header">
-                        <span class="card-title">Forensic Assessment Lab Report</span>
-                        <button class="btn" onclick="copyReport()">Copy Report</button>
+                        <span class="card-title">Forensic Laboratory Assessment</span>
+                        <button class="btn-bookmark" onclick="copyReport()">📋 Copy Report</button>
                     </div>
-                    <div class="report-box" id="reportText">--</div>
-                </section>
+                    <div class="report-box" id="reportText">Running analysis...</div>
+                </div>
             </div>
         </main>
     </div>
 
     <script>
         let currentPath = '';
-        let currentAnalysis = null;
         let directoryData = null;
+        let currentAnalysis = null;
+        let folderEventSource = null;
+        let badgeCache = {};
+
+        // Fetch GPU Status on startup
+        fetch('/api/browse?path=' + encodeURIComponent(currentPath))
+            .then(res => res.json())
+            .then(data => {
+                const b = document.getElementById('gpuStatusBadge');
+                if (data.gpu_enabled) {
+                    b.innerHTML = '⚡ GPU: ' + escapeHtml(data.gpu_device);
+                    b.className = 'gpu-badge';
+                } else {
+                    b.innerHTML = '💻 CPU Multi-Thread';
+                    b.className = 'gpu-badge cpu-mode';
+                }
+            })
+            .catch(() => {});
 
         function navigateToPathBar() {
             const p = document.getElementById('pathBar').value.trim();
-            loadDirectory(p || '.');
+            loadDirectory(p || '.', true);
+        }
+
+        function reloadCurrentDirectory(fresh = true) {
+            loadDirectory(currentPath, fresh);
         }
 
         document.getElementById('pathBar').addEventListener('keydown', (e) => {
             if (e.key === 'Enter') navigateToPathBar();
         });
 
-        // Search filtering
         document.getElementById('searchBox').addEventListener('input', (e) => {
             renderDirectory(e.target.value.toLowerCase());
         });
 
-        async function loadDirectory(path) {
+        function startFolderStream(folderPath, fresh = true) {
+            if (folderEventSource) {
+                folderEventSource.close();
+                folderEventSource = null;
+            }
+
+            folderEventSource = new EventSource(`/api/folder_stream?path=${encodeURIComponent(folderPath)}&fresh=${fresh ? 1 : 0}`);
+            folderEventSource.addEventListener('track_badge', (e) => {
+                try {
+                    const badge = JSON.parse(e.data);
+                    badgeCache[badge.filepath] = badge;
+                    updateFileBadgeDOM(badge);
+                } catch (err) {}
+            });
+        }
+
+        function updateFileBadgeDOM(badge) {
+            if (!badge || !badge.filepath) return;
+            const fileItem = document.querySelector(`.file-item[data-filepath="${CSS.escape(badge.filepath)}"]`);
+            if (!fileItem) return;
+
+            const badgeContainer = fileItem.querySelector('.file-badges');
+            if (!badgeContainer) return;
+
+            let bitsBadgeHtml = '';
+            if (badge.is_zero_padded) {
+                bitsBadgeHtml = `<span class="badge-tag badge-bits-padded" title="${badge.trailing_zero_bits} LSBs padded (${badge.container_bits}b container)">${badge.effective_bits}b (Pad)</span>`;
+            } else if (badge.container_bits >= 24) {
+                bitsBadgeHtml = `<span class="badge-tag badge-bits" title="True ${badge.effective_bits}-bit PCM">${badge.effective_bits}b</span>`;
+            }
+
+            let provClass = badge.badge_class || 'badge-provenance-native';
+            let provTitle = escapeHtml(badge.verdict);
+            if (badge.recommendation && badge.recommendation.action) {
+                const conf = (badge.confidence || '').toLowerCase();
+                if (conf !== 'low') {
+                    const isPot = (conf === 'moderate' || conf === 'medium' || badge.recommendation.is_potential);
+                    const labelPrefix = isPot ? '💡 Potential Action:' : '💡 Recommended Action:';
+                    provTitle += `&#10;${labelPrefix} ${escapeHtml(badge.recommendation.action)}`;
+                }
+            }
+            if (badge.alternative && badge.alternative.label) {
+                provTitle += `&#10;🥈 Alternative: ${escapeHtml(badge.alternative.label)}`;
+            }
+            let provBadgeHtml = `<span class="badge-tag ${provClass}" title="${provTitle}">${escapeHtml(badge.short_verdict)}</span>`;
+
+            let drBadgeHtml = badge.dr_score ? `<span class="badge-tag badge-dr" title="TT DR Score (DR${badge.dr_score})">DR${badge.dr_score}</span>` : '';
+
+            badgeContainer.innerHTML = `
+                <span class="badge-tag badge-sr">${badge.sr_str}</span>
+                ${bitsBadgeHtml}
+                ${drBadgeHtml}
+                ${provBadgeHtml}
+            `;
+        }
+
+        async function loadDirectory(path, fresh = true) {
             const player = document.getElementById('audioPlayer');
             if (player && !player.paused) player.pause();
 
@@ -870,19 +1227,34 @@ HTML_PAGE = """<!DOCTYPE html>
             const searchBox = document.getElementById('searchBox');
             if (searchBox) searchBox.value = '';
 
+            // Invalidate frontend badge cache and workspace view on folder transition
+            badgeCache = {};
+            currentAnalysis = null;
+            document.getElementById('analysisContent').style.display = 'none';
+            document.getElementById('emptyState').style.display = 'flex';
+
             const treeList = document.getElementById('treeList');
-            treeList.innerHTML = '<div style="padding: 20px; text-align: center; color: #8b949e;"><div class="spinner" style="margin: 0 auto 10px;"></div>Loading directory...</div>';
+            treeList.innerHTML = '<div style="padding: 20px; text-align: center; color: #8b949e;"><div class="spinner" style="margin: 0 auto 10px;"></div>Analyzing folder with 64-bit DSP...</div>';
 
             try {
-                const res = await fetch(`/api/browse?path=${encodeURIComponent(currentPath)}`);
+                const res = await fetch(`/api/browse?path=${encodeURIComponent(currentPath)}&fresh=${fresh ? 1 : 0}`);
                 directoryData = await res.json();
-                if (directoryData.error) {
-                    throw new Error(directoryData.error);
-                }
+                if (directoryData.error) throw new Error(directoryData.error);
+
                 currentPath = directoryData.current_path;
                 document.getElementById('pathBar').value = currentPath;
+
+                const gpuB = document.getElementById('gpuStatusBadge');
+                if (gpuB && directoryData.gpu_enabled) {
+                    gpuB.innerHTML = '⚡ GPU: ' + escapeHtml(directoryData.gpu_device || 'Active');
+                    gpuB.className = 'gpu-badge';
+                }
+
                 renderBreadcrumbs(directoryData.breadcrumbs, directoryData.parent_path);
                 renderDirectory('');
+
+                // Connect SSE stream for progressive fresh folder badges
+                startFolderStream(currentPath, fresh);
             } catch (err) {
                 treeList.innerHTML = `<div style="padding: 20px; color: var(--accent-red); text-align: center;">Failed to load directory:<br><small>${err.message}</small></div>`;
             }
@@ -895,7 +1267,7 @@ HTML_PAGE = """<!DOCTYPE html>
             const upBtn = document.createElement('span');
             upBtn.className = 'crumb';
             upBtn.innerHTML = '&#x21E7; Up';
-            upBtn.onclick = () => loadDirectory(parentPath);
+            upBtn.onclick = () => loadDirectory(parentPath, true);
             el.appendChild(upBtn);
 
             crumbs.forEach(c => {
@@ -907,7 +1279,7 @@ HTML_PAGE = """<!DOCTYPE html>
                 const a = document.createElement('span');
                 a.className = 'crumb';
                 a.textContent = c.name;
-                a.onclick = () => loadDirectory(c.path);
+                a.onclick = () => loadDirectory(c.path, true);
                 el.appendChild(a);
             });
         }
@@ -949,7 +1321,7 @@ HTML_PAGE = """<!DOCTYPE html>
                 const containerEl = div.querySelector('.folder-name-container');
                 const nameEl = div.querySelector('.folder-name');
                 setupTicker(div, nameEl, containerEl);
-                div.onclick = () => loadDirectory(f.path);
+                div.onclick = () => loadDirectory(f.path, true);
                 treeList.appendChild(div);
             });
 
@@ -959,10 +1331,11 @@ HTML_PAGE = """<!DOCTYPE html>
                 const div = document.createElement('div');
                 div.className = 'file-item';
                 div.id = `file-item-${idx}`;
+                div.setAttribute('data-filepath', f.path);
                 div.title = f.name;
-                
-                const badgeClass = f.is_hires ? 'badge-hires' : 'badge-cd';
-                const badgeText = f.samplerate ? `${(f.samplerate/1000).toFixed(1)}k` : 'FLAC';
+
+                const srText = f.samplerate ? `${(f.samplerate/1000).toFixed(1)}k` : 'FLAC';
+                const cachedBadge = badgeCache[f.path] || f.badge;
 
                 div.innerHTML = `
                     <div class="file-top">
@@ -970,7 +1343,9 @@ HTML_PAGE = """<!DOCTYPE html>
                             <span style="flex-shrink: 0;">🎵</span>
                             <span class="file-title">${escapeHtml(f.name)}</span>
                         </div>
-                        <span class="${badgeClass}" style="flex-shrink: 0;">${badgeText}</span>
+                        <div class="file-badges">
+                            <span class="badge-tag badge-sr">${srText}</span>
+                        </div>
                     </div>
                     <div class="file-meta">
                         <span>⏱ ${f.duration_str}</span>
@@ -983,6 +1358,11 @@ HTML_PAGE = """<!DOCTYPE html>
                 setupTicker(div, titleEl, containerEl);
                 div.onclick = () => analyzeTrack(f, div);
                 treeList.appendChild(div);
+
+                if (cachedBadge) {
+                    badgeCache[f.path] = cachedBadge;
+                    updateFileBadgeDOM(cachedBadge);
+                }
             });
 
             if (filteredFolders.length === 0 && filteredFiles.length === 0) {
@@ -1009,7 +1389,7 @@ HTML_PAGE = """<!DOCTYPE html>
             analysisContent.style.display = 'none';
 
             try {
-                const res = await fetch(`/api/analyze?path=${encodeURIComponent(file.path)}`);
+                const res = await fetch(`/api/analyze?path=${encodeURIComponent(file.path)}&fresh=1`);
                 const data = await res.json();
                 if (data.status !== 'ok') throw new Error(data.message);
 
@@ -1017,9 +1397,15 @@ HTML_PAGE = """<!DOCTYPE html>
                 emptyState.style.display = 'none';
                 analysisContent.style.display = 'flex';
 
+                // Synchronously update the sidebar badges immediately
+                if (data.badge) {
+                    badgeCache[data.filepath] = data.badge;
+                    updateFileBadgeDOM(data.badge);
+                }
+
                 // Update UI metadata
                 document.getElementById('trackTitle').textContent = data.filename;
-                document.getElementById('trackMeta').textContent = `${data.sr.toLocaleString()} Hz | ${data.nyquist_khz.toFixed(1)} kHz Nyquist | ${data.duration_s.toFixed(1)}s sample | Analyzed in ${data.analysis_time}s`;
+                document.getElementById('trackMeta').textContent = `${data.sr.toLocaleString()} Hz | ${data.nyquist_khz.toFixed(1)} kHz Nyquist | ${data.duration_s.toFixed(1)}s sample | ${data.analysis_time}s (${data.gpu_enabled ? 'GPU' : 'CPU'})`;
                 
                 // MQA Badge
                 const mqaBadge = document.getElementById('mqaBadge');
@@ -1055,154 +1441,201 @@ HTML_PAGE = """<!DOCTYPE html>
                     bdBadge.style.display = 'none';
                 }
 
-                // Dynamic Range badge
-                const drBadge = document.getElementById('drBadge');
-                if (data.dr_score !== undefined && data.dr_score !== null) {
-                    drBadge.style.display = 'inline-block';
-                    drBadge.textContent = `DR${data.dr_score} (${data.dr_val} dB)`;
-                    if (data.dr_score >= 14) {
-                        drBadge.style.background = 'rgba(0, 229, 255, 0.15)';
-                        drBadge.style.borderColor = 'rgba(0, 229, 255, 0.4)';
-                        drBadge.style.color = '#00e5ff';
-                    } else if (data.dr_score >= 10) {
-                        drBadge.style.background = 'rgba(0, 230, 118, 0.15)';
-                        drBadge.style.borderColor = 'rgba(0, 230, 118, 0.4)';
-                        drBadge.style.color = '#00e676';
-                    } else if (data.dr_score >= 7) {
-                        drBadge.style.background = 'rgba(255, 214, 0, 0.15)';
-                        drBadge.style.borderColor = 'rgba(255, 214, 0, 0.4)';
-                        drBadge.style.color = '#ffd600';
-                    } else {
-                        drBadge.style.background = 'rgba(255, 23, 68, 0.15)';
-                        drBadge.style.borderColor = 'rgba(255, 23, 68, 0.4)';
-                        drBadge.style.color = '#ff1744';
-                    }
-                } else {
-                    drBadge.style.display = 'none';
-                }
-
-                // Noise profile badge
-                const nBadge = document.getElementById('noiseBadge');
-                if (data.noise_profile) {
-                    nBadge.style.display = 'inline-block';
-                    nBadge.textContent = data.noise_profile;
-                    if (data.noise_profile.includes('PSYCHOACOUSTIC')) {
-                        nBadge.style.background = 'rgba(174, 234, 0, 0.15)';
-                        nBadge.style.borderColor = 'rgba(174, 234, 0, 0.4)';
-                        nBadge.style.color = '#aeea00';
-                    } else if (data.noise_profile.includes('FLAT')) {
-                        nBadge.style.background = 'rgba(88, 166, 255, 0.15)';
-                        nBadge.style.borderColor = 'rgba(88, 166, 255, 0.4)';
-                        nBadge.style.color = '#58a6ff';
-                    } else if (data.noise_profile.includes('DSD') || data.noise_profile.includes('HIGH')) {
-                        nBadge.style.background = 'rgba(255, 140, 0, 0.15)';
-                        nBadge.style.borderColor = 'rgba(255, 140, 0, 0.4)';
-                        nBadge.style.color = '#ff9800';
-                    } else {
-                        nBadge.style.background = '#21262d';
-                        nBadge.style.borderColor = '#30363d';
-                        nBadge.style.color = '#8b949e';
-                    }
-                } else {
-                    nBadge.style.display = 'none';
-                }
-
-                // Estimated Provenance Banner & Badges
-                const provCard = document.getElementById('provenanceCard');
-                const provBadge = document.getElementById('provBadge');
+                // Provenance Banner
+                const provTag = document.getElementById('provTag');
                 const provConf = document.getElementById('provConf');
                 const provDetails = document.getElementById('provDetails');
-                const provAltRow = document.getElementById('provAltRow');
-                const provAltBadge = document.getElementById('provAltBadge');
-                const provAltConf = document.getElementById('provAltConf');
-                const provAltDetails = document.getElementById('provAltDetails');
+                const provCard = document.getElementById('provenanceCard');
 
-                if (data.provenance && data.provenance.label) {
-                    provCard.style.display = 'flex';
-                    const primary = data.provenance.primary || data.provenance;
-                    provBadge.textContent = primary.label;
-                    provBadge.className = `provenance-tag ${primary.badge_class || 'badge-provenance-native'}`;
+                if (data.provenance && data.provenance.primary) {
+                    const p = data.provenance.primary;
+                    provTag.textContent = p.label.toUpperCase();
+                    provTag.className = `provenance-tag ${p.badge_class || 'badge-provenance-native'}`;
+                    
+                    provConf.textContent = `${p.confidence.toUpperCase()} CONFIDENCE (${Math.round(p.score * 100)}%)`;
+                    provConf.className = `confidence-pill ${p.confidence.toLowerCase() === 'high' ? 'conf-high' : p.confidence.toLowerCase() === 'moderate' ? 'conf-mod' : 'conf-low'}`;
 
-                    const scorePct = Math.round((primary.score || 0.9) * 100);
-                    provConf.textContent = `${primary.confidence} Confidence (${scorePct}%)`;
-                    if (primary.confidence === 'High') {
-                        provConf.className = 'confidence-pill conf-high';
-                    } else if (primary.confidence === 'Moderate') {
-                        provConf.className = 'confidence-pill conf-mod';
+                    provDetails.textContent = p.details;
+
+                    if (p.badge_class === 'badge-provenance-upsampled' || p.badge_class === 'badge-provenance-fake') {
+                        provCard.style.borderLeftColor = 'var(--accent-red)';
+                    } else if (p.badge_class === 'badge-provenance-leaky') {
+                        provCard.style.borderLeftColor = '#ffab00';
+                    } else if (p.badge_class === 'badge-provenance-mqa') {
+                        provCard.style.borderLeftColor = '#ba68c8';
                     } else {
-                        provConf.className = 'confidence-pill conf-low';
+                        provCard.style.borderLeftColor = 'var(--accent-cyan)';
                     }
-                    provDetails.textContent = primary.details || '';
+                } else {
+                    provTag.textContent = data.verdict;
+                    provTag.className = 'provenance-tag badge-provenance-native';
+                    provConf.textContent = 'ANALYZED';
+                    provDetails.textContent = data.noise_profile || 'Standard spectral profile.';
+                    provCard.style.borderLeftColor = 'var(--accent-cyan)';
+                }
 
-                    // Alternative possibility row
-                    if (data.provenance.alternative && data.provenance.alternative.label) {
-                        const alt = data.provenance.alternative;
-                        provAltRow.style.display = 'block';
-                        provAltBadge.textContent = alt.label;
-                        provAltBadge.className = `provenance-tag ${alt.badge_class || 'badge-provenance-leaky'}`;
-                        const altPct = Math.round((alt.score || 0.7) * 100);
-                        provAltConf.textContent = `${alt.confidence} (${altPct}%)`;
-                        if (alt.confidence === 'High') {
-                            provAltConf.className = 'confidence-pill conf-high';
-                        } else if (alt.confidence === 'Moderate') {
-                            provAltConf.className = 'confidence-pill conf-mod';
+                // Alternative Hypothesis
+                const altContainer = document.getElementById('altProvContainer');
+                if (data.provenance && data.provenance.alternative) {
+                    const alt = data.provenance.alternative;
+                    altContainer.style.display = 'flex';
+                    const altTag = document.getElementById('altProvTag');
+                    const altConf = document.getElementById('altProvConf');
+                    const altDet = document.getElementById('altProvDetails');
+                    
+                    altTag.textContent = alt.label.toUpperCase();
+                    altTag.className = `provenance-tag ${alt.badge_class || 'badge-provenance-upsampled'}`;
+                    altConf.textContent = `${alt.confidence.toUpperCase()} CONFIDENCE (${Math.round((alt.score || 0.65) * 100)}%)`;
+                    altConf.className = `confidence-pill ${alt.confidence.toLowerCase() === 'high' ? 'conf-high' : alt.confidence.toLowerCase() === 'moderate' ? 'conf-mod' : 'conf-low'}`;
+                    altDet.textContent = alt.details || '';
+                } else {
+                    altContainer.style.display = 'none';
+                }
+
+                // Visual Morphology Indicators
+                const visRow = document.getElementById('visMetricsRow');
+                if (data.provenance && data.provenance.visual_morphology) {
+                    const v = data.provenance.visual_morphology;
+                    visRow.style.display = 'flex';
+                    
+                    const kneeEl = document.getElementById('visKneeBadge');
+                    if (v.detected_knees && v.detected_knees.length > 0) {
+                        const kneeTexts = v.detected_knees.slice(0, 2).map(k => `${k.freq_khz}k`);
+                        kneeEl.textContent = `📐 Knee${v.detected_knees.length > 1 ? 's' : ''}: ${kneeTexts.join(', ')}`;
+                        kneeEl.title = v.detected_knees.map(k => `Knee at ${k.freq_khz} kHz: drop ${k.drop_db} dB down to shelf ${k.level_dbfs} dBFS (slope: ${k.pre_slope_db_per_khz} dB/kHz)`).join('\\n');
+                    } else {
+                        kneeEl.textContent = `📐 Smooth Rolloff (No Knee)`;
+                    }
+
+                    const corrEl = document.getElementById('visCorrBadge');
+                    const r = v.rhythmic_coherence || 0.0;
+                    if (r >= 0.45) {
+                        corrEl.textContent = `🎵 Dynamic Harmonics (r = ${r > 0 ? '+' : ''}${r.toFixed(2)})`;
+                        corrEl.style.color = 'var(--accent-green)';
+                        corrEl.style.borderColor = 'rgba(174, 234, 0, 0.4)';
+                    } else if (v.is_stationary_ultrasonic) {
+                        corrEl.textContent = `📻 Static Dither/Noise (r = ${r > 0 ? '+' : ''}${r.toFixed(2)})`;
+                        corrEl.style.color = '#ff7043';
+                        corrEl.style.borderColor = 'rgba(255, 112, 67, 0.4)';
+                    } else {
+                        corrEl.textContent = `📊 Coherence (r = ${r > 0 ? '+' : ''}${r.toFixed(2)})`;
+                        corrEl.style.color = 'var(--text-muted)';
+                        corrEl.style.borderColor = 'var(--border)';
+                    }
+
+                    const purityEl = document.getElementById('visPurityBadge');
+                    if (v.stopband_purity) {
+                        const pur = v.stopband_purity;
+                        if (pur.is_messy) {
+                            purityEl.textContent = `📻 Stopband: Messy Hash (Spurs: ${pur.max_peak_dbfs} dBFS, +${pur.crest_db} dB)`;
+                            purityEl.style.color = '#ff7043';
+                            purityEl.style.borderColor = 'rgba(255, 112, 67, 0.4)';
+                            purityEl.title = pur.description;
                         } else {
-                            provAltConf.className = 'confidence-pill conf-low';
+                            purityEl.textContent = `✨ Stopband: Clean Dither (${pur.median_rms_dbfs} dBFS)`;
+                            purityEl.style.color = 'var(--accent-green)';
+                            purityEl.style.borderColor = 'rgba(174, 234, 0, 0.4)';
+                            purityEl.title = pur.description;
                         }
-                        provAltDetails.textContent = alt.details || '';
-                    } else {
-                        provAltRow.style.display = 'none';
                     }
 
-                    // Update track item badge in left sidebar if clear
-                    if (fileEl) {
-                        const topRow = fileEl.querySelector('.file-top');
-                        let provTag = topRow.querySelector('.file-prov-tag');
-                        if (primary.confidence !== 'Low' && !primary.label.includes('Unclear')) {
-                            if (!provTag) {
-                                provTag = document.createElement('span');
-                                provTag.className = `file-prov-tag ${primary.badge_class}`;
-                                provTag.style.cssText = 'font-size: 0.68rem; padding: 1px 5px; border-radius: 3px; font-weight: 600; flex-shrink: 0;';
-                                topRow.insertBefore(provTag, topRow.lastElementChild);
-                            }
-                            let shortLabel = primary.label
-                                .replace(' Master', '')
-                                .replace(' Source', '')
-                                .replace(' Material', '')
-                                .replace(' (Leaky SRC / DAC)', ' (Leaky)')
-                                .replace('from ', '');
-                            provTag.textContent = shortLabel;
-                            provTag.className = `file-prov-tag ${primary.badge_class}`;
-                        } else if (provTag) {
-                            provTag.remove();
+                    const varEl = document.getElementById('visVarBadge');
+                    varEl.textContent = `📊 Var: Aud ${v.audible_temporal_variance.toFixed(0)} dB² | Ultra ${v.ultrasonic_temporal_variance.toFixed(0)} dB²`;
+                } else {
+                    visRow.style.display = 'none';
+                }
+
+                // Recommended / Potential Course of Action Box
+                const recBox = document.getElementById('actionRecBox');
+                if (data.provenance && data.provenance.recommendation && data.provenance.primary) {
+                    const conf = (data.provenance.primary.confidence || '').toLowerCase();
+                    const score = data.provenance.primary.score !== undefined ? data.provenance.primary.score : 0.8;
+                    
+                    if (conf === 'low' || score < 0.50) {
+                        recBox.style.display = 'none';
+                    } else {
+                        const r = data.provenance.recommendation;
+                        recBox.style.display = 'flex';
+                        
+                        const isPotential = (conf === 'moderate' || conf === 'medium' || score < 0.85 || r.is_potential);
+                        const prefixEl = document.getElementById('actionTitlePrefix');
+                        if (prefixEl) {
+                            prefixEl.textContent = isPotential ? '💡 Potential DSP Action:' : '💡 Recommended DSP Action:';
+                        }
+                        
+                        document.getElementById('actionName').textContent = r.action;
+                        
+                        const riskPill = document.getElementById('actionRisk');
+                        riskPill.textContent = (r.risk_level || 'MINIMAL RISK').toUpperCase();
+                        riskPill.className = `risk-pill ${r.risk_class || 'risk-minimal'}`;
+                        
+                        document.getElementById('actionDesc').textContent = r.details;
+                        
+                        const codeCont = document.getElementById('actionCodeContainer');
+                        const codeEl = document.getElementById('actionCode');
+                        if (r.dsp_params) {
+                            codeCont.style.display = 'block';
+                            codeEl.textContent = r.dsp_params;
+                        } else {
+                            codeCont.style.display = 'none';
                         }
                     }
                 } else {
-                    provCard.style.display = 'none';
+                    recBox.style.display = 'none';
                 }
 
-                // Audio stream player
-                const player = document.getElementById('audioPlayer');
-                player.src = `/api/stream?path=${encodeURIComponent(file.path)}`;
+                // Dynamic Range
+                document.getElementById('drScoreValue').textContent = `DR${data.dr_score}`;
+                document.getElementById('crestFactorValue').textContent = `Crest: ${data.crest_factor_db.toFixed(1)} dB | LRA: ${data.lra_lu.toFixed(1)} LU`;
 
                 // Report text
                 document.getElementById('reportText').textContent = data.report_text;
 
-                // Initialize Canvas Plots
+                // Load audio in player
+                const player = document.getElementById('audioPlayer');
+                player.src = `/api/stream?path=${encodeURIComponent(file.path)}`;
+
+                // Dynamic Curve Legend
+                updateCurveLegend(data);
+
+                // Initialize Canvases
                 initSpectrogram(data);
                 initSpectrumCurve(data);
-
             } catch (err) {
-                emptyState.innerHTML = `<p style="color: var(--accent-red);">Analysis Error: ${err.message}</p>`;
+                emptyState.style.display = 'flex';
+                emptyState.innerHTML = `<div style="color: var(--accent-red); text-align: center;">Error running DSP analysis:<br><small>${err.message}</small></div>`;
             }
         }
 
+        function updateCurveLegend(data) {
+            const legendEl = document.getElementById('curveLegend');
+            if (!legendEl || !data) return;
+            let html = `
+                <span style="color: var(--accent-cyan); font-weight: 600;">— Peak Hold</span>
+                <span style="color: var(--accent-pink); font-weight: 600;">— RMS Power</span>
+            `;
+            if (data.nyquist_khz > 20.0) {
+                html += `<span style="color: #ff1744; font-weight: 600;">-- 20 kHz Hearing Limit</span>`;
+            }
+            const prov = data.provenance || {};
+            if (prov.suspected_nyquist_hz && prov.suspected_nyquist_hz < (data.sr / 2.0) - 200) {
+                const sNyqF = (prov.suspected_nyquist_hz / 1000.0).toFixed(1);
+                const sBaseF = ((prov.suspected_base_sr_hz || (prov.suspected_nyquist_hz * 2)) / 1000.0).toFixed(1);
+                html += `<span style="color: #ffea00; font-weight: 600;">-- ${sNyqF} kHz (${sBaseF}k Lineage)</span>`;
+            }
+            html += `<span style="color: #ffab00; font-weight: 600;">-- ${data.nyquist_khz.toFixed(1)} kHz Container Nyquist</span>`;
+            legendEl.innerHTML = html;
+        }
 
         // ==========================================
-        // SPECTROGRAM CANVAS WITH ZOOM & PAN
+        // SPECTROGRAM CANVAS WITH ZOOM, PAN & HUD
         // ==========================================
-        let specTMin = 0, specTMax = 60, specFMin = 0, specFMax = 88.2;
-        let specImg = new Image(), rawLookup = null, lookupW = 0, lookupH = 0;
+        let specImg = null;
+        let specLookup = null;
+        let lookupW = 256;
+        let lookupH = 128;
+        let specTMin = 0.0, specTMax = 45.0;
+        let specFMin = 0.0, specFMax = 88.2;
         let specIsDragging = false, specDragStartX = 0, specDragStartY = 0;
         let specInitTMin = 0, specInitTMax = 0, specInitFMin = 0, specInitFMax = 0;
         let specMouseX = -1, specMouseY = -1;
@@ -1216,19 +1649,33 @@ HTML_PAGE = """<!DOCTYPE html>
         function initSpectrogram(data) {
             specTMin = 0.0; specTMax = data.duration_s;
             specFMin = 0.0; specFMax = data.nyquist_khz;
-            lookupW = data.lookup_w; lookupH = data.lookup_h;
-            rawLookup = Uint8Array.from(atob(data.lookup_base64), c => c.charCodeAt(0));
+            lookupW = data.lookup_w || 256;
+            lookupH = data.lookup_h || 128;
 
             specImg = new Image();
-            specImg.src = "data:image/webp;base64," + data.webp_base64;
-            specImg.onload = () => resizeSpecCanvas();
+            specImg.onload = () => {
+                resizeSpecCanvas();
+            };
+            const b64 = data.webp_base64 || '';
+            specImg.src = b64.startsWith('data:') ? b64 : ('data:image/webp;base64,' + b64);
+
+            if (data.lookup_base64) {
+                const raw = atob(data.lookup_base64);
+                specLookup = new Uint8Array(raw.length);
+                for (let i = 0; i < raw.length; i++) specLookup[i] = raw.charCodeAt(i);
+            } else {
+                specLookup = null;
+            }
         }
 
         function getSpectrogramDb(t, fKhz) {
-            if (!rawLookup || !currentAnalysis) return -165.0;
-            const x = Math.max(0, Math.min(lookupW - 1, Math.floor((t / currentAnalysis.duration_s) * lookupW)));
-            const y = Math.max(0, Math.min(lookupH - 1, Math.floor((1.0 - (fKhz / currentAnalysis.nyquist_khz)) * lookupH)));
-            const u8 = rawLookup[y * lookupW + x];
+            if (!currentAnalysis || !specLookup) return -165.0;
+            const dur = currentAnalysis.duration_s;
+            const nyq = currentAnalysis.nyquist_khz;
+            if (t < 0 || t > dur || fKhz < 0 || fKhz > nyq) return -165.0;
+            const x = Math.max(0, Math.min(lookupW - 1, Math.floor((t / dur) * lookupW)));
+            const y = Math.max(0, Math.min(lookupH - 1, Math.floor((1.0 - (fKhz / nyq)) * lookupH)));
+            const u8 = specLookup[y * lookupW + x];
             return (u8 / 255.0) * 165.0 - 165.0;
         }
 
@@ -1236,16 +1683,6 @@ HTML_PAGE = """<!DOCTYPE html>
             if (!currentAnalysis) return;
             specTMin = 0.0; specTMax = currentAnalysis.duration_s;
             specFMin = 0.0; specFMax = currentAnalysis.nyquist_khz;
-            drawSpectrogram(specCanvas.getBoundingClientRect().width, specCanvas.getBoundingClientRect().height);
-        }
-
-        function setSpecPreset(type) {
-            if (!currentAnalysis) return;
-            if (type === 'audible') {
-                specFMin = 0.0; specFMax = Math.min(20.0, currentAnalysis.nyquist_khz);
-            } else if (type === 'ultrasonic') {
-                specFMin = Math.min(20.0, currentAnalysis.nyquist_khz); specFMax = currentAnalysis.nyquist_khz;
-            }
             drawSpectrogram(specCanvas.getBoundingClientRect().width, specCanvas.getBoundingClientRect().height);
         }
 
@@ -1278,71 +1715,81 @@ HTML_PAGE = """<!DOCTYPE html>
         }
 
         function drawSpectrogram(w, h) {
-            if (!currentAnalysis) return;
+            if (!currentAnalysis || !specImg || !specImg.complete) return;
             sCtx.clearRect(0, 0, w, h);
+
             const padL = 55, padR = 70, padT = 15, padB = 35;
             const plotW = w - padL - padR;
             const plotH = h - padT - padB;
 
             if (plotW <= 0 || plotH <= 0) return;
 
-            // Draw Heatmap Bitmap with Zoom/Sub-Rect
-            if (specImg.complete && specImg.naturalWidth > 0) {
-                const sx = (specTMin / currentAnalysis.duration_s) * specImg.naturalWidth;
-                const sw = ((specTMax - specTMin) / currentAnalysis.duration_s) * specImg.naturalWidth;
-                const sy = (1.0 - (specFMax / currentAnalysis.nyquist_khz)) * specImg.naturalHeight;
-                const sh = ((specFMax - specFMin) / currentAnalysis.nyquist_khz) * specImg.naturalHeight;
+            sCtx.save();
+            sCtx.beginPath();
+            sCtx.rect(padL, padT, plotW, plotH);
+            sCtx.clip();
 
-                sCtx.save();
+            const sx = (specTMin / currentAnalysis.duration_s) * specImg.naturalWidth;
+            const sw = ((specTMax - specTMin) / currentAnalysis.duration_s) * specImg.naturalWidth;
+            const sy = (1.0 - (specFMax / currentAnalysis.nyquist_khz)) * specImg.naturalHeight;
+            const sh = ((specFMax - specFMin) / currentAnalysis.nyquist_khz) * specImg.naturalHeight;
+
+            sCtx.imageSmoothingEnabled = true;
+            sCtx.drawImage(specImg, sx, sy, sw, sh, padL, padT, plotW, plotH);
+
+            // Interactive Crosshair & HUD on hover
+            if (specMouseX >= padL && specMouseX <= padL + plotW && specMouseY >= padT && specMouseY <= padT + plotH) {
+                sCtx.strokeStyle = "rgba(255, 255, 255, 0.45)";
+                sCtx.lineWidth = 1;
+                sCtx.setLineDash([3, 3]);
                 sCtx.beginPath();
-                sCtx.rect(padL, padT, plotW, plotH);
-                sCtx.clip();
-                sCtx.drawImage(specImg, sx, sy, sw, sh, padL, padT, plotW, plotH);
-                sCtx.restore();
+                sCtx.moveTo(specMouseX, padT);
+                sCtx.lineTo(specMouseX, padT + plotH);
+                sCtx.moveTo(padL, specMouseY);
+                sCtx.lineTo(padL + plotW, specMouseY);
+                sCtx.stroke();
+                sCtx.setLineDash([]);
+
+                const curT = specTMin + ((specMouseX - padL) / plotW) * (specTMax - specTMin);
+                const curF = specFMin + (1.0 - (specMouseY - padT) / plotH) * (specFMax - specFMin);
+                const curDb = getSpectrogramDb(curT, curF);
+
+                specHudTime.textContent = curT.toFixed(2) + " s";
+                specHudFreq.textContent = curF.toFixed(2) + " kHz (" + (curF * 1000).toFixed(0) + " Hz)";
+                specHudDb.textContent = curDb.toFixed(1) + " dBFS";
             }
 
-            sCtx.strokeStyle = "#30363d";
+            sCtx.restore();
+
+            // Axes & Labels
+            sCtx.strokeStyle = '#30363d';
             sCtx.lineWidth = 1;
             sCtx.strokeRect(padL, padT, plotW, plotH);
 
-            // Y-Axis Ticks (Frequency kHz)
-            sCtx.fillStyle = "#8b949e";
-            sCtx.font = "10px -apple-system, sans-serif";
-            sCtx.textAlign = "right";
-            sCtx.textBaseline = "middle";
+            sCtx.fillStyle = '#8b949e';
+            sCtx.font = '10px monospace';
+            sCtx.textAlign = 'right';
+            sCtx.textBaseline = 'middle';
 
-            const fRange = specFMax - specFMin;
-            const fStep = fRange > 40 ? 20 : (fRange > 20 ? 10 : (fRange > 8 ? 5 : 2));
-            const firstF = Math.ceil(specFMin / fStep) * fStep;
-
-            for (let f = firstF; f <= specFMax; f += fStep) {
-                const y = padT + (1.0 - (f - specFMin) / fRange) * plotH;
-                sCtx.strokeStyle = "#1f242c";
-                sCtx.beginPath();
-                sCtx.moveTo(padL - 4, y);
-                sCtx.lineTo(padL, y);
-                sCtx.stroke();
-                sCtx.fillText(f.toFixed(fStep < 1 ? 1 : 0) + "k", padL - 6, y);
+            const fStep = (specFMax - specFMin) > 40 ? 20 : (specFMax - specFMin) > 15 ? 5 : 2;
+            for (let f = Math.ceil(specFMin / fStep) * fStep; f <= specFMax; f += fStep) {
+                const y = padT + (1.0 - (f - specFMin) / (specFMax - specFMin)) * plotH;
+                sCtx.fillText(`${f}k`, padL - 6, y);
+                sCtx.strokeStyle = 'rgba(255,255,255,0.06)';
+                sCtx.beginPath(); sCtx.moveTo(padL, y); sCtx.lineTo(padL + plotW, y); sCtx.stroke();
             }
 
-            // X-Axis Ticks (Time seconds)
-            sCtx.textAlign = "center";
-            sCtx.textBaseline = "top";
-            const tRange = specTMax - specTMin;
-            const tStep = tRange > 40 ? 10 : (tRange > 15 ? 5 : (tRange > 5 ? 2 : 1));
-            const firstT = Math.ceil(specTMin / tStep) * tStep;
-
-            for (let t = firstT; t <= specTMax; t += tStep) {
-                const x = padL + ((t - specTMin) / tRange) * plotW;
-                sCtx.strokeStyle = "#1f242c";
-                sCtx.beginPath();
-                sCtx.moveTo(x, padT + plotH);
-                sCtx.lineTo(x, padT + plotH + 4);
-                sCtx.stroke();
-                sCtx.fillText(t.toFixed(tStep < 1 ? 1 : 0) + "s", x, padT + plotH + 6);
+            sCtx.textAlign = 'center';
+            sCtx.textBaseline = 'top';
+            const tStep = (specTMax - specTMin) > 20 ? 10 : (specTMax - specTMin) > 8 ? 2 : 0.5;
+            for (let t = Math.ceil(specTMin / tStep) * tStep; t <= specTMax; t += tStep) {
+                const x = padL + ((t - specTMin) / (specTMax - specTMin)) * plotW;
+                sCtx.fillText(`${t.toFixed(1)}s`, x, padT + plotH + 6);
+                sCtx.strokeStyle = 'rgba(255,255,255,0.06)';
+                sCtx.beginPath(); sCtx.moveTo(x, padT); sCtx.lineTo(x, padT + plotH); sCtx.stroke();
             }
 
-            // Colorbar Scale
+            // Colorbar on right
             const barX = padL + plotW + 12;
             const barW = 10;
             const barH = plotH;
@@ -1352,7 +1799,6 @@ HTML_PAGE = """<!DOCTYPE html>
             grad.addColorStop(0.50, "#bc3754");
             grad.addColorStop(0.75, "#57106e");
             grad.addColorStop(1.00, "#000004");
-
             sCtx.fillStyle = grad;
             sCtx.fillRect(barX, padT, barW, barH);
             sCtx.strokeStyle = "#30363d";
@@ -1361,38 +1807,17 @@ HTML_PAGE = """<!DOCTYPE html>
             sCtx.textAlign = "left";
             sCtx.textBaseline = "middle";
             sCtx.fillStyle = "#8b949e";
-            sCtx.font = "9px -apple-system, sans-serif";
-            const dbTicks = [0, -40, -80, -120, -165];
-            for (let d of dbTicks) {
+            sCtx.font = "9px monospace";
+            for (let d of [0, -40, -80, -120, -165]) {
                 const y = padT + (d / -165.0) * barH;
-                sCtx.fillText(d === 0 ? "0" : d + "", barX + barW + 4, y);
-            }
-
-            // Hover Crosshair
-            if (specMouseX >= padL && specMouseX <= padL + plotW && specMouseY >= padT && specMouseY <= padT + plotH) {
-                sCtx.strokeStyle = "rgba(255, 255, 255, 0.4)";
-                sCtx.setLineDash([2, 2]);
-                sCtx.beginPath();
-                sCtx.moveTo(specMouseX, padT);
-                sCtx.lineTo(specMouseX, padT + plotH);
-                sCtx.moveTo(padL, specMouseY);
-                sCtx.lineTo(padL + plotW, specMouseY);
-                sCtx.stroke();
-                sCtx.setLineDash([]);
-
-                const curT = specTMin + ((specMouseX - padL) / plotW) * tRange;
-                const curF = specFMin + (1.0 - (specMouseY - padT) / plotH) * fRange;
-                const curDb = getSpectrogramDb(curT, curF);
-
-                specHudTime.textContent = curT.toFixed(2) + " s";
-                specHudFreq.textContent = curF.toFixed(2) + " kHz";
-                specHudDb.textContent = curDb.toFixed(1) + " dBFS";
+                sCtx.fillText(d === 0 ? "0dB" : `${d}dB`, barX + barW + 4, y);
             }
         }
 
         specCanvas.addEventListener('mousedown', (e) => {
             specIsDragging = true;
-            specDragStartX = e.clientX; specDragStartY = e.clientY;
+            specDragStartX = e.clientX;
+            specDragStartY = e.clientY;
             specInitTMin = specTMin; specInitTMax = specTMax;
             specInitFMin = specFMin; specInitFMax = specFMax;
         });
@@ -1455,7 +1880,7 @@ HTML_PAGE = """<!DOCTYPE html>
 
 
         // ==========================================
-        // SPECTRUM CURVE CANVAS WITH ZOOM & PAN
+        // SPECTRUM CURVE CANVAS WITH ZOOM, PAN & HUD
         // ==========================================
         let curveFMin = 0.0, curveFMax = 88.2;
         let curveDbMin = -175.0, curveDbMax = 0.0;
@@ -1470,14 +1895,14 @@ HTML_PAGE = """<!DOCTYPE html>
         let curveMouseX = -1;
 
         function initSpectrumCurve(data) {
-            curveFMin = 0.0; curveFMax = data.nyquist_khz;
+            curveFMin = 0.0; curveFMax = data.nyquist_khz * 1.04;
             curveDbMin = -175.0; curveDbMax = 0.0;
             resizeCurveCanvas();
         }
 
         function resetCurveZoom() {
             if (!currentAnalysis) return;
-            curveFMin = 0.0; curveFMax = currentAnalysis.nyquist_khz;
+            curveFMin = 0.0; curveFMax = currentAnalysis.nyquist_khz * 1.04;
             curveDbMin = -175.0; curveDbMax = 0.0;
             drawCurve(curveCanvas.getBoundingClientRect().width, curveCanvas.getBoundingClientRect().height);
         }
@@ -1491,7 +1916,7 @@ HTML_PAGE = """<!DOCTYPE html>
                 curveFMin = 15.0; curveFMax = Math.min(25.0, currentAnalysis.nyquist_khz);
                 curveDbMin = -175.0; curveDbMax = -40.0;
             } else if (type === 'ultrasonic') {
-                curveFMin = Math.min(20.0, currentAnalysis.nyquist_khz); curveFMax = currentAnalysis.nyquist_khz;
+                curveFMin = Math.min(20.0, currentAnalysis.nyquist_khz); curveFMax = currentAnalysis.nyquist_khz * 1.04;
                 curveDbMin = -175.0; curveDbMax = -120.0;
             }
             drawCurve(curveCanvas.getBoundingClientRect().width, curveCanvas.getBoundingClientRect().height);
@@ -1500,10 +1925,10 @@ HTML_PAGE = """<!DOCTYPE html>
         function zoomCurve(factor, centerFRatio = 0.5, centerDbRatio = 0.5) {
             if (!currentAnalysis) return;
             const curFW = curveFMax - curveFMin;
-            const newFW = Math.max(1.0, Math.min(currentAnalysis.nyquist_khz, curFW / factor));
+            const newFW = Math.max(1.0, Math.min(currentAnalysis.nyquist_khz * 1.04, curFW / factor));
             const centerF = curveFMin + curFW * centerFRatio;
             curveFMin = Math.max(0, centerF - newFW * centerFRatio);
-            curveFMax = Math.min(currentAnalysis.nyquist_khz, curveFMin + newFW);
+            curveFMax = Math.min(currentAnalysis.nyquist_khz * 1.04, curveFMin + newFW);
             if (curveFMax - curveFMin < newFW) curveFMin = Math.max(0, curveFMax - newFW);
 
             const curDbW = curveDbMax - curveDbMin;
@@ -1539,7 +1964,7 @@ HTML_PAGE = """<!DOCTYPE html>
         function drawCurve(w, h) {
             if (!currentAnalysis) return;
             cCtx.clearRect(0, 0, w, h);
-            const padL = 55, padR = 25, padT = 15, padB = 35;
+            const padL = 55, padR = 25, padT = 20, padB = 35;
             const plotW = w - padL - padR;
             const plotH = h - padT - padB;
 
@@ -1548,122 +1973,179 @@ HTML_PAGE = """<!DOCTYPE html>
             cCtx.fillStyle = "#11141a";
             cCtx.fillRect(padL, padT, plotW, plotH);
 
-            // Horizontal Grid Lines
-            const dbRange = curveDbMax - curveDbMin;
-            const dbStep = dbRange > 100 ? 20 : (dbRange > 40 ? 10 : 5);
-            const firstDb = Math.ceil(curveDbMin / dbStep) * dbStep;
+            const freqs = currentAnalysis.curve_freqs_khz;
+            const peaks = currentAnalysis.curve_peaks;
+            const rms = currentAnalysis.curve_rms;
 
-            cCtx.strokeStyle = "#1f242c";
-            cCtx.lineWidth = 1;
-            cCtx.fillStyle = "#6e7681";
-            cCtx.font = "10px -apple-system, sans-serif";
-            cCtx.textAlign = "right";
-            cCtx.textBaseline = "middle";
-
-            for (let db = firstDb; db <= curveDbMax; db += dbStep) {
-                const y = dbToY(db, h, padT, padB);
-                cCtx.beginPath();
-                cCtx.moveTo(padL, y);
-                cCtx.lineTo(padL + plotW, y);
-                cCtx.stroke();
-                cCtx.fillText(db.toFixed(0) + " dB", padL - 6, y);
-            }
-
-            // Vertical Frequency Grid Lines
-            cCtx.textAlign = "center";
-            cCtx.textBaseline = "top";
-            const fRange = curveFMax - curveFMin;
-            const fStep = fRange > 40 ? 20 : (fRange > 20 ? 10 : (fRange > 8 ? 5 : (fRange > 3 ? 1 : 0.5)));
-            const firstF = Math.ceil(curveFMin / fStep) * fStep;
-
-            for (let f = firstF; f <= curveFMax; f += fStep) {
-                const x = freqToX(f, w, padL, padR);
-                cCtx.beginPath();
-                cCtx.moveTo(x, padT);
-                cCtx.lineTo(x, padT + plotH);
-                cCtx.stroke();
-                cCtx.fillText(f.toFixed(fStep < 1 ? 1 : 0) + "k", x, padT + plotH + 6);
-            }
-
-            // Clip curves inside plot
             cCtx.save();
             cCtx.beginPath();
             cCtx.rect(padL, padT, plotW, plotH);
             cCtx.clip();
 
-            // Reference Marker: 20 kHz
-            if (curveFMin <= 20.0 && curveFMax >= 20.0) {
+            // 1. File Container Nyquist Limit
+            const nyqF = currentAnalysis.nyquist_khz;
+            if (curveFMin <= nyqF && curveFMax >= nyqF) {
+                const xNyq = freqToX(nyqF, w, padL, padR);
+                cCtx.strokeStyle = "rgba(255, 171, 0, 0.95)";
+                cCtx.lineWidth = 1.5;
+                cCtx.setLineDash([5, 3]);
+                cCtx.beginPath(); cCtx.moveTo(xNyq, padT); cCtx.lineTo(xNyq, padT + plotH); cCtx.stroke();
+                cCtx.setLineDash([]);
+                cCtx.fillStyle = "#ffab00";
+                cCtx.font = "bold 9px monospace";
+                cCtx.textAlign = "right";
+                cCtx.fillText(`${nyqF.toFixed(1)}k Nyquist`, Math.min(xNyq - 4, padL + plotW - 4), padT + 8);
+            }
+
+            // 2. 20 kHz Audible Hearing Limit (shown only when container Nyquist > 20 kHz)
+            if (currentAnalysis.nyquist_khz > 20.0 && curveFMin <= 20.0 && curveFMax >= 20.0) {
                 const x20 = freqToX(20.0, w, padL, padR);
-                cCtx.strokeStyle = "#ff1744";
-                cCtx.setLineDash([3, 3]);
-                cCtx.beginPath();
-                cCtx.moveTo(x20, padT);
-                cCtx.lineTo(x20, padT + plotH);
-                cCtx.stroke();
-            }
-
-            // Reference Marker: 22.05 kHz
-            if (curveFMin <= 22.05 && curveFMax >= 22.05) {
-                const x22 = freqToX(22.05, w, padL, padR);
-                cCtx.strokeStyle = "#ffea00";
+                cCtx.strokeStyle = "rgba(255, 23, 68, 0.85)";
+                cCtx.lineWidth = 1.5;
                 cCtx.setLineDash([4, 4]);
+                cCtx.beginPath(); cCtx.moveTo(x20, padT); cCtx.lineTo(x20, padT + plotH); cCtx.stroke();
+                cCtx.setLineDash([]);
+                cCtx.fillStyle = "#ff1744";
+                cCtx.font = "9px monospace";
+                cCtx.textAlign = "center";
+                cCtx.fillText("20k Hearing", x20, padT + 8);
+            }
+
+            // 3. Suspected Native Lineage Nyquist (shown ONLY if estimated source differs from container)
+            const prov = currentAnalysis.provenance || {};
+            if (prov.suspected_nyquist_hz && prov.suspected_nyquist_hz < (currentAnalysis.sr / 2.0) - 200) {
+                const sNyqF = prov.suspected_nyquist_hz / 1000.0;
+                const sBaseF = (prov.suspected_base_sr_hz || (prov.suspected_nyquist_hz * 2)) / 1000.0;
+                if (curveFMin <= sNyqF && curveFMax >= sNyqF) {
+                    const xsNyq = freqToX(sNyqF, w, padL, padR);
+                    cCtx.strokeStyle = "rgba(255, 234, 0, 0.95)";
+                    cCtx.lineWidth = 1.5;
+                    cCtx.setLineDash([4, 3]);
+                    cCtx.beginPath(); cCtx.moveTo(xsNyq, padT); cCtx.lineTo(xsNyq, padT + plotH); cCtx.stroke();
+                    cCtx.setLineDash([]);
+                    cCtx.fillStyle = "#ffea00";
+                    cCtx.font = "bold 9px monospace";
+                    cCtx.textAlign = "center";
+                    cCtx.fillText(`${sNyqF.toFixed(1)}k (${sBaseF.toFixed(1)}k Source)`, xsNyq, padT + 20);
+                }
+            }
+
+            // Peak curve (Cyan)
+            cCtx.strokeStyle = "rgba(0, 229, 255, 0.9)";
+            cCtx.lineWidth = 1.5;
+            cCtx.beginPath();
+            let first = true;
+            for (let i = 0; i < freqs.length; i++) {
+                if (freqs[i] < curveFMin || freqs[i] > curveFMax) continue;
+                const x = freqToX(freqs[i], w, padL, padR);
+                const y = dbToY(peaks[i], h, padT, padB);
+                if (first) { cCtx.moveTo(x, y); first = false; }
+                else { cCtx.lineTo(x, y); }
+            }
+            cCtx.stroke();
+
+            // RMS curve (Magenta)
+            cCtx.strokeStyle = "rgba(255, 0, 127, 0.9)";
+            cCtx.lineWidth = 1.5;
+            cCtx.beginPath();
+            first = true;
+            for (let i = 0; i < freqs.length; i++) {
+                if (freqs[i] < curveFMin || freqs[i] > curveFMax) continue;
+                const x = freqToX(freqs[i], w, padL, padR);
+                const y = dbToY(rms[i], h, padT, padB);
+                if (first) { cCtx.moveTo(x, y); first = false; }
+                else { cCtx.lineTo(x, y); }
+            }
+            cCtx.stroke();
+
+            // 4. Projected Filter Cutoff Response (Dashed Neon Green - plotted ONLY between Cutoff Start and Container Nyquist)
+            let recCutoffKhz = null;
+            const rec = currentAnalysis.provenance ? currentAnalysis.provenance.recommendation : null;
+            if (rec) {
+                if (rec.filter_cutoff_khz) {
+                    recCutoffKhz = rec.filter_cutoff_khz;
+                } else if (rec.dsp_params) {
+                    const m = rec.dsp_params.match(/--(?:cutoff|apodize)\\s+(\\d+)/);
+                    if (m) recCutoffKhz = parseFloat(m[1]) / 1000.0;
+                }
+            }
+
+            function calcProjectedLevel(f, origRmsDb, cutoffF) {
+                if (f < cutoffF) return origRmsDb;
+                const deltaF = f - cutoffF;
+                const wTrans = Math.min(1.2, Math.max(0.5, 0.03 * cutoffF));
+                let attDb = 0;
+                if (deltaF <= wTrans) {
+                    const ratio = deltaF / wTrans;
+                    attDb = 120.0 * Math.pow((1.0 - Math.cos(Math.PI * ratio)) / 2.0, 1.5);
+                } else {
+                    attDb = 120.0 + 20.0 * ((deltaF - wTrans) / wTrans);
+                }
+                return Math.max(-170.0, origRmsDb - attDb);
+            }
+
+            const legProj = document.getElementById('legendProjectedCutoff');
+            if (recCutoffKhz && recCutoffKhz < currentAnalysis.nyquist_khz) {
+                const cutoffLabel = (recCutoffKhz % 1 === 0) ? `${recCutoffKhz.toFixed(0)}k` : `${recCutoffKhz.toFixed(2).replace(/0$/, '')}k`;
+                if (legProj) {
+                    legProj.style.display = 'inline';
+                    legProj.textContent = `-- 🎯 Projected Filter (@ ${cutoffLabel})`;
+                }
+
+                // Vertical Cutoff Marker Line
+                if (curveFMin <= recCutoffKhz && curveFMax >= recCutoffKhz) {
+                    const xCut = freqToX(recCutoffKhz, w, padL, padR);
+                    cCtx.strokeStyle = "rgba(0, 230, 118, 0.85)";
+                    cCtx.lineWidth = 1.2;
+                    cCtx.setLineDash([3, 3]);
+                    cCtx.beginPath(); cCtx.moveTo(xCut, padT); cCtx.lineTo(xCut, padT + plotH); cCtx.stroke();
+                    cCtx.setLineDash([]);
+                    cCtx.fillStyle = "#00e676";
+                    cCtx.font = "bold 9px monospace";
+                    cCtx.textAlign = "left";
+                    cCtx.fillText(`Cutoff @ ${cutoffLabel}`, xCut + 4, padT + plotH - 8);
+                }
+
+                // Projected Filter Rolloff Curve (ONLY from Cutoff to Nyquist, applied to ACTUAL measured signal)
+                cCtx.strokeStyle = "#00e676";
+                cCtx.lineWidth = 2.0;
+                cCtx.setLineDash([5, 3]);
                 cCtx.beginPath();
-                cCtx.moveTo(x22, padT);
-                cCtx.lineTo(x22, padT + plotH);
+                let pFirst = true;
+                const nyq = currentAnalysis.nyquist_khz;
+                for (let i = 0; i < freqs.length; i++) {
+                    const f = freqs[i];
+                    if (f < recCutoffKhz || f > nyq) continue;
+                    if (f < curveFMin || f > curveFMax) continue;
+                    
+                    const projDb = calcProjectedLevel(f, rms[i], recCutoffKhz);
+                    const x = freqToX(f, w, padL, padR);
+                    const y = dbToY(projDb, h, padT, padB);
+                    if (pFirst) { cCtx.moveTo(x, y); pFirst = false; }
+                    else { cCtx.lineTo(x, y); }
+                }
                 cCtx.stroke();
+                cCtx.setLineDash([]);
+            } else {
+                if (legProj) legProj.style.display = 'none';
             }
-            cCtx.setLineDash([]);
 
-            // Draw RMS Curve (Magenta)
-            const fArr = currentAnalysis.curve_freqs_khz;
-            const rArr = currentAnalysis.curve_rms;
-            const pArr = currentAnalysis.curve_peaks;
-
-            cCtx.strokeStyle = "#ff007f";
-            cCtx.lineWidth = 1.2;
-            cCtx.beginPath();
-            let firstPoint = true;
-            for (let i = 0; i < fArr.length; i++) {
-                if (fArr[i] >= curveFMin - 1.0 && fArr[i] <= curveFMax + 1.0) {
-                    const x = freqToX(fArr[i], w, padL, padR);
-                    const y = dbToY(rArr[i], h, padT, padB);
-                    if (firstPoint) { cCtx.moveTo(x, y); firstPoint = false; }
-                    else cCtx.lineTo(x, y);
-                }
-            }
-            cCtx.stroke();
-
-            // Draw Peak Curve (Cyan)
-            cCtx.strokeStyle = "#00e5ff";
-            cCtx.lineWidth = 1.2;
-            cCtx.beginPath();
-            firstPoint = true;
-            for (let i = 0; i < fArr.length; i++) {
-                if (fArr[i] >= curveFMin - 1.0 && fArr[i] <= curveFMax + 1.0) {
-                    const x = freqToX(fArr[i], w, padL, padR);
-                    const y = dbToY(pArr[i], h, padT, padB);
-                    if (firstPoint) { cCtx.moveTo(x, y); firstPoint = false; }
-                    else cCtx.lineTo(x, y);
-                }
-            }
-            cCtx.stroke();
-            cCtx.restore();
-
-            // Hover Crosshair
+            // Interactive Hover Reticle & HUD
             if (curveMouseX >= padL && curveMouseX <= padL + plotW) {
                 const ratio = (curveMouseX - padL) / plotW;
                 const targetFreq = curveFMin + ratio * (curveFMax - curveFMin);
                 let closestIdx = 0, minDiff = Infinity;
-                for (let i = 0; i < fArr.length; i++) {
-                    const d = Math.abs(fArr[i] - targetFreq);
+                for (let i = 0; i < freqs.length; i++) {
+                    const d = Math.abs(freqs[i] - targetFreq);
                     if (d < minDiff) { minDiff = d; closestIdx = i; }
                 }
 
-                const curX = freqToX(fArr[closestIdx], w, padL, padR);
-                const curYPeak = dbToY(pArr[closestIdx], h, padT, padB);
-                const curYRMS = dbToY(rArr[closestIdx], h, padT, padB);
+                const curX = freqToX(freqs[closestIdx], w, padL, padR);
+                const curYPeak = dbToY(peaks[closestIdx], h, padT, padB);
+                const curYRMS = dbToY(rms[closestIdx], h, padT, padB);
 
-                cCtx.strokeStyle = "rgba(255, 255, 255, 0.4)";
+                cCtx.strokeStyle = "rgba(255, 255, 255, 0.45)";
+                cCtx.lineWidth = 1;
                 cCtx.setLineDash([2, 2]);
                 cCtx.beginPath();
                 cCtx.moveTo(curX, padT);
@@ -1671,25 +2153,91 @@ HTML_PAGE = """<!DOCTYPE html>
                 cCtx.stroke();
                 cCtx.setLineDash([]);
 
+                // Peak point indicator (Cyan)
                 cCtx.fillStyle = "#00e5ff";
                 cCtx.beginPath();
-                cCtx.arc(curX, curYPeak, 3.5, 0, Math.PI * 2);
+                cCtx.arc(curX, curYPeak, 4, 0, Math.PI * 2);
                 cCtx.fill();
+                cCtx.strokeStyle = "#fff";
+                cCtx.lineWidth = 1;
+                cCtx.stroke();
 
+                // RMS point indicator (Pink)
                 cCtx.fillStyle = "#ff007f";
                 cCtx.beginPath();
-                cCtx.arc(curX, curYRMS, 3.5, 0, Math.PI * 2);
+                cCtx.arc(curX, curYRMS, 4, 0, Math.PI * 2);
                 cCtx.fill();
+                cCtx.strokeStyle = "#fff";
+                cCtx.lineWidth = 1;
+                cCtx.stroke();
 
-                hudFreq.textContent = `${fArr[closestIdx].toFixed(2)} kHz (${(fArr[closestIdx]*1000).toFixed(0)} Hz)`;
-                hudPeak.textContent = `${pArr[closestIdx].toFixed(1)} dBFS`;
-                hudRMS.textContent = `${rArr[closestIdx].toFixed(1)} dBFS`;
+                // Projected point indicator (Neon Green) if active in cutoff zone
+                const hudProjItem = document.getElementById('hudProjItem');
+                const hudProj = document.getElementById('hudProj');
+                if (recCutoffKhz && freqs[closestIdx] >= recCutoffKhz && freqs[closestIdx] <= currentAnalysis.nyquist_khz) {
+                    const projDb = calcProjectedLevel(freqs[closestIdx], rms[closestIdx], recCutoffKhz);
+                    
+                    if (hudProjItem && hudProj) {
+                        hudProjItem.style.display = 'block';
+                        hudProj.textContent = `${projDb.toFixed(1)} dBFS`;
+                    }
+
+                    const curYProj = dbToY(projDb, h, padT, padB);
+                    cCtx.fillStyle = "#00e676";
+                    cCtx.beginPath();
+                    cCtx.arc(curX, curYProj, 4, 0, Math.PI * 2);
+                    cCtx.fill();
+                    cCtx.strokeStyle = "#fff";
+                    cCtx.lineWidth = 1;
+                    cCtx.stroke();
+                } else {
+                    if (hudProjItem) hudProjItem.style.display = 'none';
+                }
+
+                // Update HUD Text
+                hudFreq.textContent = `${freqs[closestIdx].toFixed(2)} kHz (${(freqs[closestIdx] * 1000).toFixed(0)} Hz)`;
+                hudPeak.textContent = `${peaks[closestIdx].toFixed(1)} dBFS`;
+                hudRMS.textContent = `${rms[closestIdx].toFixed(1)} dBFS`;
+            } else {
+                const hudProjItem = document.getElementById('hudProjItem');
+                if (hudProjItem) hudProjItem.style.display = 'none';
+            }
+
+            cCtx.restore();
+
+            // Axes & Labels
+            cCtx.strokeStyle = '#30363d';
+            cCtx.lineWidth = 1;
+            cCtx.strokeRect(padL, padT, plotW, plotH);
+
+            cCtx.fillStyle = '#8b949e';
+            cCtx.font = '10px monospace';
+            cCtx.textAlign = 'right';
+            cCtx.textBaseline = 'middle';
+
+            const dbStep = (curveDbMax - curveDbMin) > 80 ? 20 : 10;
+            for (let db = Math.ceil(curveDbMin / dbStep) * dbStep; db <= curveDbMax; db += dbStep) {
+                const y = dbToY(db, h, padT, padB);
+                cCtx.fillText(`${db}dB`, padL - 6, y);
+                cCtx.strokeStyle = 'rgba(255,255,255,0.06)';
+                cCtx.beginPath(); cCtx.moveTo(padL, y); cCtx.lineTo(padL + plotW, y); cCtx.stroke();
+            }
+
+            cCtx.textAlign = 'center';
+            cCtx.textBaseline = 'top';
+            const fStep = (curveFMax - curveFMin) > 40 ? 20 : (curveFMax - curveFMin) > 15 ? 5 : 2;
+            for (let f = Math.ceil(curveFMin / fStep) * fStep; f <= curveFMax; f += fStep) {
+                const x = freqToX(f, w, padL, padR);
+                cCtx.fillText(`${f}k`, x, padT + plotH + 6);
+                cCtx.strokeStyle = 'rgba(255,255,255,0.06)';
+                cCtx.beginPath(); cCtx.moveTo(x, padT); cCtx.lineTo(x, padT + plotH); cCtx.stroke();
             }
         }
 
         curveCanvas.addEventListener('mousedown', (e) => {
             curveIsDragging = true;
-            curveDragStartX = e.clientX; curveDragStartY = e.clientY;
+            curveDragStartX = e.clientX;
+            curveDragStartY = e.clientY;
             curveInitFMin = curveFMin; curveInitFMax = curveFMax;
             curveInitDbMin = curveDbMin; curveInitDbMax = curveDbMax;
         });
@@ -1701,7 +2249,7 @@ HTML_PAGE = """<!DOCTYPE html>
             curveMouseX = e.clientX - rect.left;
 
             if (curveIsDragging && currentAnalysis) {
-                const padL = 55, padR = 25, padT = 15, padB = 35;
+                const padL = 55, padR = 25, padT = 20, padB = 35;
                 const plotW = rect.width - padL - padR;
                 const plotH = rect.height - padT - padB;
                 const dx = e.clientX - curveDragStartX;
@@ -1713,7 +2261,7 @@ HTML_PAGE = """<!DOCTYPE html>
                 const df = -(dx / plotW) * curFW;
                 const dDb = (dy / plotH) * curDbW;
 
-                curveFMin = Math.max(0, Math.min(currentAnalysis.nyquist_khz - curFW, curveInitFMin + df));
+                curveFMin = Math.max(0, Math.min(currentAnalysis.nyquist_khz * 1.04 - curFW, curveInitFMin + df));
                 curveFMax = curveFMin + curFW;
 
                 curveDbMin = Math.max(-175.0, Math.min(0.0 - curDbW, curveInitDbMin + dDb));
@@ -1726,7 +2274,7 @@ HTML_PAGE = """<!DOCTYPE html>
         curveCanvas.addEventListener('wheel', (e) => {
             e.preventDefault();
             const rect = curveCanvas.getBoundingClientRect();
-            const padL = 55, padR = 25, padT = 15, padB = 35;
+            const padL = 55, padR = 25, padT = 20, padB = 35;
             const plotW = rect.width - padL - padR;
             const plotH = rect.height - padT - padB;
             const mX = e.clientX - rect.left;
@@ -1762,7 +2310,7 @@ HTML_PAGE = """<!DOCTYPE html>
         }
 
         // Initialize on load
-        loadDirectory(currentPath);
+        loadDirectory(currentPath, true);
     </script>
 </body>
 </html>"""
@@ -1770,8 +2318,9 @@ HTML_PAGE = """<!DOCTYPE html>
 
 class ForensicWebHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
-        # Clean logging
-        sys.stderr.write(f"[{self.log_date_time_string()}] {self.command} {self.path}\n")
+        cmd = getattr(self, 'command', 'HTTP')
+        pth = getattr(self, 'path', '')
+        sys.stderr.write(f"[{self.log_date_time_string()}] {cmd} {pth}\n")
 
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
@@ -1782,11 +2331,18 @@ class ForensicWebHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
-            self.wfile.write(HTML_PAGE.encode("utf-8"))
+            gpu_text = f"⚡ GPU: {html.escape(gpu_engine.device_name)}" if gpu_engine.enabled else "💻 CPU Multi-Thread"
+            gpu_cls = "gpu-badge" if gpu_engine.enabled else "gpu-badge cpu-mode"
+            page_rendered = HTML_PAGE.replace(
+                '<span id="gpuStatusBadge" class="gpu-badge">⚡ GPU Initializing...</span>',
+                f'<span id="gpuStatusBadge" class="{gpu_cls}">{gpu_text}</span>'
+            )
+            self.wfile.write(page_rendered.encode("utf-8"))
 
         elif path == "/api/browse":
             target = params.get("path", [""])[0]
-            data = get_directory_contents(target)
+            fresh_param = params.get("fresh", ["1"])[0] == "1"
+            data = get_directory_contents(target, fresh=fresh_param)
             if data is None:
                 self.send_response(404)
                 self.send_header("Content-Type", "application/json")
@@ -1798,9 +2354,43 @@ class ForensicWebHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(json.dumps(data).encode("utf-8"))
 
+        elif path == "/api/folder_stream":
+            target = params.get("path", [""])[0]
+            fresh_param = params.get("fresh", ["1"])[0] == "1"
+            if not target or not os.path.exists(target) or not os.path.isdir(target):
+                self.send_response(404)
+                self.end_headers()
+                return
+
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+
+            q = folder_scan_mgr.add_listener(target, fresh=fresh_param)
+            try:
+                while True:
+                    try:
+                        event_type, data = q.get(timeout=25.0)
+                        msg = f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
+                        self.wfile.write(msg.encode("utf-8"))
+                        self.wfile.flush()
+                        if event_type == "scan_complete":
+                            break
+                    except queue.Empty:
+                        self.wfile.write(b": ping\n\n")
+                        self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                pass
+            finally:
+                folder_scan_mgr.remove_listener(target, q)
+
         elif path == "/api/analyze":
             target = params.get("path", [""])[0]
-            result = analyze_file_on_demand(target)
+            fresh_param = params.get("fresh", ["1"])[0] == "1"
+            result = analyze_file_on_demand(target, force_fresh=fresh_param)
             self.send_response(200 if result.get("status") == "ok" else 400)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
@@ -1821,7 +2411,6 @@ class ForensicWebHandler(BaseHTTPRequestHandler):
             elif target.lower().endswith(".mp3"): mime = "audio/mpeg"
 
             if range_header:
-                # Byte-range request for seamless audio streaming/seeking
                 range_match = range_header.strip().lower()
                 if range_match.startswith("bytes="):
                     parts = range_match[6:].split("-")
@@ -1896,10 +2485,12 @@ def main():
     print(f"Server URL  : http://localhost:{args.port}")
     print(f"Network URL : http://{args.host}:{args.port}")
     print(f"Mode        : Multi-Threaded Concurrent I/O")
+    print(f"Engine      : {'⚡ GPU Acceleration (' + gpu_engine.device_name + ')' if gpu_engine.enabled else '💻 CPU Multi-Thread'}")
     print(f"Precision   : 64-bit Double Precision (Strict float64)")
     if ACTIVE_RULES_PATH:
         print(f"Rules Path  : {ACTIVE_RULES_PATH}")
-    print(f"Status      : Live & Ready for On-Demand Analysis")
+    print(f"Cache Policy: Fresh Dynamic Re-Analysis upon Folder Entry")
+    print(f"Status      : Live with Real-Time Progressive Badge Streaming")
     print(f"=======================================================\n")
 
     try:

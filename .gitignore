@@ -33,6 +33,12 @@ node_modules/
 package-lock.json
 package.json
 
+# Private Library Audit & Provenance Reports
+PROVENANCE_AUDIT_RECOMMENDATIONS.md
+*provenance*.json
+*audit*.md
+questionnable.png
+
 # IDE and OS metadata
 .DS_Store
 .idea/

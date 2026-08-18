@@ -40,7 +40,7 @@ def probe_audio_info_resilient(filepath):
             "-of", "default=noprint_wrappers=1:nokey=1",
             filepath
         ]
-        out = subprocess.check_output(cmd_probe, text=True, stderr=subprocess.DEVNULL).strip().split()
+        out = subprocess.check_output(cmd_probe, text=True, stderr=subprocess.DEVNULL, timeout=3.0).strip().split()
         if len(out) >= 2:
             sr = int(out[0])
             channels = int(out[1])
@@ -112,7 +112,7 @@ def load_audio_resilient(filepath, dtype='float64', start=0, stop=None, frames=N
             cmd_decode.extend(["-t", str((stop - start) / sr)])
 
         cmd_decode.extend(["-f", fmt, "-acodec", codec, "-"])
-        raw_bytes = subprocess.check_output(cmd_decode, stderr=subprocess.DEVNULL)
+        raw_bytes = subprocess.check_output(cmd_decode, stderr=subprocess.DEVNULL, timeout=10.0)
         if len(raw_bytes) > 0:
             data = np.frombuffer(raw_bytes, dtype=np_dt).reshape(-1, channels)
             return data, sr
@@ -404,7 +404,15 @@ class ProvenanceRuleEngine:
                     "badge_class": cand.get("badge_class", "badge-provenance-leaky")
                 })
 
-        # 3. Evaluate Cutoff & Upsampling Rules
+        # 3. Extract Visual Morphology Metrics (Curvature Knees, Temporal Variance, Rhythmic Coherence, Stopband Purity)
+        visual_metrics = extract_visual_morphology(freqs, mean_spec_db, rms_dbfs, peak_dbfs, stft_mag, sr, nyquist)
+        rhythmic_corr = visual_metrics.get("rhythmic_coherence", 0.0)
+        is_stat_ultra = visual_metrics.get("is_stationary_ultrasonic", False)
+        prime_knee = visual_metrics.get("primary_knee")
+        purity_info = visual_metrics.get("stopband_purity", {})
+        is_messy_stopband = purity_info.get("is_messy", False)
+
+        # 4. Evaluate Cutoff & Upsampling Rules
         cutoff_rules = rules.get("cutoff_rules", [])
         matched_cutoff = None
         
@@ -431,25 +439,35 @@ class ProvenanceRuleEngine:
             floor_margin = c_rule.get("noise_floor_margin_db", None)
             abs_ceiling = c_rule.get("absolute_noise_ceiling_dbfs", None)
 
+            # Local stopband check (5-8 kHz window above cutoff) to remain robust against distant ultrasonic dither humps
+            stop_end_f = min(nyquist, f_high + 7500.0)
+            i_stop_end = np.argmin(np.abs(freqs - stop_end_f))
+            local_stop_rms = float(np.mean(rms_dbfs[i_high:i_stop_end])) if i_stop_end > i_high else float(rms_dbfs[i_high])
+
+            max_stopband_ceiling = max_stopband if max_stopband is not None else -102.0
+
             is_match = False
-            if spec_drop >= min_spec_drop or (min_rms_drop > 0 and rms_drop >= min_rms_drop):
+            if (spec_drop >= min_spec_drop or (min_rms_drop > 0 and rms_drop >= min_rms_drop)) and local_stop_rms < max_stopband_ceiling:
                 is_match = True
-                if max_stopband is not None and rms_dbfs[i_high] > max_stopband:
-                    is_match = False
                 if floor_margin is not None and abs_ceiling is not None:
-                    if not (rms_dbfs[i_high] <= noise_floor_rms + floor_margin or mean_spec_db[i_high] < abs_ceiling):
+                    if not (local_stop_rms <= noise_floor_rms + floor_margin or mean_spec_db[i_high] < abs_ceiling):
+                        is_match = False
+
+                # Prevent false positives on continuous organic/ambient rolloffs in 48kHz containers
+                if c_rule.get("id") == "cutoff_44k" and sr == 48000:
+                    if rhythmic_corr >= 0.65 and not is_stat_ultra and local_stop_rms > -150.0 and rms_drop < 28.0:
                         is_match = False
 
             if is_match:
                 matched_cutoff = c_rule
                 break
 
-        # 4. Measure Effective Signal Bandwidth for Native Assessment
+        # 5. Measure Effective Signal Bandwidth for Native Assessment
         above_floor = (rms_dbfs > (noise_floor_rms + 5.0)) | (mean_spec_db > (noise_floor_spec + 5.0))
         valid_idx = np.where(above_floor)[0]
         effective_bw_hz = float(freqs[valid_idx[-1]]) if len(valid_idx) > 0 else 20000.0
 
-        # 5. Dual Verdict Assembler
+        # 6. Dual Verdict Assembler
         native_cfg = rules.get("native_rules", {})
         alt_cfg = rules.get("alternative_rules", {})
         enable_alts = alt_cfg.get("enable_alternative_hypotheses", True)
@@ -494,9 +512,21 @@ class ProvenanceRuleEngine:
                 "details": f"Sharp anti-aliasing cutoff near {f_boundary_khz:.2f} kHz into container noise floor."
             }
 
-            if enable_alts and leaky_hits:
-                top_leaky = leaky_hits[0]
-                if top_leaky["mirror_corr"] >= alt_cfg.get("mirror_leakage_min_corr", 0.55):
+            if enable_alts:
+                # Check for secondary partial cutoff at 22.05 kHz (e.g. 44.1k stems mixed into 88.2k master)
+                i19 = np.argmin(np.abs(freqs - 19500))
+                i23 = np.argmin(np.abs(freqs - 23000))
+                drop_22k = float(rms_dbfs[i19] - rms_dbfs[i23])
+                if matched_cutoff.get("id") in ["cutoff_88k", "cutoff_96k"] and drop_22k >= 7.0:
+                    alt_prov = {
+                        "label": "Upsampled from 44.1 kHz Master (or Mixed 44.1k Stems)",
+                        "confidence": "Moderate",
+                        "score": 0.65,
+                        "badge_class": "badge-provenance-upsampled",
+                        "details": f"Secondary spectral attenuation of {drop_22k:.1f} dB near 22.05 kHz suggests 44.1 kHz source elements mixed into the master."
+                    }
+                elif leaky_hits and leaky_hits[0]["mirror_corr"] >= alt_cfg.get("mirror_leakage_min_corr", 0.55):
+                    top_leaky = leaky_hits[0]
                     alt_prov = {
                         "label": f"{top_leaky['base_rate_khz']:.1f} kHz Master (Leaky Filter Residual)",
                         "confidence": top_leaky["confidence"],
@@ -530,21 +560,26 @@ class ProvenanceRuleEngine:
                 "details": f"Standard Red Book container with full {sr/1000:.1f} kHz audible passband."
             }
         elif sr == 48000:
-            if effective_bw_hz >= native_cfg.get("sr_48k_high_confidence_bw_hz", 23500):
+            # Check for smooth continuous wideband extension past 22.05 kHz
+            i19 = np.argmin(np.abs(freqs - 19500))
+            i22 = np.argmin(np.abs(freqs - 22050))
+            drop_to_22 = float(rms_dbfs[i19] - rms_dbfs[i22])
+            
+            if (drop_to_22 <= 9.0 and rhythmic_corr >= 0.60) or effective_bw_hz >= native_cfg.get("sr_48k_high_confidence_bw_hz", 23500):
                 primary_prov = {
                     "label": "Native 48.0 kHz Master",
                     "confidence": "High",
-                    "score": 0.90,
+                    "score": 0.92,
                     "badge_class": "badge-provenance-native",
-                    "details": f"Continuous harmonic extension up to {effective_bw_hz/1000:.1f} kHz Nyquist limit."
+                    "details": f"Continuous wideband harmonic extension (r = {rhythmic_corr:+.2f}) with natural acoustic rolloff past 22.05 kHz."
                 }
-            elif effective_bw_hz >= native_cfg.get("sr_48k_mod_confidence_bw_hz", 21500):
+            elif effective_bw_hz >= native_cfg.get("sr_48k_mod_confidence_bw_hz", 21500) or rhythmic_corr >= 0.50:
                 primary_prov = {
                     "label": "Native 48.0 kHz Material",
                     "confidence": "Moderate",
-                    "score": 0.75,
+                    "score": 0.78,
                     "badge_class": "badge-provenance-native",
-                    "details": f"Natural acoustic roll-off extending to ~{effective_bw_hz/1000:.1f} kHz."
+                    "details": f"Natural acoustic roll-off extending to ~{effective_bw_hz/1000:.1f} kHz with dynamic correlation."
                 }
             else:
                 primary_prov = {
@@ -591,6 +626,35 @@ class ProvenanceRuleEngine:
                     "details": f"Container claims {cb}-bit resolution, but the lower {tz} bits are 100% inactive. Effective resolution is {eff}-bit."
                 }
 
+        suspected_base_sr_hz = None
+        suspected_nyquist_hz = None
+        if matched_cutoff is not None:
+            suspected_base_sr_hz = matched_cutoff.get("target_base_hz")
+            suspected_nyquist_hz = (suspected_base_sr_hz / 2.0) if suspected_base_sr_hz else None
+        elif leaky_hits:
+            suspected_base_sr_hz = int(leaky_hits[0]["base_rate_khz"] * 1000)
+            suspected_nyquist_hz = leaky_hits[0]["f_n_khz"] * 1000.0
+
+        # Check for elevated ultrasonic noise/rebound or messy stopband hash
+        has_ultrasonic_noise = False
+        if matched_cutoff is not None:
+            f_boundary = matched_cutoff.get("f_high_hz", 24000)
+            i_stop = np.argmin(np.abs(freqs - (f_boundary + 2000)))
+            i_stop_end = np.argmin(np.abs(freqs - min(nyquist, f_boundary + 8000)))
+            stop_level = float(np.mean(rms_dbfs[i_stop:i_stop_end])) if i_stop_end > i_stop else float(rms_dbfs[i_stop])
+            
+            if (i_stop_end + 5) < len(rms_dbfs):
+                max_ultra_level = float(np.max(rms_dbfs[i_stop_end:]))
+                if max_ultra_level > (stop_level + 4.5) and max_ultra_level > -128.0:
+                    has_ultrasonic_noise = True
+            
+            if (is_stat_ultra or is_messy_stopband) and not has_ultrasonic_noise:
+                has_ultrasonic_noise = True
+
+        recommendation = generate_dsp_recommendation(
+            primary_prov, bitdepth_info, mqa_info, sr, nyquist, effective_bw_hz, has_ultrasonic_noise=has_ultrasonic_noise, purity_info=purity_info
+        )
+
         return {
             "primary": primary_prov,
             "alternative": alt_prov,
@@ -600,9 +664,352 @@ class ProvenanceRuleEngine:
             "badge_class": primary_prov["badge_class"],
             "details": primary_prov["details"],
             "effective_bw_hz": effective_bw_hz,
+            "suspected_base_sr_hz": suspected_base_sr_hz,
+            "suspected_nyquist_hz": suspected_nyquist_hz,
+            "recommendation": recommendation,
+            "visual_morphology": visual_metrics,
             "noise_floor_rms": noise_floor_rms,
             "noise_floor_spec": noise_floor_spec,
             "bitdepth": bitdepth_info
+        }
+
+
+def extract_visual_morphology(freqs, mean_spec_db, rms_dbfs, peak_dbfs, stft_mag, sr, nyquist):
+    """
+    Emulates human visual perception of spectrograms and spectrum curves.
+    Uses strict 64-bit double precision across all gradient, curvature, variance,
+    and cross-band envelope correlation calculations.
+    """
+    from scipy.signal import find_peaks
+    f_khz = freqs / 1000.0
+    
+    # 1. First & Second Derivative (Slope and Curvature "Knee" Detection)
+    bin_hz = sr / (len(freqs) * 2 - 2) if len(freqs) > 1 else 10.0
+    sigma_bins = max(3, int(450.0 / bin_hz))
+    x = np.arange(-3*sigma_bins, 3*sigma_bins + 1)
+    gauss_kernel = np.exp(-0.5 * (x / sigma_bins)**2)
+    gauss_kernel /= np.sum(gauss_kernel)
+
+    smooth_rms = np.convolve(rms_dbfs, gauss_kernel, mode="same")
+    d1 = np.gradient(smooth_rms, f_khz) # slope in dB/kHz
+    d2 = np.gradient(d1, f_khz)        # curvature in dB/kHz^2
+
+    min_idx = np.argmin(np.abs(f_khz - 15.0))
+    max_idx = np.argmin(np.abs(f_khz - (nyquist/1000.0 - 2.0)))
+
+    # Global unconstrained peak detection across the full spectrum
+    d2_sub = d2[min_idx:max_idx]
+    peaks, _ = find_peaks(d2_sub, prominence=0.30, distance=int(1800.0/bin_hz))
+
+    detected_knees = []
+    for p in peaks:
+        idx = min_idx + p
+        f_k = float(f_khz[idx])
+        
+        i_pre = max(0, idx - int(2000.0/bin_hz))
+        pre_slope = float(np.min(d1[i_pre:idx]))
+        
+        i_post = min(len(d1)-1, idx + int(2000.0/bin_hz))
+        post_slope = float(np.mean(d1[idx:i_post]))
+        
+        drop = float(smooth_rms[i_pre] - smooth_rms[idx])
+        level = float(smooth_rms[idx])
+        
+        if pre_slope <= -3.0 and drop >= 4.0:
+            nyq_match = None
+            for cand_nyq, cand_name in [(22.05, "44.1k"), (24.0, "48k"), (44.1, "88.2k"), (48.0, "96k")]:
+                if abs(f_k - cand_nyq) <= 2.5:
+                    nyq_match = cand_name
+                    break
+            
+            detected_knees.append({
+                "freq_khz": round(f_k, 2),
+                "detected_knee_khz": round(f_k, 2),
+                "level_dbfs": round(level, 1),
+                "pre_slope_db_per_khz": round(pre_slope, 1),
+                "steepest_slope_db_per_khz": round(pre_slope, 1),
+                "post_slope_db_per_khz": round(post_slope, 1),
+                "drop_db": round(drop, 1),
+                "max_curvature": round(float(d2[idx]), 2),
+                "matched_nyquist": nyq_match,
+                "is_brickwall_knee": bool(pre_slope <= -4.5 or drop >= 7.0)
+            })
+
+    # Sort knees in frequency order
+    detected_knees.sort(key=lambda k: k["freq_khz"])
+    
+    # Primary knee is the most significant drop/curvature
+    significant_knees = sorted(detected_knees, key=lambda k: k["drop_db"] * abs(k["pre_slope_db_per_khz"]), reverse=True)
+    primary_knee = significant_knees[0] if significant_knees else None
+
+    # 2. Temporal Variance & Stationary Banding Analysis (Music Dynamics vs Constant Dither/Noise)
+    stft_db_slices = 20.0 * np.log10(np.maximum(stft_mag / (np.max(stft_mag) + 1e-12), 1e-12))
+    temp_variance = np.var(stft_db_slices, axis=1)
+    
+    idx_aud = np.where((f_khz >= 1.0) & (f_khz <= 15.0))[0]
+    audible_variance = float(np.mean(temp_variance[idx_aud])) if len(idx_aud) > 0 else 25.0
+    
+    if nyquist >= 40000:
+        idx_ult = np.where((f_khz >= 25.0) & (f_khz <= (nyquist/1000.0 - 2.0)))[0]
+    elif nyquist >= 23000:
+        idx_ult = np.where((f_khz >= 20.5) & (f_khz <= (nyquist/1000.0 - 0.2)))[0]
+    else:
+        idx_ult = np.where((f_khz >= 18.0) & (f_khz <= (nyquist/1000.0 - 0.2)))[0]
+    ultrasonic_variance = float(np.mean(temp_variance[idx_ult])) if len(idx_ult) > 0 else 0.0
+    
+    # 3. Cross-Band Rhythmic Coherence / Correlation
+    rhythmic_coherence = 0.0
+    if len(idx_aud) > 0 and len(idx_ult) > 0:
+        env_audible = np.mean(stft_db_slices[idx_aud, :], axis=0)
+        env_ultra = np.mean(stft_db_slices[idx_ult, :], axis=0)
+        
+        std_a = np.std(env_audible)
+        std_u = np.std(env_ultra)
+        if std_a > 1e-6 and std_u > 1e-6:
+            r = np.corrcoef(env_audible, env_ultra)[0, 1]
+            if not np.isnan(r):
+                rhythmic_coherence = float(r)
+
+    # 4. Stationary Dither / Synthetic Noise Banding Check
+    is_stationary_ultrasonic = bool(ultrasonic_variance < 5.0 and rhythmic_coherence < 0.25 and len(idx_ult) > 0)
+    
+    # 5. Stopband Noise Purity & Cleanliness Analysis
+    stopband_purity = {
+        "is_messy": False,
+        "purity_label": "PRISTINE / UNIFORM DITHER",
+        "description": "Clean uniform noise floor.",
+        "crest_db": 0.0,
+        "max_peak_dbfs": -140.0,
+        "median_rms_dbfs": -140.0,
+        "temporal_variance": 0.0,
+        "undulation_db": 0.0
+    }
+    
+    stop_start_khz = 46.0 if nyquist >= 88200 else 24.0 if nyquist >= 44100 else (nyquist/1000.0)
+    if primary_knee and primary_knee.get("freq_khz", 0) > 0:
+        stop_start_khz = max(stop_start_khz, primary_knee["freq_khz"] + 2.0)
+        
+    i_stop = np.where((f_khz >= stop_start_khz) & (f_khz <= (nyquist/1000.0 - 2.0)))[0]
+    if len(i_stop) > 10:
+        rms_stop = rms_dbfs[i_stop]
+        peak_stop = peak_dbfs[i_stop]
+        
+        median_rms = float(np.median(rms_stop))
+        median_peak = float(np.median(peak_stop))
+        max_peak = float(np.max(peak_stop))
+        peak_to_floor_crest = float(max_peak - median_rms)
+        
+        stft_slices = 20.0 * np.log10(np.maximum(stft_mag[i_stop, :], 1e-12))
+        temp_var = float(np.mean(np.var(stft_slices, axis=1)))
+        
+        win_size = min(30, max(5, len(rms_stop) // 4))
+        smooth_stop = np.convolve(rms_stop, np.ones(win_size)/win_size, mode="valid")
+        undulation_db = float(np.max(smooth_stop) - np.min(smooth_stop)) if len(smooth_stop) > 0 else 0.0
+        
+        is_messy = bool(peak_to_floor_crest >= 24.0 or temp_var >= 50.0 or undulation_db >= 4.0 or max_peak >= -106.0)
+        
+        if is_messy:
+            p_label = "MESSY / SPURIOUS HASH"
+            p_desc = f"Stopband contains sporadic bursts (Variance {temp_var:.1f} dB²) and transient spurs up to {max_peak:.1f} dBFS (+{peak_to_floor_crest:.1f} dB above floor)."
+        elif median_rms > -118.0:
+            p_label = "ELEVATED DITHER HUMP"
+            p_desc = f"Elevated ultrasonic floor ({median_rms:.1f} dBFS) with {undulation_db:.1f} dB undulation."
+        else:
+            p_label = "PRISTINE / UNIFORM DITHER"
+            p_desc = f"Uniform, flat dither floor ({median_rms:.1f} dBFS) with low crest ({peak_to_floor_crest:.1f} dB)."
+            
+        stopband_purity = {
+            "is_messy": is_messy,
+            "purity_label": p_label,
+            "description": p_desc,
+            "crest_db": round(peak_to_floor_crest, 1),
+            "max_peak_dbfs": round(max_peak, 1),
+            "median_rms_dbfs": round(median_rms, 1),
+            "temporal_variance": round(temp_var, 1),
+            "undulation_db": round(undulation_db, 1)
+        }
+
+    return {
+        "detected_knees": detected_knees,
+        "primary_knee": primary_knee,
+        "audible_temporal_variance": round(audible_variance, 2),
+        "ultrasonic_temporal_variance": round(ultrasonic_variance, 2),
+        "rhythmic_coherence": round(rhythmic_coherence, 3),
+        "is_stationary_ultrasonic": is_stationary_ultrasonic,
+        "stopband_purity": stopband_purity
+    }
+
+
+def generate_dsp_recommendation(primary_prov, bitdepth_info, mqa_info, sr, nyquist, effective_bw_hz, has_ultrasonic_noise=False, purity_info=None):
+    if not primary_prov:
+        return None
+        
+    conf = (primary_prov.get("confidence") or "").strip().lower()
+    score = primary_prov.get("score", 0.8)
+    
+    # If the highest confidence is low, do not return any DSP recommendation
+    if conf == "low" or score < 0.50:
+        return None
+
+    is_potential = bool(conf in ["moderate", "medium"] or score < 0.85)
+    action_prefix = "Potential" if is_potential else "Recommended"
+    
+    label = (primary_prov or {}).get("label", "")
+    purity = purity_info or {}
+    is_messy = purity.get("is_messy", False)
+    max_p = purity.get("max_peak_dbfs", -100.0)
+    crest_p = purity.get("crest_db", 0.0)
+    
+    if "Upsampled from 44.1 kHz" in label or ("Upsampled" in label and "44.1" in label):
+        if has_ultrasonic_noise or is_messy:
+            noise_reason = f"transient spurs up to {max_p:.1f} dBFS (+{crest_p:.1f} dB crest)" if is_messy else "elevated 16-bit noise and dither artifacts"
+            return {
+                "action_type": action_prefix,
+                "is_potential": is_potential,
+                "filter_cutoff_khz": 22.05,
+                "action": "Apodizing Low-Pass @ 22.05 kHz (Replace Legacy Cutoff & Cleanse Noise)",
+                "action_short": "Apodize @ 22.05k",
+                "risk_level": "Minimal Risk — Recommended",
+                "risk_class": "risk-minimal",
+                "details": f"Source signal brickwalls at 22.05 kHz, but stopband contains {noise_reason}. When expanding bit-depth or re-upsampling, apply a minimum-phase apodizing filter at 22.05 kHz to replace the legacy transition band, eliminate filter ringing, and purge 16-bit noise before 24-bit Shibata noise shaping.",
+                "dsp_params": "--cutoff 22050 --phase min --dither shibata"
+            }
+        else:
+            return {
+                "action_type": action_prefix,
+                "is_potential": is_potential,
+                "filter_cutoff_khz": 22.05,
+                "action": "Direct Processing (or Apodize @ 22.05 kHz for Bit-Depth Expansion)",
+                "action_short": "Direct / Apodize @ 22.05k",
+                "risk_level": "Zero Risk",
+                "risk_class": "risk-zero",
+                "details": "Clean brickwall cutoff at 22.05 kHz. For direct decimation, process directly. When expanding bit-depth or re-upsampling, applying a minimum-phase apodizing filter at 22.05 kHz improves the transition band, removes legacy ADC ringing, and pre-cleans the noise floor before Shibata dither shaping.",
+                "dsp_params": "--cutoff 22050 --phase min --dither shibata"
+            }
+    elif "Upsampled from 48.0 kHz" in label or ("Upsampled" in label and "48.0" in label):
+        if has_ultrasonic_noise or is_messy:
+            noise_reason = f"transient spurs up to {max_p:.1f} dBFS" if is_messy else "elevated synthetic noise/dither humps"
+            return {
+                "action_type": action_prefix,
+                "is_potential": is_potential,
+                "filter_cutoff_khz": 24.0,
+                "action": "Apodizing Low-Pass @ 24.0 kHz (Replace Legacy Cutoff & Cleanse Noise)",
+                "action_short": "Apodize @ 24.0k",
+                "risk_level": "Minimal Risk — Recommended",
+                "risk_class": "risk-minimal",
+                "details": f"Musical harmonics terminate at 24.0 kHz, but stopband contains {noise_reason}. When expanding bit-depth or re-upsampling, apply a minimum-phase apodizing filter at 24.0 kHz to replace the legacy transition band and purge ultrasonic hash before 24-bit Shibata shaping.",
+                "dsp_params": "--cutoff 24000 --phase min --dither shibata"
+            }
+        else:
+            return {
+                "action_type": action_prefix,
+                "is_potential": is_potential,
+                "filter_cutoff_khz": 24.0,
+                "action": "Direct Processing (or Apodize @ 24.0 kHz for Bit-Depth Expansion)",
+                "action_short": "Direct / Apodize @ 24k",
+                "risk_level": "Zero Risk",
+                "risk_class": "risk-zero",
+                "details": "Clean brickwall cutoff at 24.0 kHz. For direct decimation, process directly. When expanding bit-depth, applying a minimum-phase apodizing filter at 24.0 kHz replaces the legacy transition band and eliminates ringing before 24-bit noise shaping.",
+                "dsp_params": "--cutoff 24000 --phase min --dither shibata"
+            }
+    elif "Upsampled from 88.2 kHz" in label or "Upsampled from 96.0 kHz" in label:
+        fn = 44.1 if "88.2" in label else 48.0
+        if has_ultrasonic_noise or is_messy:
+            noise_reason = f"messy noise hash and transient spurs up to {max_p:.1f} dBFS (+{crest_p:.1f} dB crest)" if is_messy else "elevated ultrasonic noise"
+            return {
+                "action_type": action_prefix,
+                "is_potential": is_potential,
+                "filter_cutoff_khz": fn,
+                "action": f"Pre-Filter Low-Pass @ {fn} kHz (Strip Ultrasonic Noise & Spurs)",
+                "action_short": f"Low-Pass @ {fn}k",
+                "risk_level": "Minimal Risk",
+                "risk_class": "risk-minimal",
+                "details": f"Source signal brickwalls near {fn} kHz, but stopband contains {noise_reason}. Apply a low-pass filter at {fn} kHz before re-upsampling.",
+                "dsp_params": f"--cutoff {int(fn*1000)} --filter min-phase"
+            }
+        else:
+            return {
+                "action_type": action_prefix,
+                "is_potential": is_potential,
+                "filter_cutoff_khz": fn,
+                "action": "Direct Processing / Decimation (Clean Stopband — No Filtering Needed)",
+                "action_short": "Direct Processing",
+                "risk_level": "Zero Risk",
+                "risk_class": "risk-zero",
+                "details": "Clean brickwall cutoff directly into the container quantization floor. No pre-filtering is necessary; process directly or decimate cleanly.",
+                "dsp_params": "--phase min --dither shibata"
+            }
+    elif "Leaky" in label:
+        fn = (primary_prov or {}).get("suspected_nyquist_hz", 22050) / 1000.0 if primary_prov else 22.05
+        f_cut = max(20.0, fn - 0.6)
+        return {
+            "action_type": action_prefix,
+            "is_potential": is_potential,
+            "filter_cutoff_khz": round(f_cut, 1),
+            "action": f"Apodizing Low-Pass Filter @ {f_cut:.1f} kHz",
+            "action_short": f"Apodize @ {f_cut:.1f}k",
+            "risk_level": "Low Risk",
+            "risk_class": "risk-low",
+            "details": f"Mirrored ultrasonic imaging aliases detected above {fn:.2f} kHz. Apply an apodizing minimum-phase filter with stopband notch at {fn:.2f} kHz to remove ultrasonic imaging.",
+            "dsp_params": f"--apodize {int(f_cut*1000)}"
+        }
+    elif "Zero-Stuffed" in label or "NOS" in label:
+        return {
+            "action_type": action_prefix,
+            "is_potential": is_potential,
+            "filter_cutoff_khz": 21.5,
+            "action": "Sharp Reconstruction Low-Pass @ 21.5 kHz",
+            "action_short": "Brickwall LP @ 21.5k",
+            "risk_level": "Low Risk",
+            "risk_class": "risk-low",
+            "details": "Unfiltered mirror images detected across ultrasonic spectrum. Apply steep low-pass brickwall filter at 21.5 kHz to eliminate imaging aliases.",
+            "dsp_params": "--cutoff 21500 --steep"
+        }
+    elif "MQA" in label or (mqa_info and mqa_info.get("is_mqa")):
+        return {
+            "action_type": action_prefix,
+            "is_potential": is_potential,
+            "action": "Adaptive MQA Subband Unfold + Psychoacoustic Gating",
+            "action_short": "Adaptive MQA Unfold",
+            "risk_level": "Minimal Risk",
+            "risk_class": "risk-minimal",
+            "details": "MQA subband packaging detected. Unfold with psychoacoustic noise-gating to reconstruct transient details while suppressing high-frequency quantization noise.",
+            "dsp_params": "--mqa adaptive --dither shibata"
+        }
+    elif bitdepth_info and bitdepth_info.get("is_zero_padded"):
+        tz = bitdepth_info.get("trailing_zero_bits", 8)
+        eff = bitdepth_info.get("effective_bits", 16)
+        return {
+            "action_type": action_prefix,
+            "is_potential": is_potential,
+            "action": f"Direct 64-Bit Processing (Lossless Truncation of {tz} Inactive LSBs)",
+            "action_short": f"Lossless {eff}b Process",
+            "risk_level": "Zero Risk",
+            "risk_class": "risk-zero",
+            "details": f"Container is zero-padded ({eff}-bit audio in 24-bit container). Processing directly in 64-bit float is lossless. Re-dither to true 24-bit with Shibata shaping on output.",
+            "dsp_params": "--precision float64 --dither shibata"
+        }
+    elif "Native" in label:
+        return {
+            "action_type": action_prefix,
+            "is_potential": is_potential,
+            "action": "Direct Polyphase Sinc Upsampling (No Pre-Filtering Required)",
+            "action_short": "Direct Upsampling",
+            "risk_level": "Zero Risk",
+            "risk_class": "risk-zero",
+            "details": "Authentic wideband master with clean acoustic harmonics extending across the container spectrum. Process directly using minimum-phase polyphase sinc interpolation and Shibata noise shaping.",
+            "dsp_params": "--phase min --dither shibata"
+        }
+    else:
+        return {
+            "action_type": action_prefix,
+            "is_potential": is_potential,
+            "action": "Standard Minimum-Phase Sinc Reconstruction",
+            "action_short": "Min-Phase Sinc",
+            "risk_level": "Low Risk",
+            "risk_class": "risk-low",
+            "details": "Standard acoustic profile. Apply minimum-phase sinc reconstruction to preserve time-domain impulse response.",
+            "dsp_params": "--phase min --dither shibata"
         }
 
 
