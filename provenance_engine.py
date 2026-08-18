@@ -652,7 +652,7 @@ class ProvenanceRuleEngine:
                 has_ultrasonic_noise = True
 
         recommendation = generate_dsp_recommendation(
-            primary_prov, bitdepth_info, mqa_info, sr, nyquist, effective_bw_hz, has_ultrasonic_noise=has_ultrasonic_noise, purity_info=purity_info
+            primary_prov, bitdepth_info, mqa_info, sr, nyquist, effective_bw_hz, has_ultrasonic_noise=has_ultrasonic_noise, purity_info=purity_info, visual_morphology=visual_metrics
         )
 
         return {
@@ -695,7 +695,7 @@ def extract_visual_morphology(freqs, mean_spec_db, rms_dbfs, peak_dbfs, stft_mag
     d2 = np.gradient(d1, f_khz)        # curvature in dB/kHz^2
 
     min_idx = np.argmin(np.abs(f_khz - 15.0))
-    max_idx = np.argmin(np.abs(f_khz - (nyquist/1000.0 - 2.0)))
+    max_idx = np.argmin(np.abs(f_khz - (nyquist/1000.0 - 0.2)))
 
     # Global unconstrained peak detection across the full spectrum
     d2_sub = d2[min_idx:max_idx]
@@ -717,7 +717,7 @@ def extract_visual_morphology(freqs, mean_spec_db, rms_dbfs, peak_dbfs, stft_mag
         
         if pre_slope <= -3.0 and drop >= 4.0:
             nyq_match = None
-            for cand_nyq, cand_name in [(22.05, "44.1k"), (24.0, "48k"), (44.1, "88.2k"), (48.0, "96k")]:
+            for cand_nyq, cand_name in [(20.5, "Legacy ADC"), (22.05, "44.1k"), (24.0, "48k"), (44.1, "88.2k"), (48.0, "96k")]:
                 if abs(f_k - cand_nyq) <= 2.5:
                     nyq_match = cand_name
                     break
@@ -738,8 +738,8 @@ def extract_visual_morphology(freqs, mean_spec_db, rms_dbfs, peak_dbfs, stft_mag
     # Sort knees in frequency order
     detected_knees.sort(key=lambda k: k["freq_khz"])
     
-    # Primary knee is the most significant drop/curvature
-    significant_knees = sorted(detected_knees, key=lambda k: k["drop_db"] * abs(k["pre_slope_db_per_khz"]), reverse=True)
+    # Primary knee is the most significant drop/curvature (prioritizing brickwall drops)
+    significant_knees = sorted(detected_knees, key=lambda k: (1.5 if k["is_brickwall_knee"] else 1.0) * k["drop_db"] * abs(k["pre_slope_db_per_khz"]), reverse=True)
     primary_knee = significant_knees[0] if significant_knees else None
 
     # 2. Temporal Variance & Stationary Banding Analysis (Music Dynamics vs Constant Dither/Noise)
@@ -775,59 +775,61 @@ def extract_visual_morphology(freqs, mean_spec_db, rms_dbfs, peak_dbfs, stft_mag
     
     # 5. Stopband Noise Purity & Cleanliness Analysis
     stopband_purity = {
+        "has_stopband": False,
         "is_messy": False,
-        "purity_label": "PRISTINE / UNIFORM DITHER",
-        "description": "Clean uniform noise floor.",
+        "purity_label": "AUTHENTIC WIDEBAND HARMONICS",
+        "description": "Continuous musical harmonics extending across the full container bandwidth.",
         "crest_db": 0.0,
-        "max_peak_dbfs": -140.0,
-        "median_rms_dbfs": -140.0,
-        "temporal_variance": 0.0,
+        "max_peak_dbfs": float(np.max(peak_dbfs[idx_ult])) if len(idx_ult) > 0 else -140.0,
+        "median_rms_dbfs": float(np.median(rms_dbfs[idx_ult])) if len(idx_ult) > 0 else -140.0,
+        "temporal_variance": float(ultrasonic_variance),
         "undulation_db": 0.0
     }
     
-    stop_start_khz = 46.0 if nyquist >= 88200 else 24.0 if nyquist >= 44100 else (nyquist/1000.0)
-    if primary_knee and primary_knee.get("freq_khz", 0) > 0:
-        stop_start_khz = max(stop_start_khz, primary_knee["freq_khz"] + 2.0)
+    # A true stopband ONLY exists if an anti-aliasing cutoff knee was detected below Nyquist
+    if primary_knee and primary_knee.get("detected_knee_khz", 0) > 0:
+        stop_start_khz = primary_knee["detected_knee_khz"] + 1.5
+        i_stop = np.where((f_khz >= stop_start_khz) & (f_khz <= (nyquist/1000.0 - 1.0)))[0]
         
-    i_stop = np.where((f_khz >= stop_start_khz) & (f_khz <= (nyquist/1000.0 - 2.0)))[0]
-    if len(i_stop) > 10:
-        rms_stop = rms_dbfs[i_stop]
-        peak_stop = peak_dbfs[i_stop]
-        
-        median_rms = float(np.median(rms_stop))
-        median_peak = float(np.median(peak_stop))
-        max_peak = float(np.max(peak_stop))
-        peak_to_floor_crest = float(max_peak - median_rms)
-        
-        stft_slices = 20.0 * np.log10(np.maximum(stft_mag[i_stop, :], 1e-12))
-        temp_var = float(np.mean(np.var(stft_slices, axis=1)))
-        
-        win_size = min(30, max(5, len(rms_stop) // 4))
-        smooth_stop = np.convolve(rms_stop, np.ones(win_size)/win_size, mode="valid")
-        undulation_db = float(np.max(smooth_stop) - np.min(smooth_stop)) if len(smooth_stop) > 0 else 0.0
-        
-        is_messy = bool(peak_to_floor_crest >= 24.0 or temp_var >= 50.0 or undulation_db >= 4.0 or max_peak >= -106.0)
-        
-        if is_messy:
-            p_label = "MESSY / SPURIOUS HASH"
-            p_desc = f"Stopband contains sporadic bursts (Variance {temp_var:.1f} dB²) and transient spurs up to {max_peak:.1f} dBFS (+{peak_to_floor_crest:.1f} dB above floor)."
-        elif median_rms > -118.0:
-            p_label = "ELEVATED DITHER HUMP"
-            p_desc = f"Elevated ultrasonic floor ({median_rms:.1f} dBFS) with {undulation_db:.1f} dB undulation."
-        else:
-            p_label = "PRISTINE / UNIFORM DITHER"
-            p_desc = f"Uniform, flat dither floor ({median_rms:.1f} dBFS) with low crest ({peak_to_floor_crest:.1f} dB)."
+        if len(i_stop) > 8:
+            rms_stop = rms_dbfs[i_stop]
+            peak_stop = peak_dbfs[i_stop]
             
-        stopband_purity = {
-            "is_messy": is_messy,
-            "purity_label": p_label,
-            "description": p_desc,
-            "crest_db": round(peak_to_floor_crest, 1),
-            "max_peak_dbfs": round(max_peak, 1),
-            "median_rms_dbfs": round(median_rms, 1),
-            "temporal_variance": round(temp_var, 1),
-            "undulation_db": round(undulation_db, 1)
-        }
+            median_rms = float(np.median(rms_stop))
+            median_peak = float(np.median(peak_stop))
+            max_peak = float(np.max(peak_stop))
+            peak_to_floor_crest = float(max_peak - median_rms)
+            
+            stft_slices = 20.0 * np.log10(np.maximum(stft_mag[i_stop, :], 1e-12))
+            temp_var = float(np.mean(np.var(stft_slices, axis=1)))
+            
+            win_size = min(30, max(5, len(rms_stop) // 4))
+            smooth_stop = np.convolve(rms_stop, np.ones(win_size)/win_size, mode="valid")
+            undulation_db = float(np.max(smooth_stop) - np.min(smooth_stop)) if len(smooth_stop) > 0 else 0.0
+            
+            is_messy = bool(peak_to_floor_crest >= 24.0 or temp_var >= 50.0 or undulation_db >= 4.0 or max_peak >= -106.0)
+            
+            if is_messy:
+                p_label = "MESSY / SPURIOUS HASH"
+                p_desc = f"Stopband above {stop_start_khz:.1f} kHz contains sporadic bursts (Variance {temp_var:.1f} dB²) and transient spurs up to {max_peak:.1f} dBFS (+{peak_to_floor_crest:.1f} dB above floor)."
+            elif median_rms > -118.0:
+                p_label = "ELEVATED DITHER HUMP"
+                p_desc = f"Elevated ultrasonic stopband floor above {stop_start_khz:.1f} kHz ({median_rms:.1f} dBFS) with {undulation_db:.1f} dB undulation."
+            else:
+                p_label = "PRISTINE / UNIFORM DITHER"
+                p_desc = f"Uniform, flat dither floor above {stop_start_khz:.1f} kHz ({median_rms:.1f} dBFS) with low crest ({peak_to_floor_crest:.1f} dB)."
+                
+            stopband_purity = {
+                "has_stopband": True,
+                "is_messy": is_messy,
+                "purity_label": p_label,
+                "description": p_desc,
+                "crest_db": round(peak_to_floor_crest, 1),
+                "max_peak_dbfs": round(max_peak, 1),
+                "median_rms_dbfs": round(median_rms, 1),
+                "temporal_variance": round(temp_var, 1),
+                "undulation_db": round(undulation_db, 1)
+            }
 
     return {
         "detected_knees": detected_knees,
@@ -840,7 +842,7 @@ def extract_visual_morphology(freqs, mean_spec_db, rms_dbfs, peak_dbfs, stft_mag
     }
 
 
-def generate_dsp_recommendation(primary_prov, bitdepth_info, mqa_info, sr, nyquist, effective_bw_hz, has_ultrasonic_noise=False, purity_info=None):
+def generate_dsp_recommendation(primary_prov, bitdepth_info, mqa_info, sr, nyquist, effective_bw_hz, has_ultrasonic_noise=False, purity_info=None, visual_morphology=None):
     if not primary_prov:
         return None
         
@@ -990,16 +992,31 @@ def generate_dsp_recommendation(primary_prov, bitdepth_info, mqa_info, sr, nyqui
             "dsp_params": "--precision float64 --dither shibata"
         }
     elif "Native" in label:
-        return {
-            "action_type": action_prefix,
-            "is_potential": is_potential,
-            "action": "Direct Polyphase Sinc Upsampling (No Pre-Filtering Required)",
-            "action_short": "Direct Upsampling",
-            "risk_level": "Zero Risk",
-            "risk_class": "risk-zero",
-            "details": "Authentic wideband master with clean acoustic harmonics extending across the container spectrum. Process directly using minimum-phase polyphase sinc interpolation and Shibata noise shaping.",
-            "dsp_params": "--phase min --dither shibata"
-        }
+        pk = (visual_morphology or {}).get("primary_knee")
+        if pk and pk.get("is_brickwall_knee") and 19.5 <= pk.get("freq_khz", 0) <= 21.6:
+            fk = pk["freq_khz"]
+            return {
+                "action_type": action_prefix,
+                "is_potential": is_potential,
+                "filter_cutoff_khz": round(fk, 1),
+                "action": f"Apodizing Low-Pass @ {fk:.1f} kHz (Replace Legacy ADC Cutoff & Cleanse Noise)",
+                "action_short": f"Apodize @ {fk:.1f}k",
+                "risk_level": "Minimal Risk — Recommended",
+                "risk_class": "risk-minimal",
+                "details": f"Original studio ADC anti-aliasing filter knee detected at {fk:.1f} kHz (plunging {pk.get('drop_db', 0):.1f} dB into noise floor). Applying a minimum-phase apodizing filter at {fk:.1f} kHz replaces the steep legacy brickwall transition, eliminates ADC filter ringing, and purges empty noise above {fk:.1f} kHz before 24-bit Shibata upsampling.",
+                "dsp_params": f"--cutoff {int(fk*1000)} --phase min --dither shibata"
+            }
+        else:
+            return {
+                "action_type": action_prefix,
+                "is_potential": is_potential,
+                "action": "Direct Polyphase Sinc Upsampling (No Pre-Filtering Required)",
+                "action_short": "Direct Upsampling",
+                "risk_level": "Zero Risk",
+                "risk_class": "risk-zero",
+                "details": "Authentic wideband master with clean acoustic harmonics extending across the container spectrum. Process directly using minimum-phase polyphase sinc interpolation and Shibata noise shaping.",
+                "dsp_params": "--phase min --dither shibata"
+            }
     else:
         return {
             "action_type": action_prefix,

@@ -1526,7 +1526,12 @@ HTML_PAGE = """<!DOCTYPE html>
                     const purityEl = document.getElementById('visPurityBadge');
                     if (v.stopband_purity) {
                         const pur = v.stopband_purity;
-                        if (pur.is_messy) {
+                        if (!pur.has_stopband) {
+                            purityEl.textContent = `✨ Passband: Authentic Harmonics (Peak ${pur.max_peak_dbfs} dBFS)`;
+                            purityEl.style.color = 'var(--accent-cyan)';
+                            purityEl.style.borderColor = 'rgba(0, 229, 255, 0.4)';
+                            purityEl.title = pur.description;
+                        } else if (pur.is_messy) {
                             purityEl.textContent = `📻 Stopband: Messy Hash (Spurs: ${pur.max_peak_dbfs} dBFS, +${pur.crest_db} dB)`;
                             purityEl.style.color = '#ff7043';
                             purityEl.style.borderColor = 'rgba(255, 112, 67, 0.4)';
