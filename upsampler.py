@@ -716,7 +716,7 @@ def scan_album(files):
 # TRACK PROCESSOR
 # ==============================================================================
 
-def process_track(filepath, dest_dir, gain_factor, album_max_peak_lin, queue, phase_mode, dither_mode, tmp_dir, apodizing=False, mqa_mode='adaptive', cutoff_hz=None, steep=False):
+def process_track(filepath, dest_dir, gain_factor, album_max_peak_lin, queue, phase_mode, dither_mode, tmp_dir, apodizing=False, mqa_mode='adaptive', cutoff_hz=None, steep=False, force=False):
     t0 = time.time()
     def elapsed(): return f"[+{time.time() - t0:6.2f}s]"
 
@@ -724,8 +724,13 @@ def process_track(filepath, dest_dir, gain_factor, album_max_peak_lin, queue, ph
     dest_path = os.path.join(dest_dir, filename)
     wip_path = dest_path + ".WIP"
 
-    if os.path.exists(dest_path):
-        print(f"   [Skip] Output exists: {filename}")
+    # Bulletproof Safety Guard: Never overwrite original source file
+    if os.path.abspath(filepath) == os.path.abspath(dest_path):
+        print(f"   [Fatal Safety Error] Target path matches original source file ({dest_path}). Skipping to protect original.")
+        return False, 0.0, None
+
+    if os.path.exists(dest_path) and not force:
+        print(f"   [Skip] Output exists: {filename} (use --force to overwrite)")
         return False, 0.0, None
 
     try: 
@@ -872,16 +877,21 @@ def process_track(filepath, dest_dir, gain_factor, album_max_peak_lin, queue, ph
 # ALBUM BATCH CONTROLLER WITH RETRY AUTO-HEALING
 # ==============================================================================
 
-def process_album_folder(source_album_dir, dest_album_dir, queue, phase_mode, dither_mode, tmp_dir, apodizing=False, mqa_mode='adaptive', cutoff_hz=None, steep=False):
+def process_album_folder(source_album_dir, dest_album_dir, queue, phase_mode, dither_mode, tmp_dir, apodizing=False, mqa_mode='adaptive', cutoff_hz=None, steep=False, force=False):
     print(f"\n==================================================")
     print(f"Directory:   {source_album_dir}")
     print(f"Destination: {dest_album_dir}")
     print(f"==================================================")
 
+    # Bulletproof Safety Guard: Destination cannot be identical to source directory
+    if os.path.abspath(source_album_dir) == os.path.abspath(dest_album_dir):
+        print(f"[Fatal Safety Error] Destination directory is identical to source directory: {source_album_dir}. Skipping album to protect original files.")
+        return
+
     files = get_audio_files(source_album_dir)
     if not files: return
-    if all(os.path.exists(os.path.join(dest_album_dir, os.path.basename(f))) for f in files):
-        print(f">>> All {len(files)} target files already exist in {dest_album_dir}. Skipping album.")
+    if not force and all(os.path.exists(os.path.join(dest_album_dir, os.path.basename(f))) for f in files):
+        print(f">>> All {len(files)} target files already exist in {dest_album_dir}. Skipping album. (Use --force to overwrite)")
         return
 
     os.makedirs(dest_album_dir, exist_ok=True)
@@ -903,7 +913,7 @@ def process_album_folder(source_album_dir, dest_album_dir, queue, phase_mode, di
 
         for idx, f in enumerate(files, 1):
             print(f"\n--- Track [{idx}/{len(files)}] ---")
-            clipped, out_peak, fut = process_track(f, dest_album_dir, gain_factor, album_max_peak_lin, queue, phase_mode, dither_mode, tmp_dir, apodizing=apodizing, mqa_mode=mqa_mode, cutoff_hz=cutoff_hz, steep=steep)
+            clipped, out_peak, fut = process_track(f, dest_album_dir, gain_factor, album_max_peak_lin, queue, phase_mode, dither_mode, tmp_dir, apodizing=apodizing, mqa_mode=mqa_mode, cutoff_hz=cutoff_hz, steep=steep, force=force)
             if fut is not None:
                 pass_futures.append(fut)
             if clipped:
@@ -965,6 +975,7 @@ def main():
     parser.add_argument("source", help="Source audio file or root directory containing album folders")
     parser.add_argument("target", nargs="?", default=None, help="Target output directory (optional, default: <source>_upsampled_<topology>)")
     parser.add_argument("-o", "--output-dir", default=None, help="Explicit target output directory")
+    parser.add_argument("-f", "--force", action="store_true", help="Force re-processing and overwrite existing target output files")
     parser.add_argument("--phase", choices=['linear', 'min', 'minimum'], default='linear', help="Filter phase mode: linear (symmetric) or min (minimum phase, causal)")
     parser.add_argument("--apodizing", "--apod", action="store_true", help="Enable Apodizing transition band to attenuate pre-existing studio ADC ringing")
     parser.add_argument("--cutoff", "--apodize", type=float, default=None, help="Custom low-pass reconstruction filter cutoff frequency in Hz (e.g. 20700, 21500, 22050, 44100)")
@@ -995,6 +1006,8 @@ def main():
     phase_name = "MINIMUM PHASE" if is_min else "LINEAR PHASE"
     topology_name = f"{phase_name} APODIZING" if args.apodizing else phase_name
     topology_suffix = ("min_apod" if args.apodizing else "min") if is_min else ("linear_apod" if args.apodizing else "linear")
+    if args.cutoff:
+        topology_suffix += f"_{int(args.cutoff)}hz"
 
     target_dir = args.output_dir or args.target
     if not target_dir:
@@ -1005,6 +1018,18 @@ def main():
             target_dir = f"{source_path.rstrip(os.sep)}_upsampled_{topology_suffix}"
 
     target_dir = os.path.abspath(target_dir)
+
+    # Bulletproof Safety Guard: Target cannot be identical to source
+    if os.path.abspath(source_path) == os.path.abspath(target_dir):
+        print(f"[Fatal Safety Error] Target directory cannot be identical to source path ({target_dir}). Aborting to protect original files.")
+        sys.exit(1)
+
+    if os.path.isfile(source_path):
+        src_file_dir = os.path.abspath(os.path.dirname(source_path))
+        if os.path.abspath(target_dir) == src_file_dir:
+            print(f"[Fatal Safety Error] Output directory cannot be identical to the source file directory ({target_dir}). Please specify a distinct target directory or use the default auto-named directory.")
+            sys.exit(1)
+
     dither_mode = "none" if args.no_dither else args.dither
     tmp_dir = os.path.abspath(args.tmp_dir)
     os.makedirs(tmp_dir, exist_ok=True)
@@ -1019,6 +1044,7 @@ def main():
     print(f"Phase Mode      : {phase_name}")
     print(f"Cutoff Frequency: {f'{args.cutoff:,.0f} Hz' if args.cutoff else 'Nyquist Bandwidth'}")
     print(f"Apodizing Filter: {'ENABLED' if args.apodizing else 'DISABLED (Full Sinc Bandwidth)'}")
+    print(f"Force Overwrite : {'ENABLED (--force)' if args.force else 'DISABLED (Skip Existing)'}")
     print(f"Noise Shaping   : {dither_mode.upper()} (In-Register Double Precision)")
     print(f"MQA Processing  : {args.mqa.upper()}")
     print(f"FLAC Compression: Level 5 (Strict)")
@@ -1030,13 +1056,13 @@ def main():
 
     if os.path.isfile(source_path):
         gain_factor, pk = scan_album([source_path])
-        clipped, out_peak, fut = process_track(source_path, target_dir, gain_factor, pk, queue, args.phase, dither_mode, tmp_dir, apodizing=args.apodizing, mqa_mode=args.mqa, cutoff_hz=args.cutoff, steep=args.steep)
+        clipped, out_peak, fut = process_track(source_path, target_dir, gain_factor, pk, queue, args.phase, dither_mode, tmp_dir, apodizing=args.apodizing, mqa_mode=args.mqa, cutoff_hz=args.cutoff, steep=args.steep, force=args.force)
         if clipped and out_peak > PEAK_TARGET_LIN:
             overshoot_ratio = PEAK_TARGET_LIN / out_peak
             safety_margin_lin = 10.0 ** (-0.2 / 20.0)
             gain_factor *= (overshoot_ratio * safety_margin_lin)
             print(f">>> Retrying single file with exact calculated Gain Factor: {gain_factor:.6f}")
-            process_track(source_path, target_dir, gain_factor, pk, queue, args.phase, dither_mode, tmp_dir, apodizing=args.apodizing, mqa_mode=args.mqa, cutoff_hz=args.cutoff, steep=args.steep)
+            process_track(source_path, target_dir, gain_factor, pk, queue, args.phase, dither_mode, tmp_dir, apodizing=args.apodizing, mqa_mode=args.mqa, cutoff_hz=args.cutoff, steep=args.steep, force=args.force)
         file_writer_pool.shutdown(wait=True)
         return
 
@@ -1056,7 +1082,7 @@ def main():
         print(f"\n==================================================")
         print(f"[Album {idx}/{len(album_directories)}]")
         try:
-            process_album_folder(alb_dir, dest_alb, queue, args.phase, dither_mode, tmp_dir, apodizing=args.apodizing, mqa_mode=args.mqa, cutoff_hz=args.cutoff, steep=args.steep)
+            process_album_folder(alb_dir, dest_alb, queue, args.phase, dither_mode, tmp_dir, apodizing=args.apodizing, mqa_mode=args.mqa, cutoff_hz=args.cutoff, steep=args.steep, force=args.force)
         except Exception as e:
             err_msg = f"[Album {idx} Skipped on Error]: {alb_dir}\nDetails: {e}"
             print(f"\n{err_msg}\n>>> Continuing to next album...")
