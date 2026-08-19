@@ -35,12 +35,24 @@ def calculate_dynamic_range_metrics(y, sr):
     2. ITU-R BS.1770-4 / EBU R128 Integrated Loudness (LUFS) and Loudness Range (LRA in LU)
     3. Peak-to-RMS Crest Factor (dB)
     """
+    if y is None or len(y) == 0:
+        return {
+            "dr_score": 0,
+            "dr_val": 0.0,
+            "crest_factor_db": 0.0,
+            "integrated_lufs": -70.0,
+            "lra_lu": 0.0,
+            "peak_dbfs": -140.0,
+            "rms_dbfs": -140.0,
+            "noise_floor_dbfs": -140.0
+        }
+
     # 1. Official TT Dynamic Range (3-second blocks, top 20% loudest RMS vs peak)
-    block_len = int(sr * 3.0)
+    block_len = max(1, int(sr * 3.0))
     if len(y) < block_len:
         block_len = len(y)
 
-    num_blocks = len(y) // block_len
+    num_blocks = len(y) // block_len if block_len > 0 else 0
     if num_blocks > 0:
         blocks = y[:num_blocks * block_len].reshape(num_blocks, block_len)
         block_rms = np.sqrt(np.mean(blocks**2, axis=1))

@@ -585,13 +585,19 @@ def get_destination_dir(source_dir, root_source_dir, root_target_dir):
     rel_path = os.path.relpath(source_dir, root_source_dir)
     return os.path.join(root_target_dir, rel_path)
 
-def get_audio_files(directory):
+def get_audio_files(directory, recursive=False):
     audio_files = []
     try:
-        with os.scandir(directory) as entries:
-            for entry in entries:
-                if entry.is_file() and entry.name.lower().endswith(('.flac', '.wav')):
-                    audio_files.append(entry.path)
+        if recursive:
+            for r, _, f in os.walk(directory):
+                for file in f:
+                    if file.lower().endswith(('.flac', '.wav')):
+                        audio_files.append(os.path.join(r, file))
+        else:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    if entry.is_file() and entry.name.lower().endswith(('.flac', '.wav')):
+                        audio_files.append(entry.path)
     except Exception:
         pass
     return sorted(audio_files)
@@ -1005,7 +1011,19 @@ def audit_and_resolve_recommendation(source_path, files, args):
     print(f"🔬 RUNNING FORENSIC DSP AUDIT & PROVENANCE ANALYSIS")
     print(f"=======================================================")
 
-    sample_file = files[0] if files else source_path
+    if not files:
+        if os.path.isfile(source_path):
+            sample_file = source_path
+        else:
+            rec_files = get_audio_files(source_path, recursive=True)
+            if rec_files:
+                sample_file = rec_files[0]
+            else:
+                print(f"[AcoustiSinc] No audio files found under {source_path}")
+                return args
+    else:
+        sample_file = files[0]
+
     try:
         data, sr = sf.read(sample_file, frames=int(192000 * 25), dtype='float64', always_2d=True)
     except Exception:
@@ -1132,6 +1150,8 @@ def main():
         all_src_files = [source_path]
     else:
         all_src_files = get_audio_files(source_path)
+        if not all_src_files:
+            all_src_files = get_audio_files(source_path, recursive=True)
 
     # Audit & resolve recommendations if requested
     args = audit_and_resolve_recommendation(source_path, all_src_files, args)
