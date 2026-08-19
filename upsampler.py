@@ -98,7 +98,7 @@ __kernel void sinc_interpolate_multichannel_gpu(
         }
         out_spec[out_idx] = val;
     } else if (gid == in_len - 1) {
-        double2 val = (double2)(in_spec[in_idx].x * 0.5, in_spec[in_idx].y * 0.5);
+        double2 val = (in_len == out_len) ? in_spec[in_idx] : (double2)(in_spec[in_idx].x * 0.5, in_spec[in_idx].y * 0.5);
         if (apply_filter) {
             double2 k = filter_kernel[gid];
             val = (double2)(val.x * k.x - val.y * k.y, val.x * k.y + val.y * k.x);
@@ -111,12 +111,12 @@ __kernel void sinc_interpolate_multichannel_gpu(
 
 __kernel void init_min_phase_log_mag(
     __global double2 *log_mag_spec,
-    const ulong padded_len,
+    const ulong in_len,
     const ulong k_cutoff,
     const ulong w
 ) {
     ulong gid = get_global_id(0);
-    if (gid >= padded_len) return;
+    if (gid >= in_len) return;
 
     double mag_val = 1e-12;
     ulong start_taper = (k_cutoff > w) ? (k_cutoff - w) : 0;
@@ -136,13 +136,13 @@ __kernel void init_min_phase_log_mag(
 
 __kernel void apply_cepstral_window(
     __global double *cep,
-    const ulong n_out
+    const ulong n_in
 ) {
     ulong gid = get_global_id(0);
-    if (gid >= n_out) return;
+    if (gid >= n_in) return;
 
-    double inv_n = 1.0 / (double)n_out;
-    ulong half_n = n_out / 2;
+    double inv_n = 1.0 / (double)n_in;
+    ulong half_n = n_in / 2;
 
     if (gid == 0 || gid == half_n) {
         cep[gid] *= inv_n;
@@ -155,10 +155,10 @@ __kernel void apply_cepstral_window(
 
 __kernel void complex_exp_inplace(
     __global double2 *spec,
-    const ulong padded_len
+    const ulong in_len
 ) {
     ulong gid = get_global_id(0);
-    if (gid >= padded_len) return;
+    if (gid >= in_len) return;
 
     double2 z = spec[gid];
     double exp_x = exp(z.x);
@@ -167,12 +167,12 @@ __kernel void complex_exp_inplace(
 
 __kernel void init_apodizing_filter(
     __global double2 *filter_spec,
-    const ulong padded_len,
+    const ulong in_len,
     const ulong cutoff_bin,
     const ulong transition_bins
 ) {
     ulong gid = get_global_id(0);
-    if (gid >= padded_len) return;
+    if (gid >= in_len) return;
 
     double mag_val = 0.0;
     ulong start_taper = (cutoff_bin > transition_bins) ? (cutoff_bin - transition_bins) : 0;
@@ -204,7 +204,7 @@ def get_sinc_kernel(ctx, kernel_name):
         CL_KERNELS[kernel_name] = cl.Kernel(prg, kernel_name)
     return CL_KERNELS[kernel_name]
 
-def get_gpu_filter_kernel(queue, fast_output_len, padded_len, in_len, scale_factor, phase_mode="linear", apodizing=False, cutoff_hz=None, src_sr=None, steep=False):
+def get_gpu_filter_kernel(queue, fast_input_len, in_len, phase_mode="linear", apodizing=False, cutoff_hz=None, src_sr=None, steep=False):
     p = phase_mode.lower()
     is_min = p in ['min', 'minimum']
     
@@ -219,7 +219,7 @@ def get_gpu_filter_kernel(queue, fast_output_len, padded_len, in_len, scale_fact
     if not is_min and not apodizing:
         return None, 0
 
-    key = (padded_len, in_len, k_cutoff, scale_factor, is_min, apodizing, steep)
+    key = (fast_input_len, in_len, k_cutoff, is_min, apodizing, steep)
     if key in GPU_FILTER_CACHE:
         return GPU_FILTER_CACHE[key], 1
 
@@ -228,7 +228,7 @@ def get_gpu_filter_kernel(queue, fast_output_len, padded_len, in_len, scale_fact
         GPU_FILTER_CACHE.clear()
 
     trans_bw = 500.0 if steep else 2000.0
-    ref_nyq = (src_sr / 2.0) if src_sr is not None else (22050.0 if in_len > 22050 else 44100.0)
+    ref_nyq = (src_sr / 2.0) if src_sr is not None else 22050.0
     transition_bins = max(16, int((in_len - 1) * trans_bw / ref_nyq)) if (apodizing or cutoff_hz) else max(16, int((in_len - 1) * 250.0 / ref_nyq))
 
     if is_min:
@@ -237,10 +237,10 @@ def get_gpu_filter_kernel(queue, fast_output_len, padded_len, in_len, scale_fact
         k_window = get_sinc_kernel(queue.context, "apply_cepstral_window")
         k_exp = get_sinc_kernel(queue.context, "complex_exp_inplace")
 
-        gpu_log_mag = cla.empty(queue, (padded_len,), dtype=np.complex128)
+        gpu_log_mag = cla.empty(queue, (in_len,), dtype=np.complex128)
         k_init(
-            queue, (padded_len,), None,
-            gpu_log_mag.data, np.uint64(padded_len), np.uint64(k_cutoff), np.uint64(transition_bins)
+            queue, (in_len,), None,
+            gpu_log_mag.data, np.uint64(in_len), np.uint64(k_cutoff), np.uint64(transition_bins)
         )
         
         # 1D IFFT to cepstral domain in double precision
@@ -248,8 +248,8 @@ def get_gpu_filter_kernel(queue, fast_output_len, padded_len, in_len, scale_fact
         
         # Apply causal step window + normalization in-place
         k_window(
-            queue, (fast_output_len,), None,
-            gpu_cep.data, np.uint64(fast_output_len)
+            queue, (fast_input_len,), None,
+            gpu_cep.data, np.uint64(fast_input_len)
         )
         
         # 1D RFFT back to frequency domain
@@ -257,8 +257,8 @@ def get_gpu_filter_kernel(queue, fast_output_len, padded_len, in_len, scale_fact
         
         # In-place complex exponential: exp(u + i*v)
         k_exp(
-            queue, (padded_len,), None,
-            d_kernel.data, np.uint64(padded_len)
+            queue, (in_len,), None,
+            d_kernel.data, np.uint64(in_len)
         )
         queue.finish()
         
@@ -266,10 +266,10 @@ def get_gpu_filter_kernel(queue, fast_output_len, padded_len, in_len, scale_fact
     else:
         # Linear Phase Apodizing Kernel
         k_apod = get_sinc_kernel(queue.context, "init_apodizing_filter")
-        d_kernel = cla.empty(queue, (padded_len,), dtype=np.complex128)
+        d_kernel = cla.empty(queue, (in_len,), dtype=np.complex128)
         k_apod(
-            queue, (padded_len,), None,
-            d_kernel.data, np.uint64(padded_len), np.uint64(k_cutoff), np.uint64(transition_bins)
+            queue, (in_len,), None,
+            d_kernel.data, np.uint64(in_len), np.uint64(k_cutoff), np.uint64(transition_bins)
         )
         queue.finish()
 
@@ -304,7 +304,7 @@ def upsample_multichannel_gpu(pcm_data, scale_factor, queue, phase_mode="linear"
     gpu_freq = rfftn(gpu_in, ndim=1)
 
     # 3. Sinc Zero-Padding + Filter Multiplication entirely inside VRAM
-    d_kernel, apply_filter = get_gpu_filter_kernel(queue, fast_output_len, padded_spectrum_shape, fft_in_shape, scale_factor, phase_mode, apodizing, cutoff_hz, src_sr, steep)
+    d_kernel, apply_filter = get_gpu_filter_kernel(queue, fast_input_len, fft_in_shape, phase_mode, apodizing, cutoff_hz, src_sr, steep)
     kernel_data = d_kernel.data if d_kernel is not None else gpu_freq.data
 
     gpu_padded = cla.empty(queue, (num_channels, padded_spectrum_shape), dtype=np.complex128)
@@ -783,7 +783,8 @@ def process_track(filepath, dest_dir, gain_factor, album_max_peak_lin, queue, ph
 
     data = data * gain_factor
 
-    if scale_factor == 1:
+    needs_filtering = (cutoff_hz is not None) or apodizing or (phase_mode.lower() in ['min', 'minimum'])
+    if scale_factor == 1 and not needs_filtering:
         out_int32 = apply_dither_and_noise_shaping(data, dither_mode)
         fut = file_writer_pool.submit(save_and_tag_async, wip_path, dest_path, out_int32, target_rate, filepath, t0, np.max(np.abs(data)), album_max_peak_lin, gain_factor)
         return False, np.max(np.abs(data)), fut

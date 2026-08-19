@@ -807,11 +807,14 @@ def extract_visual_morphology(freqs, mean_spec_db, rms_dbfs, peak_dbfs, stft_mag
             smooth_stop = np.convolve(rms_stop, np.ones(win_size)/win_size, mode="valid")
             undulation_db = float(np.max(smooth_stop) - np.min(smooth_stop)) if len(smooth_stop) > 0 else 0.0
             
-            is_messy = bool(peak_to_floor_crest >= 24.0 or temp_var >= 50.0 or undulation_db >= 4.0 or max_peak >= -106.0)
+            is_messy = bool((peak_to_floor_crest >= 24.0 or temp_var >= 50.0 or undulation_db >= 4.0 or max_peak >= -106.0) and median_rms > -135.0 and max_peak > -120.0)
             
             if is_messy:
                 p_label = "MESSY / SPURIOUS HASH"
                 p_desc = f"Stopband above {stop_start_khz:.1f} kHz contains sporadic bursts (Variance {temp_var:.1f} dB²) and transient spurs up to {max_peak:.1f} dBFS (+{peak_to_floor_crest:.1f} dB above floor)."
+            elif median_rms <= -135.0 or max_peak <= -120.0:
+                p_label = "PRISTINE DIGITAL BLACK"
+                p_desc = f"Cleaned stopband above {stop_start_khz:.1f} kHz in deep digital silence ({median_rms:.1f} dBFS) with inaudible noise floor."
             elif median_rms > -118.0:
                 p_label = "ELEVATED DITHER HUMP"
                 p_desc = f"Elevated ultrasonic stopband floor above {stop_start_khz:.1f} kHz ({median_rms:.1f} dBFS) with {undulation_db:.1f} dB undulation."
