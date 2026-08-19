@@ -930,19 +930,19 @@ def generate_dsp_recommendation(primary_prov, bitdepth_info, mqa_info, sr, nyqui
                 "risk_level": "Minimal Risk",
                 "risk_class": "risk-minimal",
                 "details": f"Source signal brickwalls near {fn} kHz, but stopband contains {noise_reason}. Apply a low-pass filter at {fn} kHz before re-upsampling.",
-                "dsp_params": f"--cutoff {int(fn*1000)} --filter min-phase"
+                "dsp_params": f"--cutoff {int(fn*1000)} --phase min --dither shibata"
             }
         else:
             return {
                 "action_type": action_prefix,
                 "is_potential": is_potential,
                 "filter_cutoff_khz": fn,
-                "action": "Direct Processing / Decimation (Clean Stopband — No Filtering Needed)",
-                "action_short": "Direct Processing",
-                "risk_level": "Zero Risk",
-                "risk_class": "risk-zero",
-                "details": "Clean brickwall cutoff directly into the container quantization floor. No pre-filtering is necessary; process directly or decimate cleanly.",
-                "dsp_params": "--phase min --dither shibata"
+                "action": f"Apodizing Low-Pass @ {fn} kHz (Cleanse Ultrasonic Stopband & Re-Upsample)",
+                "action_short": f"Apodize @ {fn}k",
+                "risk_level": "Minimal Risk — Recommended",
+                "risk_class": "risk-minimal",
+                "details": f"Clean brickwall cutoff detected near {fn} kHz with no legitimate musical harmonics above {fn} kHz. When re-upsampling or expanding bit-depth, applying a minimum-phase apodizing filter at {fn} kHz cleanses unneeded ultrasonic imaging and pre-cleans the noise floor before Shibata dither shaping.",
+                "dsp_params": f"--cutoff {int(fn*1000)} --phase min --dither shibata"
             }
     elif "Leaky" in label:
         fn = (primary_prov or {}).get("suspected_nyquist_hz", 22050) / 1000.0 if primary_prov else 22.05
