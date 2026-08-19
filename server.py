@@ -124,6 +124,42 @@ def extract_badge_data(res):
     }
 
 
+def scan_track_badge_fast(filepath, rules_path=None):
+    """
+    Fast background scanner for sidebar badges (under 1.5s per track).
+    Audits a 30s sample for provenance, bit depth, MQA, and DR score without full WebP rendering.
+    """
+    try:
+        data, sr = load_audio_resilient(filepath, dtype='float64', frames=int(192000 * 30))
+        if data.ndim > 1:
+            data = np.mean(data, axis=1)
+
+        taper_len = min(int(sr * 0.05), len(data) // 10)
+        if taper_len > 0:
+            taper = np.sin(np.linspace(0, np.pi/2, taper_len))**2
+            data[:taper_len] *= taper
+            data[-taper_len:] *= taper[::-1]
+
+        spec_db, freqs, peak_dbfs, rms_dbfs, assessment_text, dr_metrics, provenance_info = analyze_audio_forensics(
+            data, sr, rules_path=rules_path or ACTIVE_RULES_PATH, filepath=filepath
+        )
+
+        return {
+            "status": "ok",
+            "filepath": filepath,
+            "filename": os.path.basename(filepath),
+            "sr": sr,
+            "nyquist_khz": sr / 2000.0,
+            "duration_s": len(data) / float(sr),
+            "dr_score": dr_metrics.get("dr_score", 0),
+            "crest_factor_db": dr_metrics.get("crest_factor_db", 0.0),
+            "verdict": provenance_info.get("label", "ANALYZED"),
+            "provenance": provenance_info
+        }
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
 class FolderScanManager:
     """
     Manages asynchronous background folder analysis and real-time SSE badge streaming.
@@ -179,18 +215,17 @@ class FolderScanManager:
         except Exception:
             files = []
 
-        # Progressively scan tracks freshly using latest rules & DSP engine
+        # Progressively scan tracks with lightweight badge auditor
         for f in files:
             with self.lock:
                 if self.active_scan_dir != folder_dir:
                     break  # User moved to another folder
 
             try:
-                res = analyze_file_on_demand(f, force_fresh=True)
+                res = scan_track_badge_fast(f)
                 if res.get("status") == "ok":
+                    badge_data = extract_badge_data(res)
                     with CACHE_LOCK:
-                        ANALYSIS_CACHE[f] = res
-                        badge_data = extract_badge_data(res)
                         BADGE_CACHE[f] = badge_data
                     self._broadcast(folder_dir, "track_badge", badge_data)
             except Exception:
@@ -1389,7 +1424,7 @@ HTML_PAGE = """<!DOCTYPE html>
             analysisContent.style.display = 'none';
 
             try {
-                const res = await fetch(`/api/analyze?path=${encodeURIComponent(file.path)}&fresh=1`);
+                const res = await fetch(`/api/analyze?path=${encodeURIComponent(file.path)}&fresh=0`);
                 const data = await res.json();
                 if (data.status !== 'ok') throw new Error(data.message);
 

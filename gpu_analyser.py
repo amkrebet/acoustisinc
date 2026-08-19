@@ -132,10 +132,13 @@ class GPUForensicEngine:
             logger.warning(f"Failed to initialize OpenCL GPU context: {e}. Using CPU fallback.")
             self.enabled = False
 
-    def compute_stft_and_reductions(self, y: np.ndarray, sr: int, n_fft: int = 16384, hop_length: int = 4096):
+    def compute_stft_and_reductions(self, y: np.ndarray, sr: int, n_fft: int = 16384, hop_length: int = None):
         """
         Executes batched 64-bit STFT and 2D reduction on GPU with CPU fallback.
         """
+        if hop_length is None:
+            hop_length = max(4096, len(y) // 2048)
+
         if not self.enabled:
             return self._compute_cpu(y, sr, n_fft, hop_length)
 
@@ -201,8 +204,11 @@ class GPUForensicEngine:
             logger.warning(f"GPU STFT execution failed: {e}. Falling back to CPU.")
             return self._compute_cpu(y, sr, n_fft, hop_length)
 
-    def _compute_cpu(self, y: np.ndarray, sr: int, n_fft: int = 16384, hop_length: int = 4096):
+    def _compute_cpu(self, y: np.ndarray, sr: int, n_fft: int = 16384, hop_length: int = None):
         import scipy.fft as sfft
+        if hop_length is None:
+            hop_length = max(4096, len(y) // 2048)
+
         win = signal.windows.blackmanharris(n_fft, sym=False)
         S1 = np.sum(win)
         S2 = np.sum(win**2)
@@ -249,11 +255,10 @@ def analyze_audio_forensics_accelerated(y, sr, rules_path=None, filepath=None):
 
     t0 = time.time()
     n_fft = 16384
-    hop_length = n_fft // 4
 
     # 1. Compute STFT and 2D Reductions on GPU (or CPU Fallback)
     spec_db, freqs, peak_dbfs, rms_dbfs, enbw_hz, backend_used = gpu_engine.compute_stft_and_reductions(
-        y, sr, n_fft=n_fft, hop_length=hop_length
+        y, sr, n_fft=n_fft, hop_length=None
     )
 
     # 2. Dynamic Range & EBU R128

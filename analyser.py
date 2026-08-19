@@ -99,12 +99,14 @@ def calculate_dynamic_range_metrics(y, sr):
         y_k = signal.lfilter(b_shelf, a_shelf, y)
         y_k = signal.lfilter(b_hp, a_hp, y_k)
 
-        # Short-term loudness blocks (3.0s window, 100ms step)
+        # Short-term loudness blocks (3.0s window, 100ms step) - Vectorized cumsum
         step_len = int(sr * 0.1)
         win_len = int(sr * 3.0)
         if len(y_k) >= win_len:
             num_st = (len(y_k) - win_len) // step_len
-            st_blocks = np.array([np.mean(y_k[i * step_len : i * step_len + win_len]**2) for i in range(num_st)], dtype=np.float64)
+            p_cum = np.cumsum(np.insert(y_k**2, 0, 0.0))
+            idx = np.arange(num_st) * step_len
+            st_blocks = (p_cum[win_len + idx] - p_cum[idx]) / win_len
             st_lufs = -0.691 + 10.0 * np.log10(np.maximum(st_blocks, 1e-12))
             valid_st = st_lufs[st_lufs > -70.0]
             
