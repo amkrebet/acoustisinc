@@ -1405,7 +1405,9 @@ HTML_PAGE = """<!DOCTYPE html>
 
                 // Update UI metadata
                 document.getElementById('trackTitle').textContent = data.filename;
-                document.getElementById('trackMeta').textContent = `${data.sr.toLocaleString()} Hz | ${data.nyquist_khz.toFixed(1)} kHz Nyquist | ${data.duration_s.toFixed(1)}s sample | ${data.analysis_time}s (${data.gpu_enabled ? 'GPU' : 'CPU'})`;
+                const durMin = Math.floor(data.duration_s / 60);
+                const durSec = Math.floor(data.duration_s % 60).toString().padStart(2, '0');
+                document.getElementById('trackMeta').textContent = `${data.sr.toLocaleString()} Hz | ${data.nyquist_khz.toFixed(1)} kHz Nyquist | ${durMin}:${durSec} (${data.duration_s.toFixed(1)}s) | ${data.analysis_time}s (${data.gpu_enabled ? 'GPU' : 'CPU'})`;
                 
                 // MQA Badge
                 const mqaBadge = document.getElementById('mqaBadge');
@@ -1786,10 +1788,29 @@ HTML_PAGE = """<!DOCTYPE html>
 
             sCtx.textAlign = 'center';
             sCtx.textBaseline = 'top';
-            const tStep = (specTMax - specTMin) > 20 ? 10 : (specTMax - specTMin) > 8 ? 2 : 0.5;
+            const tRange = specTMax - specTMin;
+            let tStep = 10;
+            if (tRange > 300) tStep = 60;
+            else if (tRange > 120) tStep = 30;
+            else if (tRange > 60) tStep = 15;
+            else if (tRange > 20) tStep = 5;
+            else if (tRange > 8) tStep = 2;
+            else if (tRange > 2) tStep = 0.5;
+            else tStep = 0.2;
+
             for (let t = Math.ceil(specTMin / tStep) * tStep; t <= specTMax; t += tStep) {
                 const x = padL + ((t - specTMin) / (specTMax - specTMin)) * plotW;
-                sCtx.fillText(`${t.toFixed(1)}s`, x, padT + plotH + 6);
+                let label = '';
+                if (tStep >= 60 || (tRange > 60 && tStep >= 15)) {
+                    const m = Math.floor(t / 60);
+                    const s = Math.floor(t % 60).toString().padStart(2, '0');
+                    label = `${m}:${s}`;
+                } else if (tStep >= 1) {
+                    label = `${Math.round(t)}s`;
+                } else {
+                    label = `${t.toFixed(1)}s`;
+                }
+                sCtx.fillText(label, x, padT + plotH + 6);
                 sCtx.strokeStyle = 'rgba(255,255,255,0.06)';
                 sCtx.beginPath(); sCtx.moveTo(x, padT); sCtx.lineTo(x, padT + plotH); sCtx.stroke();
             }
