@@ -898,6 +898,9 @@ def process_album_folder(source_album_dir, dest_album_dir, queue, default_params
         print(f"[Fatal Safety Error] Destination directory is identical to source directory: {source_album_dir}. Skipping album to protect original files.")
         return
 
+    if prompt_ctrl is not None:
+        prompt_ctrl.set_album_context(source_album_dir)
+
     files = get_audio_files(source_album_dir)
     if not files: return
     if not force and all(os.path.exists(os.path.join(dest_album_dir, os.path.basename(f))) for f in files):
@@ -1025,10 +1028,26 @@ def process_album_folder(source_album_dir, dest_album_dir, queue, default_params
 
 class SessionPromptController:
     def __init__(self, mode='none', default_params=None):
+        self.initial_mode = mode  # 'none', 'ask', 'auto'
         self.mode = mode  # 'none', 'ask', 'auto', 'locked'
         self.default_params = default_params or {}
         self.locked_params = None
+        self.current_album_dir = None
         self.track_decisions = {}
+
+    def set_album_context(self, album_dir):
+        """
+        Notify the controller that a new album directory is being processed.
+        If a recipe was locked via [C] or [E] for the previous album, reset to initial mode ('ask')
+        so that parameters never bleed across distinct album directories.
+        """
+        if self.current_album_dir is not None and self.current_album_dir != album_dir:
+            if self.mode == 'locked':
+                folder_name = os.path.basename(album_dir) or album_dir
+                print(f"\n[AcoustiSinc] Resetting per-album recipe lock for new directory: {folder_name}")
+                self.mode = self.initial_mode
+                self.locked_params = None
+        self.current_album_dir = album_dir
 
     def resolve_track_params(self, filepath, track_idx=1, total_tracks=1, fallback_params=None):
         base_params = fallback_params or self.default_params
@@ -1059,7 +1078,7 @@ class SessionPromptController:
         dsp_str = rec_info.get("dsp_params", "--phase min --dither shibata")
 
         print("--------------------------------------------------------------------------------")
-        print("[Y] Accept for this track (Default)    |  [A] Accept recommended for ALL remaining")
+        print("[Y] Accept for this track (Default)    |  [A] Auto-apply recommended for ALL remaining")
         print("[C] Apply this recipe to REST of album |  [E] Edit parameters")
         print("[S] Skip track                         |  [Q] Quit")
         try:
@@ -1079,7 +1098,7 @@ class SessionPromptController:
             return rec_params, False
 
         elif choice in ['c', 'continue', 'freeze']:
-            print(f">>> Freezing recipe ({dsp_str}) for the REST of the album.\n")
+            print(f">>> Freezing recipe ({dsp_str}) for the REST of this album directory.\n")
             self.mode = 'locked'
             self.locked_params = rec_params
             self.track_decisions[filepath] = rec_params
