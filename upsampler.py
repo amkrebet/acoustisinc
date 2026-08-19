@@ -725,7 +725,7 @@ def scan_album(files):
 # TRACK PROCESSOR
 # ==============================================================================
 
-def process_track(filepath, dest_dir, gain_factor, album_max_peak_lin, queue, phase_mode, dither_mode, tmp_dir, apodizing=False, mqa_mode='adaptive', cutoff_hz=None, steep=False, force=False):
+def process_track(filepath, dest_dir, gain_factor, album_max_peak_lin, queue, phase_mode, dither_mode, tmp_dir, apodizing=False, mqa_mode='adaptive', cutoff_hz=None, steep=False, overwrite=False):
     t0 = time.time()
     def elapsed(): return f"[+{time.time() - t0:6.2f}s]"
 
@@ -738,8 +738,8 @@ def process_track(filepath, dest_dir, gain_factor, album_max_peak_lin, queue, ph
         print(f"   [Fatal Safety Error] Target path matches original source file ({dest_path}). Skipping to protect original.")
         return False, 0.0, None
 
-    if os.path.exists(dest_path) and not force:
-        print(f"   [Skip] Output exists: {filename} (use --force to overwrite)")
+    if os.path.exists(dest_path) and not overwrite:
+        print(f"   [Skip] Output exists: {filename} (use --overwrite to overwrite)")
         return False, 0.0, None
 
     try: 
@@ -887,7 +887,7 @@ def process_track(filepath, dest_dir, gain_factor, album_max_peak_lin, queue, ph
 # ALBUM BATCH CONTROLLER WITH RETRY AUTO-HEALING
 # ==============================================================================
 
-def process_album_folder(source_album_dir, dest_album_dir, queue, default_params, tmp_dir, force_mode='off', prompt_ctrl=None):
+def process_album_folder(source_album_dir, dest_album_dir, queue, default_params, tmp_dir, overwrite_mode='off', prompt_ctrl=None):
     print(f"\n==================================================")
     print(f"Directory:   {source_album_dir}")
     print(f"Destination: {dest_album_dir}")
@@ -904,11 +904,11 @@ def process_album_folder(source_album_dir, dest_album_dir, queue, default_params
     files = get_audio_files(source_album_dir)
     if not files: return
 
-    # Skip entire album upfront ONLY if force mode is completely 'off' (or album skipped)
-    cur_force = prompt_ctrl.force_mode if prompt_ctrl else force_mode
-    cur_album_force = prompt_ctrl.album_force_mode if prompt_ctrl else None
-    if (cur_force == 'off' or cur_album_force == 'off') and all(os.path.exists(os.path.join(dest_album_dir, os.path.basename(f))) for f in files):
-        print(f">>> All {len(files)} target files already exist in {dest_album_dir}. Skipping album. (Use --force to overwrite)")
+    # Skip entire album upfront ONLY if overwrite mode is completely 'off' (or album skipped)
+    cur_overwrite = prompt_ctrl.overwrite_mode if prompt_ctrl else overwrite_mode
+    cur_album_overwrite = prompt_ctrl.album_overwrite_mode if prompt_ctrl else None
+    if (cur_overwrite == 'off' or cur_album_overwrite == 'off') and all(os.path.exists(os.path.join(dest_album_dir, os.path.basename(f))) for f in files):
+        print(f">>> All {len(files)} target files already exist in {dest_album_dir}. Skipping album. (Use --overwrite to overwrite)")
         return
 
     os.makedirs(dest_album_dir, exist_ok=True)
@@ -933,12 +933,12 @@ def process_album_folder(source_album_dir, dest_album_dir, queue, default_params
             dest_file = os.path.join(dest_album_dir, os.path.basename(f))
             if os.path.exists(dest_file):
                 if prompt_ctrl is not None:
-                    should_overwrite = prompt_ctrl.resolve_force(dest_file, f, idx, len(files))
+                    should_overwrite = prompt_ctrl.resolve_overwrite(dest_file, f, idx, len(files))
                 else:
-                    should_overwrite = (force_mode == 'on')
+                    should_overwrite = (overwrite_mode == 'on')
 
                 if not should_overwrite:
-                    print(f"   [Skip] Output exists: {os.path.basename(f)} (use --force to overwrite)")
+                    print(f"   [Skip] Output exists: {os.path.basename(f)} (use --overwrite to overwrite)")
                     continue
 
             if prompt_ctrl is not None:
@@ -959,7 +959,7 @@ def process_album_folder(source_album_dir, dest_album_dir, queue, default_params
                 mqa_mode=track_params['mqa_mode'],
                 cutoff_hz=track_params['cutoff_hz'],
                 steep=track_params['steep'],
-                force=True
+                overwrite=True
             )
             if fut is not None:
                 pass_futures.append(fut)
@@ -1042,16 +1042,16 @@ def process_album_folder(source_album_dir, dest_album_dir, queue, default_params
 # ==============================================================================
 
 class SessionPromptController:
-    def __init__(self, mode='none', force_mode='off', default_params=None):
+    def __init__(self, mode='none', overwrite_mode='off', default_params=None):
         self.initial_mode = mode  # 'none', 'ask', 'auto'
         self.mode = mode  # 'none', 'ask', 'auto', 'locked'
-        self.force_mode = force_mode  # 'on', 'off', 'ask'
-        self.album_force_mode = None  # None, 'on', 'off'
+        self.overwrite_mode = overwrite_mode  # 'on', 'off', 'ask'
+        self.album_overwrite_mode = None  # None, 'on', 'off'
         self.default_params = default_params or {}
         self.locked_params = None
         self.current_album_dir = None
         self.track_decisions = {}
-        self.force_decisions = {}
+        self.overwrite_decisions = {}
 
     def set_album_context(self, album_dir):
         """
@@ -1065,40 +1065,40 @@ class SessionPromptController:
                 print(f"\n[AcoustiSinc] Resetting per-album recipe lock for new directory: {folder_name}")
                 self.mode = self.initial_mode
                 self.locked_params = None
-            if self.album_force_mode is not None:
+            if self.album_overwrite_mode is not None:
                 print(f"\n[AcoustiSinc] Resetting per-album overwrite setting for new directory: {folder_name}")
-                self.album_force_mode = None
+                self.album_overwrite_mode = None
         self.current_album_dir = album_dir
 
-    def resolve_force(self, dest_path, src_filepath, track_idx=1, total_tracks=1):
+    def resolve_overwrite(self, dest_path, src_filepath, track_idx=1, total_tracks=1):
         """
-        Resolves whether an existing target file should be overwritten based on --force {on|off|ask}.
+        Resolves whether an existing target file should be overwritten based on --overwrite {on|off|ask}.
         Returns True (overwrite) or False (skip).
         """
         if not os.path.exists(dest_path):
             return True
 
         # Re-use decision if already resolved in a prior pass (e.g. clipping retry)
-        if dest_path in self.force_decisions:
-            return self.force_decisions[dest_path]
+        if dest_path in self.overwrite_decisions:
+            return self.overwrite_decisions[dest_path]
 
         # Check album-level override
-        if self.album_force_mode == 'on':
-            self.force_decisions[dest_path] = True
+        if self.album_overwrite_mode == 'on':
+            self.overwrite_decisions[dest_path] = True
             return True
-        elif self.album_force_mode == 'off':
-            self.force_decisions[dest_path] = False
+        elif self.album_overwrite_mode == 'off':
+            self.overwrite_decisions[dest_path] = False
             return False
 
-        # Check session force mode
-        if self.force_mode == 'on':
-            self.force_decisions[dest_path] = True
+        # Check session overwrite mode
+        if self.overwrite_mode == 'on':
+            self.overwrite_decisions[dest_path] = True
             return True
-        elif self.force_mode == 'off':
-            self.force_decisions[dest_path] = False
+        elif self.overwrite_mode == 'off':
+            self.overwrite_decisions[dest_path] = False
             return False
 
-        # If force_mode is 'ask' -> Interactive Prompt
+        # If overwrite_mode is 'ask' -> Interactive Prompt
         filename = os.path.basename(dest_path)
         track_str = f" [Track {track_idx}/{total_tracks}]" if track_idx and total_tracks else ""
 
@@ -1132,30 +1132,30 @@ class SessionPromptController:
 
         if choice in ['', 'y', 'yes']:
             print(f">>> Overwriting target file: {filename}\n")
-            self.force_decisions[dest_path] = True
+            self.overwrite_decisions[dest_path] = True
             return True
 
         elif choice in ['a', 'all']:
-            print(f">>> Enabling force overwrite for this and ALL remaining files in the entire session.\n")
-            self.force_mode = 'on'
-            self.force_decisions[dest_path] = True
+            print(f">>> Enabling overwrite for this and ALL remaining files in the entire session.\n")
+            self.overwrite_mode = 'on'
+            self.overwrite_decisions[dest_path] = True
             return True
 
         elif choice in ['c', 'continue', 'album']:
-            print(f">>> Enabling force overwrite for the REST of this album directory.\n")
-            self.album_force_mode = 'on'
-            self.force_decisions[dest_path] = True
+            print(f">>> Enabling overwrite for the REST of this album directory.\n")
+            self.album_overwrite_mode = 'on'
+            self.overwrite_decisions[dest_path] = True
             return True
 
         elif choice in ['n', 'no', 'skip']:
             print(f">>> Keeping existing file, skipping track: {filename}\n")
-            self.force_decisions[dest_path] = False
+            self.overwrite_decisions[dest_path] = False
             return False
 
         elif choice in ['s', 'skip_album']:
             print(f">>> Skipping this and all remaining existing files in this album directory.\n")
-            self.album_force_mode = 'off'
-            self.force_decisions[dest_path] = False
+            self.album_overwrite_mode = 'off'
+            self.overwrite_decisions[dest_path] = False
             return False
 
         elif choice in ['q', 'quit', 'abort']:
@@ -1163,7 +1163,7 @@ class SessionPromptController:
             sys.exit(0)
         else:
             print(f">>> Overwriting target file: {filename}\n")
-            self.force_decisions[dest_path] = True
+            self.overwrite_decisions[dest_path] = True
             return True
 
     def resolve_track_params(self, filepath, track_idx=1, total_tracks=1, fallback_params=None):
@@ -1328,7 +1328,7 @@ def main():
     parser.add_argument("source", help="Source audio file or root directory containing album folders")
     parser.add_argument("target", nargs="?", default=None, help="Target output directory (optional, default: <source>_upsampled_<topology>)")
     parser.add_argument("-o", "--output-dir", default=None, help="Explicit target output directory")
-    parser.add_argument("-f", "--force", choices=['on', 'off', 'ask', 'true', 'false'], default='off', const='on', nargs='?', help="Force re-processing and overwrite existing target output files: 'on' (silent overwrite), 'off' (skip existing), 'ask' (interactive prompt when output exists)")
+    parser.add_argument("--overwrite", "-f", "--force", choices=['on', 'off', 'ask', 'true', 'false'], default='off', const='on', nargs='?', dest="overwrite", help="Target output file overwrite policy: 'on' (silent overwrite), 'off' (skip existing), 'ask' (interactive prompt when output exists)")
     parser.add_argument("--use-recommended", "--use-rec", choices=['auto', 'ask', 'none'], default='none', const='auto', nargs='?', help="Analyze audio forensics and apply recommended DSP recipe: 'auto' (silent auto-apply) or 'ask' (interactive prompt)")
     parser.add_argument("--phase", choices=['linear', 'min', 'minimum'], default='linear', help="Filter phase mode: linear (symmetric) or min (minimum phase, causal)")
     parser.add_argument("--apodizing", "--apod", action="store_true", help="Enable Apodizing transition band to attenuate pre-existing studio ADC ringing")
@@ -1389,13 +1389,13 @@ def main():
     os.makedirs(tmp_dir, exist_ok=True)
     os.makedirs(target_dir, exist_ok=True)
 
-    force_raw = str(args.force).lower() if args.force is not None else 'off'
-    if force_raw in ['true', '1', 'on']:
-        force_mode = 'on'
-    elif force_raw in ['ask', 'prompt']:
-        force_mode = 'ask'
+    overwrite_raw = str(args.overwrite).lower() if args.overwrite is not None else 'off'
+    if overwrite_raw in ['true', '1', 'on']:
+        overwrite_mode = 'on'
+    elif overwrite_raw in ['ask', 'prompt']:
+        overwrite_mode = 'ask'
     else:
-        force_mode = 'off'
+        overwrite_mode = 'off'
 
     default_params = {
         "phase_mode": args.phase,
@@ -1404,11 +1404,11 @@ def main():
         "mqa_mode": args.mqa,
         "cutoff_hz": args.cutoff,
         "steep": args.steep,
-        "force_mode": force_mode
+        "overwrite_mode": overwrite_mode
     }
-    prompt_ctrl = SessionPromptController(mode=args.use_recommended, force_mode=force_mode, default_params=default_params)
+    prompt_ctrl = SessionPromptController(mode=args.use_recommended, overwrite_mode=overwrite_mode, default_params=default_params)
 
-    force_label = "ENABLED (Silent Overwrite)" if force_mode == 'on' else ("ASK (Interactive Prompt on Existing Files)" if force_mode == 'ask' else "DISABLED (Skip Existing)")
+    overwrite_label = "ENABLED (Silent Overwrite)" if overwrite_mode == 'on' else ("ASK (Interactive Prompt on Existing Files)" if overwrite_mode == 'ask' else "DISABLED (Skip Existing)")
 
     print(f"\n=======================================================")
     print(f"ACOUSTISINC: 64-BIT GPU SINC AUDIO UPSAMPLER")
@@ -1419,7 +1419,7 @@ def main():
     print(f"Phase Mode      : {phase_name}")
     print(f"Cutoff Frequency: {f'{args.cutoff:,.0f} Hz' if args.cutoff else 'Nyquist Bandwidth'}")
     print(f"Apodizing Filter: {'ENABLED' if args.apodizing else 'DISABLED (Full Sinc Bandwidth)'}")
-    print(f"Force Overwrite : {force_label}")
+    print(f"Overwrite Policy: {overwrite_label}")
     print(f"Noise Shaping   : {dither_mode.upper()} (In-Register Double Precision)")
     print(f"MQA Processing  : {args.mqa.upper()}")
     print(f"FLAC Compression: Level 5 (Strict)")
@@ -1432,9 +1432,9 @@ def main():
     if os.path.isfile(source_path):
         dest_file = os.path.join(target_dir, os.path.basename(source_path))
         if os.path.exists(dest_file):
-            should_overwrite = prompt_ctrl.resolve_force(dest_file, source_path, 1, 1)
+            should_overwrite = prompt_ctrl.resolve_overwrite(dest_file, source_path, 1, 1)
             if not should_overwrite:
-                print(f"   [Skip] Output exists: {os.path.basename(source_path)} (use --force to overwrite)")
+                print(f"   [Skip] Output exists: {os.path.basename(source_path)} (use --overwrite to overwrite)")
                 return
 
         t_params, skip = prompt_ctrl.resolve_track_params(source_path, 1, 1, default_params)
@@ -1450,7 +1450,7 @@ def main():
             mqa_mode=t_params['mqa_mode'],
             cutoff_hz=t_params['cutoff_hz'],
             steep=t_params['steep'],
-            force=True
+            overwrite=True
         )
         if clipped and out_peak > PEAK_TARGET_LIN:
             overshoot_ratio = PEAK_TARGET_LIN / out_peak
@@ -1466,7 +1466,7 @@ def main():
                 mqa_mode=t_params['mqa_mode'],
                 cutoff_hz=t_params['cutoff_hz'],
                 steep=t_params['steep'],
-                force=True
+                overwrite=True
             )
         file_writer_pool.shutdown(wait=True)
 
@@ -1504,7 +1504,7 @@ def main():
         print(f"\n==================================================")
         print(f"[Album {idx}/{len(album_directories)}]")
         try:
-            process_album_folder(alb_dir, dest_alb, queue, default_params, tmp_dir, force_mode=force_mode, prompt_ctrl=prompt_ctrl)
+            process_album_folder(alb_dir, dest_alb, queue, default_params, tmp_dir, overwrite_mode=overwrite_mode, prompt_ctrl=prompt_ctrl)
         except Exception as e:
             err_msg = f"[Album {idx} Skipped on Error]: {alb_dir}\nDetails: {e}"
             print(f"\n{err_msg}\n>>> Continuing to next album...")

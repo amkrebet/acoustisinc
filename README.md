@@ -70,7 +70,7 @@ python upsampler.py "/Music/Hi-Res/Album"
 | `source` | **Mandatory** | *(None)* | Path to a single audio track (`.flac`/`.wav`) or root directory containing albums. |
 | `target` *(or `-o`, `--output-dir`)* | *Optional* | `<source>_upsampled_<topology>` | Destination directory. Multi-tier safety guards strictly prevent overwriting originals. |
 | `--use-recommended` | *Optional* | `none` | Audits audio provenance and resolves DSP recipe: `auto` (silent apply) or `ask` (interactive prompt). |
-| `-f`, `--force` | *Optional* | `False` | Forces re-processing and overwrites existing destination files. |
+| `--overwrite` *(or `-f`, `--force`)* | *Optional* | `off` | Target output overwrite policy: `on` (silent overwrite), `off` (skip existing), or `ask` (interactive scoped prompt). |
 | `--cutoff`, `--apodize` | *Optional* | `None` | Sets custom low-pass reconstruction filter cutoff frequency in Hz (e.g. `20700`, `21500`, `22050`). |
 | `--steep` | *Optional* | `False` | Uses a steep transition band (500 Hz) instead of the standard 2 kHz cosine taper. |
 | `--phase` | *Optional* | `linear` | Filter phase mode: `linear` (symmetric) or `min` (causal, zero pre-ringing). |
