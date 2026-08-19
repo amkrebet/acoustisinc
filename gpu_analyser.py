@@ -268,7 +268,6 @@ def analyze_audio_forensics_accelerated(y, sr, rules_path=None, filepath=None):
     bitdepth_info = analyze_effective_bit_depth(filepath=filepath, pcm_int32=pcm_int32) if filepath else None
     engine = get_provenance_engine(rules_path or DEFAULT_RULES_PATH)
     
-    stft_mag_lin = 10.0 ** (spec_db / 20.0)
     provenance_info = engine.evaluate(
         sr=sr,
         nyquist=nyquist,
@@ -276,7 +275,7 @@ def analyze_audio_forensics_accelerated(y, sr, rules_path=None, filepath=None):
         mean_spec_db=mean_spec_db,
         rms_dbfs=rms_dbfs,
         peak_dbfs=peak_dbfs,
-        stft_mag=stft_mag_lin,
+        stft_mag=spec_db,
         zero_ratio=zero_ratio,
         mqa_info=mqa_info,
         bitdepth_info=bitdepth_info

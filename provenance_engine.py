@@ -743,7 +743,10 @@ def extract_visual_morphology(freqs, mean_spec_db, rms_dbfs, peak_dbfs, stft_mag
     primary_knee = significant_knees[0] if significant_knees else None
 
     # 2. Temporal Variance & Stationary Banding Analysis (Music Dynamics vs Constant Dither/Noise)
-    stft_db_slices = 20.0 * np.log10(np.maximum(stft_mag / (np.max(stft_mag) + 1e-12), 1e-12))
+    if np.all(stft_mag <= 10.0) and np.median(stft_mag) < -20.0:
+        stft_db_slices = stft_mag
+    else:
+        stft_db_slices = 20.0 * np.log10(np.maximum(stft_mag / (np.max(stft_mag) + 1e-12), 1e-12))
     temp_variance = np.var(stft_db_slices, axis=1)
     
     idx_aud = np.where((f_khz >= 1.0) & (f_khz <= 15.0))[0]
@@ -800,7 +803,10 @@ def extract_visual_morphology(freqs, mean_spec_db, rms_dbfs, peak_dbfs, stft_mag
             max_peak = float(np.max(peak_stop))
             peak_to_floor_crest = float(max_peak - median_rms)
             
-            stft_slices = 20.0 * np.log10(np.maximum(stft_mag[i_stop, :], 1e-12))
+            if np.all(stft_mag <= 10.0) and np.median(stft_mag) < -20.0:
+                stft_slices = stft_mag[i_stop, :]
+            else:
+                stft_slices = 20.0 * np.log10(np.maximum(stft_mag[i_stop, :], 1e-12))
             temp_var = float(np.mean(np.var(stft_slices, axis=1)))
             
             win_size = min(30, max(5, len(rms_stop) // 4))

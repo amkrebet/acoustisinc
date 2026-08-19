@@ -320,11 +320,11 @@ def analyze_file_on_demand(filepath, rules_path=None, force_fresh=True):
 
     try:
         t0 = time.time()
-        # Fast direct decoding of 25 seconds of audio for instant responsiveness
+        # Decode full audio track with strict 64-bit double precision
         try:
-            data, sr = sf.read(filepath, frames=int(192000 * 25), dtype='float64', always_2d=True)
+            data, sr = sf.read(filepath, dtype='float64', always_2d=True)
         except Exception:
-            data, sr = load_audio_resilient(filepath, dtype='float64', frames=int(192000 * 25))
+            data, sr = load_audio_resilient(filepath, dtype='float64')
 
         if data.ndim > 1:
             data = np.mean(data, axis=1)

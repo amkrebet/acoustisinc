@@ -1374,7 +1374,7 @@ def main():
         print(f"Rules Path : {args.rules}")
     print(f"==================================================")
 
-    data, sr = load_audio_resilient(filepath, dtype='float64', start=0, stop=60*192000)
+    data, sr = load_audio_resilient(filepath, dtype='float64')
     if data.ndim > 1:
         data = np.mean(data, axis=1)
 
