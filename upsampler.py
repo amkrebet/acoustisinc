@@ -887,7 +887,7 @@ def process_track(filepath, dest_dir, gain_factor, album_max_peak_lin, queue, ph
 # ALBUM BATCH CONTROLLER WITH RETRY AUTO-HEALING
 # ==============================================================================
 
-def process_album_folder(source_album_dir, dest_album_dir, queue, phase_mode, dither_mode, tmp_dir, apodizing=False, mqa_mode='adaptive', cutoff_hz=None, steep=False, force=False):
+def process_album_folder(source_album_dir, dest_album_dir, queue, default_params, tmp_dir, force=False, prompt_ctrl=None):
     print(f"\n==================================================")
     print(f"Directory:   {source_album_dir}")
     print(f"Destination: {dest_album_dir}")
@@ -915,6 +915,7 @@ def process_album_folder(source_album_dir, dest_album_dir, queue, phase_mode, di
 
     gain_factor, album_max_peak_lin = scan_album(files)
     max_retries = 4; retry_count = 0; album_success = False
+    last_track_params = default_params
 
     while not album_success and retry_count <= max_retries:
         clipped_in_pass = False
@@ -922,8 +923,26 @@ def process_album_folder(source_album_dir, dest_album_dir, queue, phase_mode, di
         pass_futures = []
 
         for idx, f in enumerate(files, 1):
+            if prompt_ctrl is not None:
+                track_params, skip = prompt_ctrl.resolve_track_params(f, idx, len(files), default_params)
+                if skip:
+                    continue
+            else:
+                track_params = default_params
+
+            last_track_params = track_params
             print(f"\n--- Track [{idx}/{len(files)}] ---")
-            clipped, out_peak, fut = process_track(f, dest_album_dir, gain_factor, album_max_peak_lin, queue, phase_mode, dither_mode, tmp_dir, apodizing=apodizing, mqa_mode=mqa_mode, cutoff_hz=cutoff_hz, steep=steep, force=force)
+            clipped, out_peak, fut = process_track(
+                f, dest_album_dir, gain_factor, album_max_peak_lin, queue,
+                phase_mode=track_params['phase_mode'],
+                dither_mode=track_params['dither_mode'],
+                tmp_dir=tmp_dir,
+                apodizing=track_params['apodizing'],
+                mqa_mode=track_params['mqa_mode'],
+                cutoff_hz=track_params['cutoff_hz'],
+                steep=track_params['steep'],
+                force=force
+            )
             if fut is not None:
                 pass_futures.append(fut)
             if clipped:
@@ -984,10 +1003,11 @@ def process_album_folder(source_album_dir, dest_album_dir, queue, phase_mode, di
     pairs = [(f, os.path.join(dest_album_dir, os.path.basename(f))) for f in files]
     alb_name = os.path.basename(source_album_dir) or "Album"
     applied_recipe = {
-        "cli_params": f"--phase {phase_mode} --dither {dither_mode}" + (f" --cutoff {int(cutoff_hz)}" if cutoff_hz else "") + (f" --mqa {mqa_mode}" if mqa_mode != 'adaptive' else "") + (" --steep" if steep else ""),
-        "topology_name": f"{phase_mode.upper()} APODIZING" if (apodizing or cutoff_hz) else f"{phase_mode.upper()}",
+        "cli_params": f"--phase {last_track_params['phase_mode']} --dither {last_track_params['dither_mode']}" + (f" --cutoff {int(last_track_params['cutoff_hz'])}" if last_track_params.get('cutoff_hz') else "") + (f" --mqa {last_track_params['mqa_mode']}" if last_track_params.get('mqa_mode') != 'adaptive' else "") + (" --steep" if last_track_params.get('steep') else ""),
+        "topology_name": f"{last_track_params['phase_mode'].upper()} APODIZING" if (last_track_params.get('apodizing') or last_track_params.get('cutoff_hz')) else f"{last_track_params['phase_mode'].upper()}",
         "gain_factor": gain_factor,
-        "gain_db": 20.0 * np.log10(gain_factor)
+        "gain_db": 20.0 * np.log10(gain_factor),
+        "cutoff_hz": last_track_params.get('cutoff_hz')
     }
     try:
         html_rep, md_rep = generate_comparative_report(pairs, alb_name, applied_recipe, dest_album_dir)
@@ -999,126 +1019,172 @@ def process_album_folder(source_album_dir, dest_album_dir, queue, phase_mode, di
         print(f"   [Notice] Could not generate comparative report: {e}")
 
 
-def audit_and_resolve_recommendation(source_path, files, args):
-    """
-    Forensic pre-scan that audits source audio and resolves DSP parameters
-    based on --use-recommended={auto|ask}.
-    """
-    if args.use_recommended not in ['auto', 'ask']:
-        return args
+# ==============================================================================
+# SESSION PROMPT CONTROLLER (PER-FILE FORENSIC RECIPE RESOLVER)
+# ==============================================================================
 
-    print(f"\n=======================================================")
-    print(f"🔬 RUNNING FORENSIC DSP AUDIT & PROVENANCE ANALYSIS")
-    print(f"=======================================================")
+class SessionPromptController:
+    def __init__(self, mode='none', default_params=None):
+        self.mode = mode  # 'none', 'ask', 'auto', 'locked'
+        self.default_params = default_params or {}
+        self.locked_params = None
+        self.track_decisions = {}
 
-    if not files:
-        if os.path.isfile(source_path):
-            sample_file = source_path
-        else:
-            rec_files = get_audio_files(source_path, recursive=True)
-            if rec_files:
-                sample_file = rec_files[0]
-            else:
-                print(f"[AcoustiSinc] No audio files found under {source_path}")
-                return args
-    else:
-        sample_file = files[0]
+    def resolve_track_params(self, filepath, track_idx=1, total_tracks=1, fallback_params=None):
+        base_params = fallback_params or self.default_params
 
-    try:
-        data, sr = sf.read(sample_file, frames=int(192000 * 25), dtype='float64', always_2d=True)
-    except Exception:
-        data, sr = load_audio_resilient(sample_file, dtype='float64', frames=int(192000 * 25))
-    if data.ndim > 1:
-        data = np.mean(data, axis=1)
+        # Re-use decision if already resolved in a prior pass (e.g. clipping retry)
+        if filepath in self.track_decisions:
+            return self.track_decisions[filepath], False
 
-    _, _, _, _, assessment_text, dr_metrics, prov_info = analyze_audio_forensics(
-        data, sr, filepath=sample_file
-    )
+        # If user chose [C] Freeze recipe for remainder of album/session
+        if self.mode == 'locked' and self.locked_params is not None:
+            self.track_decisions[filepath] = self.locked_params
+            return self.locked_params, False
 
-    primary = prov_info.get("primary", {})
-    label = primary.get("label", "Standard Master")
-    rec = prov_info.get("recommendation", {})
-    vis = prov_info.get("visual_morphology", {})
-    pk = vis.get("primary_knee", {})
+        # If mode is 'none' (user did not specify --use-recommended)
+        if self.mode == 'none':
+            return base_params, False
 
-    print(f"Source Provenance : {label} [{primary.get('confidence', 'High')} Confidence]")
-    if pk and pk.get("is_brickwall_knee"):
-        print(f"Detected Knee     : {pk.get('freq_khz', 0):.1f} kHz (Slope: {pk.get('steepest_slope_db_per_khz', 0):.1f} dB/kHz | Drop: {pk.get('drop_db', 0):.1f} dB)")
+        # If mode is 'auto'
+        if self.mode == 'auto':
+            rec_params, rec_info = self._audit_track(filepath, print_card=False)
+            dsp_str = rec_info.get("dsp_params", "--phase min --dither shibata")
+            print(f">>> [Auto-Recommended] {os.path.basename(filepath)} -> {dsp_str}")
+            self.track_decisions[filepath] = rec_params
+            return rec_params, False
 
-    if rec:
-        print(f"Recommended Action: {rec.get('action', 'Direct Sinc Upsampling')}")
-        print(f"Recommended DSP   : {rec.get('dsp_params', '--phase min --dither shibata')}")
-        print(f"Technical Rationale: {rec.get('details', '')}")
-    else:
-        print(f"Recommended DSP   : --phase min --dither shibata")
-    print(f"=======================================================\n")
+        # If mode is 'ask' -> Interactive Card Prompt
+        rec_params, rec_info = self._audit_track(filepath, print_card=True, track_idx=track_idx, total_tracks=total_tracks)
+        dsp_str = rec_info.get("dsp_params", "--phase min --dither shibata")
 
-    # Extract recommended params
-    rec_phase = 'min'
-    rec_apodizing = False
-    rec_cutoff = None
-    rec_dither = 'shibata'
-    rec_mqa = 'adaptive'
-    rec_steep = False
-
-    if rec:
-        if rec.get("filter_cutoff_khz"):
-            rec_cutoff = rec["filter_cutoff_khz"] * 1000.0
-            rec_apodizing = True
-        params_str = rec.get("dsp_params", "")
-        if "--phase min" in params_str or "--filter min" in params_str:
-            rec_phase = 'min'
-        elif "--phase linear" in params_str:
-            rec_phase = 'linear'
-        if "--mqa" in params_str:
-            m = re.search(r"--mqa\s+(\w+)", params_str)
-            if m: rec_mqa = m.group(1)
-        if "--steep" in params_str:
-            rec_steep = True
-
-    if args.use_recommended == 'ask':
-        dsp_str = rec.get("dsp_params", f"--phase {rec_phase} --dither {rec_dither}")
+        print("--------------------------------------------------------------------------------")
+        print("[Y] Accept for this track (Default)    |  [A] Accept recommended for ALL remaining")
+        print("[C] Apply this recipe to REST of album |  [E] Edit parameters")
+        print("[S] Skip track                         |  [Q] Quit")
         try:
-            choice = input(f"Apply recommended DSP recipe [{dsp_str}]? [Y/n/edit]: ").strip().lower()
+            choice = input("Choice [Y/a/c/e/s/q]: ").strip().lower()
         except EOFError:
             choice = 'y'
 
         if choice in ['', 'y', 'yes']:
-            print(f">>> Adopting recommended DSP recipe: {dsp_str}\n")
-            args.phase = rec_phase
-            args.apodizing = rec_apodizing
-            args.cutoff = rec_cutoff
-            args.dither = rec_dither
-            args.mqa = rec_mqa
-            args.steep = rec_steep
+            print(f">>> Applying recipe to {os.path.basename(filepath)}: {dsp_str}\n")
+            self.track_decisions[filepath] = rec_params
+            return rec_params, False
+
+        elif choice in ['a', 'all']:
+            print(f">>> Adopting recommended recipes automatically for this and ALL remaining tracks.\n")
+            self.mode = 'auto'
+            self.track_decisions[filepath] = rec_params
+            return rec_params, False
+
+        elif choice in ['c', 'continue', 'freeze']:
+            print(f">>> Freezing recipe ({dsp_str}) for the REST of the album.\n")
+            self.mode = 'locked'
+            self.locked_params = rec_params
+            self.track_decisions[filepath] = rec_params
+            return rec_params, False
+
         elif choice in ['e', 'edit']:
-            custom_input = input("Enter custom CLI flags (e.g. --cutoff 21000 --phase linear): ").strip()
+            custom_input = input("Enter custom CLI flags (e.g. --cutoff 22050 --phase min): ").strip()
+            edited = dict(rec_params)
             if "--cutoff" in custom_input or "--apodize" in custom_input:
                 m = re.search(r"--(?:cutoff|apodize)\s+(\d+)", custom_input)
                 if m:
-                    args.cutoff = float(m.group(1))
-                    args.apodizing = True
+                    edited['cutoff_hz'] = float(m.group(1))
+                    edited['apodizing'] = True
             if "--phase" in custom_input:
                 m = re.search(r"--phase\s+(\w+)", custom_input)
-                if m: args.phase = m.group(1)
+                if m: edited['phase_mode'] = m.group(1)
             if "--dither" in custom_input:
                 m = re.search(r"--dither\s+(\w+)", custom_input)
-                if m: args.dither = m.group(1)
+                if m: edited['dither_mode'] = m.group(1)
             if "--mqa" in custom_input:
                 m = re.search(r"--mqa\s+(\w+)", custom_input)
-                if m: args.mqa = m.group(1)
-        else:
-            print(">>> Skipping recommendations. Using explicit/default command line arguments.\n")
-    elif args.use_recommended == 'auto':
-        print(f">>> Automatically applying recommended DSP recipe: {rec.get('dsp_params', '--phase min --dither shibata')}\n")
-        args.phase = rec_phase
-        args.apodizing = rec_apodizing
-        args.cutoff = rec_cutoff
-        args.dither = rec_dither
-        args.mqa = rec_mqa
-        args.steep = rec_steep
+                if m: edited['mqa_mode'] = m.group(1)
 
-    return args
+            scope = input("Apply custom recipe to: [1] This track only (Default)  [2] Rest of album: ").strip()
+            if scope == '2':
+                self.mode = 'locked'
+                self.locked_params = edited
+            self.track_decisions[filepath] = edited
+            return edited, False
+
+        elif choice in ['s', 'skip']:
+            print(f">>> Skipping track: {os.path.basename(filepath)}\n")
+            return None, True
+
+        elif choice in ['q', 'quit', 'abort']:
+            print("\n[AcoustiSinc] Processing aborted by user.")
+            sys.exit(0)
+        else:
+            print(f">>> Applying recipe to {os.path.basename(filepath)}: {dsp_str}\n")
+            self.track_decisions[filepath] = rec_params
+            return rec_params, False
+
+    def _audit_track(self, filepath, print_card=False, track_idx=None, total_tracks=None):
+        try:
+            data, sr = sf.read(filepath, frames=int(192000 * 25), dtype='float64', always_2d=True)
+        except Exception:
+            data, sr = load_audio_resilient(filepath, dtype='float64', frames=int(192000 * 25))
+        if data.ndim > 1:
+            data = np.mean(data, axis=1)
+
+        _, _, _, _, _, _, prov_info = analyze_audio_forensics(data, sr, filepath=filepath)
+        primary = prov_info.get("primary", {})
+        label = primary.get("label", "Standard Master")
+        rec = prov_info.get("recommendation", {})
+        vis = prov_info.get("visual_morphology", {})
+        pk = vis.get("primary_knee", {})
+        purity = vis.get("stopband_purity", {})
+
+        if print_card:
+            track_str = f" [Track {track_idx}/{total_tracks}]" if track_idx and total_tracks else ""
+            print(f"\n================================================================================")
+            print(f"🔬 FORENSIC AUDIT{track_str}: {os.path.basename(filepath)}")
+            print(f"================================================================================")
+            print(f"   Source Format   : {sr/1000.0:.1f} kHz (2 ch)")
+            print(f"   Provenance      : {label} [{primary.get('confidence', 'High')} Confidence]")
+            if pk and pk.get("is_brickwall_knee"):
+                print(f"   Primary Knee    : {pk.get('freq_khz', 0):.1f} kHz (Slope: {pk.get('steepest_slope_db_per_khz', 0):.1f} dB/kHz | Drop: {pk.get('drop_db', 0):.1f} dB)")
+            if purity and purity.get("has_stopband"):
+                print(f"   Stopband State  : {purity.get('purity_label', 'Clean')} ({purity.get('description', '')})")
+            if rec:
+                print(f"   Recommended Action: {rec.get('action', 'Direct Sinc Upsampling')}")
+                print(f"   Recommended DSP   : {rec.get('dsp_params', '--phase min --dither shibata')}")
+                if rec.get('details'):
+                    print(f"   Technical Rationale: {rec.get('details')}")
+
+        rec_phase = 'min'
+        rec_apodizing = False
+        rec_cutoff = None
+        rec_dither = 'shibata'
+        rec_mqa = 'adaptive'
+        rec_steep = False
+
+        if rec:
+            if rec.get("filter_cutoff_khz"):
+                rec_cutoff = rec["filter_cutoff_khz"] * 1000.0
+                rec_apodizing = True
+            params_str = rec.get("dsp_params", "")
+            if "--phase min" in params_str or "--filter min" in params_str:
+                rec_phase = 'min'
+            elif "--phase linear" in params_str:
+                rec_phase = 'linear'
+            if "--mqa" in params_str:
+                m = re.search(r"--mqa\s+(\w+)", params_str)
+                if m: rec_mqa = m.group(1)
+            if "--steep" in params_str:
+                rec_steep = True
+
+        return {
+            "phase_mode": rec_phase,
+            "apodizing": rec_apodizing,
+            "cutoff_hz": rec_cutoff,
+            "dither_mode": rec_dither,
+            "mqa_mode": rec_mqa,
+            "steep": rec_steep
+        }, rec
 
 
 def main():
@@ -1144,17 +1210,6 @@ def main():
     if not os.path.exists(source_path):
         print(f"[Error] Source path not found: {source_path}")
         sys.exit(1)
-
-    # Discover files for pre-flight audit
-    if os.path.isfile(source_path):
-        all_src_files = [source_path]
-    else:
-        all_src_files = get_audio_files(source_path)
-        if not all_src_files:
-            all_src_files = get_audio_files(source_path, recursive=True)
-
-    # Audit & resolve recommendations if requested
-    args = audit_and_resolve_recommendation(source_path, all_src_files, args)
 
     if args.filter:
         if args.filter in ['min-phase', 'min']:
@@ -1198,6 +1253,16 @@ def main():
     os.makedirs(tmp_dir, exist_ok=True)
     os.makedirs(target_dir, exist_ok=True)
 
+    default_params = {
+        "phase_mode": args.phase,
+        "dither_mode": dither_mode,
+        "apodizing": args.apodizing,
+        "mqa_mode": args.mqa,
+        "cutoff_hz": args.cutoff,
+        "steep": args.steep
+    }
+    prompt_ctrl = SessionPromptController(mode=args.use_recommended, default_params=default_params)
+
     print(f"\n=======================================================")
     print(f"ACOUSTISINC: 64-BIT GPU SINC AUDIO UPSAMPLER")
     print(f"=======================================================")
@@ -1218,22 +1283,46 @@ def main():
     queue = cl.CommandQueue(ctx)
 
     if os.path.isfile(source_path):
+        t_params, skip = prompt_ctrl.resolve_track_params(source_path, 1, 1, default_params)
+        if skip:
+            return
         gain_factor, pk = scan_album([source_path])
-        clipped, out_peak, fut = process_track(source_path, target_dir, gain_factor, pk, queue, args.phase, dither_mode, tmp_dir, apodizing=args.apodizing, mqa_mode=args.mqa, cutoff_hz=args.cutoff, steep=args.steep, force=args.force)
+        clipped, out_peak, fut = process_track(
+            source_path, target_dir, gain_factor, pk, queue,
+            phase_mode=t_params['phase_mode'],
+            dither_mode=t_params['dither_mode'],
+            tmp_dir=tmp_dir,
+            apodizing=t_params['apodizing'],
+            mqa_mode=t_params['mqa_mode'],
+            cutoff_hz=t_params['cutoff_hz'],
+            steep=t_params['steep'],
+            force=args.force
+        )
         if clipped and out_peak > PEAK_TARGET_LIN:
             overshoot_ratio = PEAK_TARGET_LIN / out_peak
             safety_margin_lin = 10.0 ** (-0.2 / 20.0)
             gain_factor *= (overshoot_ratio * safety_margin_lin)
             print(f">>> Retrying single file with exact calculated Gain Factor: {gain_factor:.6f}")
-            process_track(source_path, target_dir, gain_factor, pk, queue, args.phase, dither_mode, tmp_dir, apodizing=args.apodizing, mqa_mode=args.mqa, cutoff_hz=args.cutoff, steep=args.steep, force=args.force)
+            process_track(
+                source_path, target_dir, gain_factor, pk, queue,
+                phase_mode=t_params['phase_mode'],
+                dither_mode=t_params['dither_mode'],
+                tmp_dir=tmp_dir,
+                apodizing=t_params['apodizing'],
+                mqa_mode=t_params['mqa_mode'],
+                cutoff_hz=t_params['cutoff_hz'],
+                steep=t_params['steep'],
+                force=args.force
+            )
         file_writer_pool.shutdown(wait=True)
 
         dest_file = os.path.join(target_dir, os.path.basename(source_path))
         applied_recipe = {
-            "cli_params": f"--phase {args.phase} --dither {dither_mode}" + (f" --cutoff {int(args.cutoff)}" if args.cutoff else "") + (f" --mqa {args.mqa}" if args.mqa != 'adaptive' else "") + (" --steep" if args.steep else ""),
-            "topology_name": topology_name,
+            "cli_params": f"--phase {t_params['phase_mode']} --dither {t_params['dither_mode']}" + (f" --cutoff {int(t_params['cutoff_hz'])}" if t_params.get('cutoff_hz') else "") + (f" --mqa {t_params['mqa_mode']}" if t_params.get('mqa_mode') != 'adaptive' else "") + (" --steep" if t_params.get('steep') else ""),
+            "topology_name": f"{t_params['phase_mode'].upper()} APODIZING" if (t_params.get('apodizing') or t_params.get('cutoff_hz')) else f"{t_params['phase_mode'].upper()}",
             "gain_factor": gain_factor,
-            "gain_db": 20.0 * np.log10(gain_factor)
+            "gain_db": 20.0 * np.log10(gain_factor),
+            "cutoff_hz": t_params.get('cutoff_hz')
         }
         try:
             html_rep, md_rep = generate_comparative_report([(source_path, dest_file)], os.path.basename(source_path), applied_recipe, target_dir)
@@ -1261,7 +1350,7 @@ def main():
         print(f"\n==================================================")
         print(f"[Album {idx}/{len(album_directories)}]")
         try:
-            process_album_folder(alb_dir, dest_alb, queue, args.phase, dither_mode, tmp_dir, apodizing=args.apodizing, mqa_mode=args.mqa, cutoff_hz=args.cutoff, steep=args.steep, force=args.force)
+            process_album_folder(alb_dir, dest_alb, queue, default_params, tmp_dir, force=args.force, prompt_ctrl=prompt_ctrl)
         except Exception as e:
             err_msg = f"[Album {idx} Skipped on Error]: {alb_dir}\nDetails: {e}"
             print(f"\n{err_msg}\n>>> Continuing to next album...")

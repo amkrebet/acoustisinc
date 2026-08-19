@@ -15,11 +15,12 @@ import numpy as np
 import soundfile as sf
 from analyser import analyze_audio_forensics, encode_spectrogram_and_lookup, load_audio_resilient
 
-def audit_track_pair(src_path, dst_path):
+def audit_track_pair(src_path, dst_path, applied_recipe=None):
     """
     Audits a single track before and after upsampling.
     """
     filename = os.path.basename(src_path)
+    rec = applied_recipe or {}
 
     # 1. Analyze Source (Before)
     try:
@@ -60,6 +61,9 @@ def audit_track_pair(src_path, dst_path):
     try: dst_info = sf.info(dst_path)
     except Exception: dst_info = type("Info", (), {"subtype": "PCM_24"})()
 
+    src_knee = (prov_src.get("visual_morphology") or {}).get("primary_knee") or {}
+    dst_knee = (prov_dst.get("visual_morphology") or {}).get("primary_knee") or {}
+
     return {
         "filename": filename,
         "src_path": src_path,
@@ -68,6 +72,9 @@ def audit_track_pair(src_path, dst_path):
         "dst_sr": sr_dst,
         "src_nyquist": sr_src / 2000.0,
         "dst_nyquist": sr_dst / 2000.0,
+        "src_knee_khz": src_knee.get("freq_khz"),
+        "dst_knee_khz": dst_knee.get("freq_khz"),
+        "applied_cutoff_khz": (rec.get("cutoff_hz") / 1000.0) if rec.get("cutoff_hz") else None,
         "src_sub_format": src_info.subtype,
         "dst_sub_format": dst_info.subtype,
         "src_size_mb": round(sz_src / (1024 * 1024), 2),
@@ -107,7 +114,7 @@ def generate_comparative_report(source_target_pairs, album_title, applied_recipe
 
         filename = os.path.basename(src_path)
         print(f"   [Report Analysis] Auditing Before/After: {filename}...")
-        item = audit_track_pair(src_path, dst_path)
+        item = audit_track_pair(src_path, dst_path, applied_recipe=applied_recipe)
         comparisons.append(item)
 
         # Generate individual per-track report alongside the audio file
@@ -251,6 +258,32 @@ def write_single_track_html_report(filepath, item, applied_recipe):
             border: 1px solid #1f242e;
             margin-bottom: 12px;
         }}
+        .spec-ruler {{
+            position: absolute;
+            left: 8px;
+            top: 8px;
+            bottom: 8px;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+            pointer-events: none;
+            z-index: 2;
+            font-family: "SF Mono", "Roboto Mono", monospace;
+            font-size: 10px;
+            font-weight: 600;
+        }}
+        .ruler-tag {{
+            background: rgba(11, 14, 20, 0.75);
+            padding: 2px 5px;
+            border-radius: 4px;
+            border: 1px solid rgba(255, 255, 255, 0.15);
+            color: #f0f3f6;
+            backdrop-filter: blur(4px);
+        }}
+        .ruler-aud {{
+            color: var(--accent-green);
+            border-color: rgba(174, 234, 0, 0.4);
+        }}
         .spec-img {{
             width: 100%;
             height: 100%;
@@ -259,8 +292,8 @@ def write_single_track_html_report(filepath, item, applied_recipe):
         }}
         .canvas-container {{
             width: 100%;
-            height: 240px;
-            background: #11141a;
+            height: 270px;
+            background: #0b0e14;
             border-radius: 8px;
             border: 1px solid #1f242e;
             position: relative;
@@ -305,6 +338,11 @@ def write_single_track_html_report(filepath, item, applied_recipe):
                 <span class="badge" style="color: #fff; background: rgba(255,255,255,0.1); border-color: #444;">{item['src_sr']/1000.0:.1f}k / {item['src_sub_format']}</span>
             </div>
             <div class="spec-container">
+                <div class="spec-ruler">
+                    <span class="ruler-tag">{item['src_nyquist']:.1f} kHz</span>
+                    {f'<span class="ruler-tag ruler-aud">20.0 kHz</span>' if item['src_nyquist'] >= 20.0 else ''}
+                    <span class="ruler-tag">0 Hz</span>
+                </div>
                 <img src="data:image/webp;base64,{item['src_webp']}" class="spec-img" alt="Source Spectrogram" />
             </div>
             <div class="canvas-container">
@@ -330,6 +368,11 @@ def write_single_track_html_report(filepath, item, applied_recipe):
                 <span class="badge" style="color: var(--accent-green); background: rgba(174,234,0,0.1); border-color: rgba(174,234,0,0.3);">{item['dst_sr']/1000.0:.1f}k / {item['dst_sub_format']}</span>
             </div>
             <div class="spec-container">
+                <div class="spec-ruler">
+                    <span class="ruler-tag">{item['dst_nyquist']:.1f} kHz</span>
+                    {f'<span class="ruler-tag ruler-aud">20.0 kHz</span>' if item['dst_nyquist'] >= 20.0 else ''}
+                    <span class="ruler-tag">0 Hz</span>
+                </div>
                 <img src="data:image/webp;base64,{item['dst_webp']}" class="spec-img" alt="Upsampled Spectrogram" />
             </div>
             <div class="canvas-container">
@@ -352,8 +395,9 @@ def write_single_track_html_report(filepath, item, applied_recipe):
     <script>
         const item = {item_json};
 
-        function drawCurve(canvasId, curve, nyquist) {{
+        function drawForensicCurve(canvasId, curve, nyquist, cutoffKhz, kneeKhz) {{
             const canvas = document.getElementById(canvasId);
+            if (!canvas) return;
             const rect = canvas.getBoundingClientRect();
             const dpr = window.devicePixelRatio || 1;
             canvas.width = rect.width * dpr;
@@ -362,58 +406,202 @@ def write_single_track_html_report(filepath, item, applied_recipe):
             ctx.scale(dpr, dpr);
 
             const w = rect.width, h = rect.height;
-            const padL = 40, padR = 20, padT = 15, padB = 25;
+            const padL = 54, padR = 28, padT = 24, padB = 32;
             const plotW = w - padL - padR;
             const plotH = h - padT - padB;
 
             ctx.clearRect(0, 0, w, h);
-            ctx.fillStyle = '#11141a';
+            ctx.fillStyle = '#0b0e14';
             ctx.fillRect(padL, padT, plotW, plotH);
+            ctx.strokeStyle = '#1e2638';
+            ctx.lineWidth = 1;
+            ctx.strokeRect(padL, padT, plotW, plotH);
 
-            const fMin = 0, fMax = nyquist * 1.05;
+            const fMin = 0, fMax = Math.max(22.05, nyquist * 1.04);
             const dbMin = -160, dbMax = 0;
 
             function fToX(f) {{ return padL + ((f - fMin) / (fMax - fMin)) * plotW; }}
             function dbToY(db) {{ return padT + (1.0 - (Math.max(dbMin, Math.min(dbMax, db)) - dbMin) / (dbMax - dbMin)) * plotH; }}
 
-            // Nyquist Line
+            // 1. Horizontal dBFS Grid & Axis Ticks
+            const dbSteps = [0, -20, -40, -60, -80, -100, -120, -140, -160];
+            ctx.font = '10px "SF Mono", "Roboto Mono", monospace';
+            ctx.textAlign = 'right';
+            ctx.textBaseline = 'middle';
+
+            dbSteps.forEach(db => {{
+                const y = dbToY(db);
+                ctx.strokeStyle = db === 0 ? 'rgba(255,255,255,0.18)' : 'rgba(255,255,255,0.06)';
+                ctx.setLineDash([]);
+                ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(padL + plotW, y); ctx.stroke();
+
+                ctx.fillStyle = '#8b949e';
+                ctx.fillText(`${{db}}`, padL - 8, y);
+            }});
+
+            // dBFS Axis Title
+            ctx.save();
+            ctx.translate(14, padT + plotH / 2);
+            ctx.rotate(-Math.PI / 2);
+            ctx.textAlign = 'center';
+            ctx.fillStyle = '#6e7681';
+            ctx.font = '10px sans-serif';
+            ctx.fillText('Amplitude (dBFS)', 0, 0);
+            ctx.restore();
+
+            // 2. Reference Quantization Noise Floor Lines
+            // 16-bit PCM Floor (-96.33 dBFS)
+            const y16 = dbToY(-96.33);
+            ctx.strokeStyle = 'rgba(255, 171, 0, 0.4)';
+            ctx.lineWidth = 1;
+            ctx.setLineDash([3, 3]);
+            ctx.beginPath(); ctx.moveTo(padL, y16); ctx.lineTo(padL + plotW, y16); ctx.stroke();
+            ctx.fillStyle = 'rgba(255, 171, 0, 0.85)';
+            ctx.textAlign = 'left';
+            ctx.fillText('16-bit Floor (-96 dB)', padL + 6, y16 - 6);
+
+            // 24-bit PCM Floor (-144.49 dBFS)
+            const y24 = dbToY(-144.49);
+            ctx.strokeStyle = 'rgba(0, 229, 255, 0.35)';
+            ctx.setLineDash([3, 3]);
+            ctx.beginPath(); ctx.moveTo(padL, y24); ctx.lineTo(padL + plotW, y24); ctx.stroke();
+            ctx.fillStyle = 'rgba(0, 229, 255, 0.75)';
+            ctx.fillText('24-bit Floor (-144 dB)', padL + 6, y24 - 6);
+
+            // 3. Vertical Frequency Grid & Axis Ticks
+            let fTicks = [0, 5, 10, 15, 20, 22.05];
+            if (nyquist > 25 && nyquist <= 50) fTicks = [0, 10, 20, 30, 40, nyquist <= 44.1 ? 44.1 : 48];
+            else if (nyquist > 50 && nyquist <= 100) fTicks = [0, 20, 40, 44.1, 60, 80, nyquist <= 88.2 ? 88.2 : 96];
+            else if (nyquist > 100) fTicks = [0, 20, 44.1, 88.2, 120, 160, 176.4, 192];
+
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'top';
+            ctx.setLineDash([]);
+
+            fTicks.forEach(f => {{
+                if (f > fMax) return;
+                const x = fToX(f);
+                ctx.strokeStyle = 'rgba(255,255,255,0.06)';
+                ctx.beginPath(); ctx.moveTo(x, padT); ctx.lineTo(x, padT + plotH); ctx.stroke();
+
+                ctx.fillStyle = (f === 20 || f === 22.05 || f === 44.1 || f === 48 || f === 88.2 || f === 96 || f === 176.4 || f === 192) ? '#00e5ff' : '#8b949e';
+                const label = f === 0 ? '0' : (f >= 1 ? `${{Number.isInteger(f) ? f : f.toFixed(1)}}k` : `${{f*1000}}`);
+                ctx.fillText(label, x, padT + plotH + 6);
+            }});
+
+            // Frequency Axis Title
+            ctx.fillStyle = '#6e7681';
+            ctx.font = '10px sans-serif';
+            ctx.fillText('Frequency (kHz)', padL + plotW / 2, padT + plotH + 18);
+
+            // 4. Special Frequency Boundary Markers
+            // Audible Limit (20 kHz)
+            if (fMax >= 20.0) {{
+                const x20 = fToX(20.0);
+                ctx.strokeStyle = 'rgba(174, 234, 0, 0.7)';
+                ctx.setLineDash([4, 4]);
+                ctx.beginPath(); ctx.moveTo(x20, padT); ctx.lineTo(x20, padT + plotH); ctx.stroke();
+                ctx.fillStyle = '#aeea00';
+                ctx.font = '9px monospace';
+                ctx.textAlign = 'center';
+                ctx.fillText('20k Aud', x20, padT - 14);
+            }}
+
+            // Nyquist Limit Line
             const xNyq = fToX(nyquist);
             ctx.strokeStyle = '#ffab00';
             ctx.setLineDash([4, 4]);
             ctx.beginPath(); ctx.moveTo(xNyq, padT); ctx.lineTo(xNyq, padT + plotH); ctx.stroke();
-            ctx.setLineDash([]);
             ctx.fillStyle = '#ffab00';
             ctx.font = '9px monospace';
-            ctx.fillText(`${{nyquist.toFixed(1)}}k Nyq`, xNyq - 30, padT + 10);
+            ctx.textAlign = 'center';
+            ctx.fillText(`${{nyquist.toFixed(1)}}k Nyq`, xNyq, padT - 14);
 
-            // Peak curve (Cyan)
-            ctx.strokeStyle = '#00e5ff';
-            ctx.lineWidth = 1.2;
-            ctx.beginPath();
-            curve.f.forEach((f, i) => {{
-                const x = fToX(f), y = dbToY(curve.pk[i]);
-                if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
-            }});
-            ctx.stroke();
+            // Cutoff Marker (if active)
+            if (cutoffKhz && cutoffKhz < nyquist && cutoffKhz > 0) {{
+                const xCut = fToX(cutoffKhz);
+                ctx.strokeStyle = '#ff5252';
+                ctx.setLineDash([2, 2]);
+                ctx.beginPath(); ctx.moveTo(xCut, padT); ctx.lineTo(xCut, padT + plotH); ctx.stroke();
+                ctx.fillStyle = '#ff5252';
+                ctx.fillText(`Cutoff ${{cutoffKhz.toFixed(1)}}k`, xCut, padT - 14);
+            }}
 
-            // RMS curve (Pink)
-            ctx.strokeStyle = '#ff007f';
-            ctx.lineWidth = 1.2;
-            ctx.beginPath();
-            curve.f.forEach((f, i) => {{
-                const x = fToX(f), y = dbToY(curve.rms[i]);
-                if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
-            }});
-            ctx.stroke();
+            // Detected Knee Marker (if present)
+            if (kneeKhz && kneeKhz > 0 && Math.abs(kneeKhz - nyquist) > 1.0) {{
+                const xKnee = fToX(kneeKhz);
+                ctx.strokeStyle = '#e040fb';
+                ctx.setLineDash([2, 4]);
+                ctx.beginPath(); ctx.moveTo(xKnee, padT); ctx.lineTo(xKnee, padT + plotH); ctx.stroke();
+                ctx.fillStyle = '#e040fb';
+                ctx.fillText(`Knee ${{kneeKhz.toFixed(1)}}k`, xKnee, (cutoffKhz && Math.abs(cutoffKhz - kneeKhz) < 4.0) ? (padT + 10) : (padT - 14));
+            }}
+
+            ctx.setLineDash([]);
+
+            // 5. RMS Energy Shading (Pink gradient)
+            if (curve && curve.f && curve.f.length > 0) {{
+                const grad = ctx.createLinearGradient(0, padT, 0, padT + plotH);
+                grad.addColorStop(0, 'rgba(255, 0, 127, 0.18)');
+                grad.addColorStop(1, 'rgba(255, 0, 127, 0.0)');
+                ctx.fillStyle = grad;
+                ctx.beginPath();
+                ctx.moveTo(fToX(curve.f[0]), padT + plotH);
+                curve.f.forEach((f, i) => {{
+                    ctx.lineTo(fToX(f), dbToY(curve.rms[i]));
+                }});
+                ctx.lineTo(fToX(curve.f[curve.f.length - 1]), padT + plotH);
+                ctx.closePath();
+                ctx.fill();
+
+                // 6. RMS Curve (Pink)
+                ctx.strokeStyle = '#ff007f';
+                ctx.lineWidth = 1.3;
+                ctx.beginPath();
+                curve.f.forEach((f, i) => {{
+                    const x = fToX(f), y = dbToY(curve.rms[i]);
+                    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+                }});
+                ctx.stroke();
+
+                // 7. Peak Curve (Cyan)
+                ctx.strokeStyle = '#00e5ff';
+                ctx.lineWidth = 1.4;
+                ctx.beginPath();
+                curve.f.forEach((f, i) => {{
+                    const x = fToX(f), y = dbToY(curve.pk[i]);
+                    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+                }});
+                ctx.stroke();
+            }}
+
+            // 8. Legend Box (Top-Right)
+            const legX = padL + plotW - 130;
+            const legY = padT + 8;
+            ctx.fillStyle = 'rgba(11, 14, 20, 0.85)';
+            ctx.fillRect(legX, legY, 122, 38);
+            ctx.strokeStyle = '#232936';
+            ctx.strokeRect(legX, legY, 122, 38);
+
+            // Peak
+            ctx.strokeStyle = '#00e5ff'; ctx.lineWidth = 2;
+            ctx.beginPath(); ctx.moveTo(legX + 8, legY + 12); ctx.lineTo(legX + 24, legY + 12); ctx.stroke();
+            ctx.fillStyle = '#f0f3f6'; ctx.font = '9px sans-serif'; ctx.textAlign = 'left';
+            ctx.fillText('Peak Level', legX + 30, legY + 12);
+
+            // RMS
+            ctx.strokeStyle = '#ff007f'; ctx.lineWidth = 2;
+            ctx.beginPath(); ctx.moveTo(legX + 8, legY + 26); ctx.lineTo(legX + 24, legY + 26); ctx.stroke();
+            ctx.fillText('RMS Energy', legX + 30, legY + 26);
         }}
 
         window.addEventListener('load', () => {{
-            drawCurve('srcCurveCanvas', item.src_curve, item.src_nyquist);
-            drawCurve('dstCurveCanvas', item.dst_curve, item.dst_nyquist);
+            drawForensicCurve('srcCurveCanvas', item.src_curve, item.src_nyquist, null, item.src_knee_khz);
+            drawForensicCurve('dstCurveCanvas', item.dst_curve, item.dst_nyquist, item.applied_cutoff_khz, item.dst_knee_khz);
         }});
         window.addEventListener('resize', () => {{
-            drawCurve('srcCurveCanvas', item.src_curve, item.src_nyquist);
-            drawCurve('dstCurveCanvas', item.dst_curve, item.dst_nyquist);
+            drawForensicCurve('srcCurveCanvas', item.src_curve, item.src_nyquist, null, item.src_knee_khz);
+            drawForensicCurve('dstCurveCanvas', item.dst_curve, item.dst_nyquist, item.applied_cutoff_khz, item.dst_knee_khz);
         }});
     </script>
 </body>
@@ -614,6 +802,11 @@ def write_album_html_report(filepath, comparisons, album_title, applied_recipe):
                 <span id="srcFmtBadge" class="badge" style="color: #fff; background: rgba(255,255,255,0.1); border-color: #444;">--</span>
             </div>
             <div class="spec-container">
+                <div class="spec-ruler" id="srcSpecRuler">
+                    <span class="ruler-tag" id="srcRulerTop">-- kHz</span>
+                    <span class="ruler-tag ruler-aud">20.0 kHz</span>
+                    <span class="ruler-tag">0 Hz</span>
+                </div>
                 <img id="srcSpecImg" class="spec-img" alt="Source Spectrogram" />
             </div>
             <div class="canvas-container">
@@ -638,6 +831,11 @@ def write_album_html_report(filepath, comparisons, album_title, applied_recipe):
                 <span id="dstFmtBadge" class="badge" style="color: var(--accent-green); background: rgba(174,234,0,0.1); border-color: rgba(174,234,0,0.3);">--</span>
             </div>
             <div class="spec-container">
+                <div class="spec-ruler" id="dstSpecRuler">
+                    <span class="ruler-tag" id="dstRulerTop">-- kHz</span>
+                    <span class="ruler-tag ruler-aud">20.0 kHz</span>
+                    <span class="ruler-tag">0 Hz</span>
+                </div>
                 <img id="dstSpecImg" class="spec-img" alt="Upsampled Spectrogram" />
             </div>
             <div class="canvas-container">
@@ -703,6 +901,9 @@ def write_album_html_report(filepath, comparisons, album_title, applied_recipe):
             document.getElementById('srcSpecImg').src = 'data:image/webp;base64,' + item.src_webp;
             document.getElementById('dstSpecImg').src = 'data:image/webp;base64,' + item.dst_webp;
 
+            document.getElementById('srcRulerTop').textContent = `${{item.src_nyquist.toFixed(1)}} kHz`;
+            document.getElementById('dstRulerTop').textContent = `${{item.dst_nyquist.toFixed(1)}} kHz`;
+
             document.getElementById('srcSrVal').textContent = `${{item.src_sr.toLocaleString()}} Hz (${{item.src_sub_format}})`;
             document.getElementById('dstSrVal').textContent = `${{item.dst_sr.toLocaleString()}} Hz (${{item.dst_sub_format}})`;
 
@@ -724,12 +925,13 @@ def write_album_html_report(filepath, comparisons, album_title, applied_recipe):
             document.getElementById('srcCrestVal').textContent = `${{item.src_crest}} dB`;
             document.getElementById('dstCrestVal').textContent = `${{item.dst_crest}} dB`;
 
-            drawCurve('srcCurveCanvas', item.src_curve, item.src_nyquist);
-            drawCurve('dstCurveCanvas', item.dst_curve, item.dst_nyquist);
+            drawForensicCurve('srcCurveCanvas', item.src_curve, item.src_nyquist, null, item.src_knee_khz);
+            drawForensicCurve('dstCurveCanvas', item.dst_curve, item.dst_nyquist, item.applied_cutoff_khz, item.dst_knee_khz);
         }}
 
-        function drawCurve(canvasId, curve, nyquist) {{
+        function drawForensicCurve(canvasId, curve, nyquist, cutoffKhz, kneeKhz) {{
             const canvas = document.getElementById(canvasId);
+            if (!canvas) return;
             const rect = canvas.getBoundingClientRect();
             const dpr = window.devicePixelRatio || 1;
             canvas.width = rect.width * dpr;
@@ -738,49 +940,193 @@ def write_album_html_report(filepath, comparisons, album_title, applied_recipe):
             ctx.scale(dpr, dpr);
 
             const w = rect.width, h = rect.height;
-            const padL = 40, padR = 20, padT = 15, padB = 25;
+            const padL = 54, padR = 28, padT = 24, padB = 32;
             const plotW = w - padL - padR;
             const plotH = h - padT - padB;
 
             ctx.clearRect(0, 0, w, h);
-            ctx.fillStyle = '#11141a';
+            ctx.fillStyle = '#0b0e14';
             ctx.fillRect(padL, padT, plotW, plotH);
+            ctx.strokeStyle = '#1e2638';
+            ctx.lineWidth = 1;
+            ctx.strokeRect(padL, padT, plotW, plotH);
 
-            const fMin = 0, fMax = nyquist * 1.05;
+            const fMin = 0, fMax = Math.max(22.05, nyquist * 1.04);
             const dbMin = -160, dbMax = 0;
 
             function fToX(f) {{ return padL + ((f - fMin) / (fMax - fMin)) * plotW; }}
             function dbToY(db) {{ return padT + (1.0 - (Math.max(dbMin, Math.min(dbMax, db)) - dbMin) / (dbMax - dbMin)) * plotH; }}
 
-            // Nyquist Line
+            // 1. Horizontal dBFS Grid & Axis Ticks
+            const dbSteps = [0, -20, -40, -60, -80, -100, -120, -140, -160];
+            ctx.font = '10px "SF Mono", "Roboto Mono", monospace';
+            ctx.textAlign = 'right';
+            ctx.textBaseline = 'middle';
+
+            dbSteps.forEach(db => {{
+                const y = dbToY(db);
+                ctx.strokeStyle = db === 0 ? 'rgba(255,255,255,0.18)' : 'rgba(255,255,255,0.06)';
+                ctx.setLineDash([]);
+                ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(padL + plotW, y); ctx.stroke();
+
+                ctx.fillStyle = '#8b949e';
+                ctx.fillText(`${{db}}`, padL - 8, y);
+            }});
+
+            // dBFS Axis Title
+            ctx.save();
+            ctx.translate(14, padT + plotH / 2);
+            ctx.rotate(-Math.PI / 2);
+            ctx.textAlign = 'center';
+            ctx.fillStyle = '#6e7681';
+            ctx.font = '10px sans-serif';
+            ctx.fillText('Amplitude (dBFS)', 0, 0);
+            ctx.restore();
+
+            // 2. Reference Quantization Noise Floor Lines
+            // 16-bit PCM Floor (-96.33 dBFS)
+            const y16 = dbToY(-96.33);
+            ctx.strokeStyle = 'rgba(255, 171, 0, 0.4)';
+            ctx.lineWidth = 1;
+            ctx.setLineDash([3, 3]);
+            ctx.beginPath(); ctx.moveTo(padL, y16); ctx.lineTo(padL + plotW, y16); ctx.stroke();
+            ctx.fillStyle = 'rgba(255, 171, 0, 0.85)';
+            ctx.textAlign = 'left';
+            ctx.fillText('16-bit Floor (-96 dB)', padL + 6, y16 - 6);
+
+            // 24-bit PCM Floor (-144.49 dBFS)
+            const y24 = dbToY(-144.49);
+            ctx.strokeStyle = 'rgba(0, 229, 255, 0.35)';
+            ctx.setLineDash([3, 3]);
+            ctx.beginPath(); ctx.moveTo(padL, y24); ctx.lineTo(padL + plotW, y24); ctx.stroke();
+            ctx.fillStyle = 'rgba(0, 229, 255, 0.75)';
+            ctx.fillText('24-bit Floor (-144 dB)', padL + 6, y24 - 6);
+
+            // 3. Vertical Frequency Grid & Axis Ticks
+            let fTicks = [0, 5, 10, 15, 20, 22.05];
+            if (nyquist > 25 && nyquist <= 50) fTicks = [0, 10, 20, 30, 40, nyquist <= 44.1 ? 44.1 : 48];
+            else if (nyquist > 50 && nyquist <= 100) fTicks = [0, 20, 40, 44.1, 60, 80, nyquist <= 88.2 ? 88.2 : 96];
+            else if (nyquist > 100) fTicks = [0, 20, 44.1, 88.2, 120, 160, 176.4, 192];
+
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'top';
+            ctx.setLineDash([]);
+
+            fTicks.forEach(f => {{
+                if (f > fMax) return;
+                const x = fToX(f);
+                ctx.strokeStyle = 'rgba(255,255,255,0.06)';
+                ctx.beginPath(); ctx.moveTo(x, padT); ctx.lineTo(x, padT + plotH); ctx.stroke();
+
+                ctx.fillStyle = (f === 20 || f === 22.05 || f === 44.1 || f === 48 || f === 88.2 || f === 96 || f === 176.4 || f === 192) ? '#00e5ff' : '#8b949e';
+                const label = f === 0 ? '0' : (f >= 1 ? `${{Number.isInteger(f) ? f : f.toFixed(1)}}k` : `${{f*1000}}`);
+                ctx.fillText(label, x, padT + plotH + 6);
+            }});
+
+            // Frequency Axis Title
+            ctx.fillStyle = '#6e7681';
+            ctx.font = '10px sans-serif';
+            ctx.fillText('Frequency (kHz)', padL + plotW / 2, padT + plotH + 18);
+
+            // 4. Special Frequency Boundary Markers
+            // Audible Limit (20 kHz)
+            if (fMax >= 20.0) {{
+                const x20 = fToX(20.0);
+                ctx.strokeStyle = 'rgba(174, 234, 0, 0.7)';
+                ctx.setLineDash([4, 4]);
+                ctx.beginPath(); ctx.moveTo(x20, padT); ctx.lineTo(x20, padT + plotH); ctx.stroke();
+                ctx.fillStyle = '#aeea00';
+                ctx.font = '9px monospace';
+                ctx.textAlign = 'center';
+                ctx.fillText('20k Aud', x20, padT - 14);
+            }}
+
+            // Nyquist Limit Line
             const xNyq = fToX(nyquist);
             ctx.strokeStyle = '#ffab00';
             ctx.setLineDash([4, 4]);
             ctx.beginPath(); ctx.moveTo(xNyq, padT); ctx.lineTo(xNyq, padT + plotH); ctx.stroke();
-            ctx.setLineDash([]);
             ctx.fillStyle = '#ffab00';
             ctx.font = '9px monospace';
-            ctx.fillText(`${{nyquist.toFixed(1)}}k Nyq`, xNyq - 30, padT + 10);
+            ctx.textAlign = 'center';
+            ctx.fillText(`${{nyquist.toFixed(1)}}k Nyq`, xNyq, padT - 14);
 
-            // Peak curve (Cyan)
-            ctx.strokeStyle = '#00e5ff';
-            ctx.lineWidth = 1.2;
-            ctx.beginPath();
-            curve.f.forEach((f, i) => {{
-                const x = fToX(f), y = dbToY(curve.pk[i]);
-                if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
-            }});
-            ctx.stroke();
+            // Cutoff Marker (if active)
+            if (cutoffKhz && cutoffKhz < nyquist && cutoffKhz > 0) {{
+                const xCut = fToX(cutoffKhz);
+                ctx.strokeStyle = '#ff5252';
+                ctx.setLineDash([2, 2]);
+                ctx.beginPath(); ctx.moveTo(xCut, padT); ctx.lineTo(xCut, padT + plotH); ctx.stroke();
+                ctx.fillStyle = '#ff5252';
+                ctx.fillText(`Cutoff ${{cutoffKhz.toFixed(1)}}k`, xCut, padT - 14);
+            }}
 
-            // RMS curve (Pink)
-            ctx.strokeStyle = '#ff007f';
-            ctx.lineWidth = 1.2;
-            ctx.beginPath();
-            curve.f.forEach((f, i) => {{
-                const x = fToX(f), y = dbToY(curve.rms[i]);
-                if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
-            }});
-            ctx.stroke();
+            // Detected Knee Marker (if present)
+            if (kneeKhz && kneeKhz > 0 && Math.abs(kneeKhz - nyquist) > 1.0) {{
+                const xKnee = fToX(kneeKhz);
+                ctx.strokeStyle = '#e040fb';
+                ctx.setLineDash([2, 4]);
+                ctx.beginPath(); ctx.moveTo(xKnee, padT); ctx.lineTo(xKnee, padT + plotH); ctx.stroke();
+                ctx.fillStyle = '#e040fb';
+                ctx.fillText(`Knee ${{kneeKhz.toFixed(1)}}k`, xKnee, (cutoffKhz && Math.abs(cutoffKhz - kneeKhz) < 4.0) ? (padT + 10) : (padT - 14));
+            }}
+
+            ctx.setLineDash([]);
+
+            // 5. RMS Energy Shading (Pink gradient)
+            if (curve && curve.f && curve.f.length > 0) {{
+                const grad = ctx.createLinearGradient(0, padT, 0, padT + plotH);
+                grad.addColorStop(0, 'rgba(255, 0, 127, 0.18)');
+                grad.addColorStop(1, 'rgba(255, 0, 127, 0.0)');
+                ctx.fillStyle = grad;
+                ctx.beginPath();
+                ctx.moveTo(fToX(curve.f[0]), padT + plotH);
+                curve.f.forEach((f, i) => {{
+                    ctx.lineTo(fToX(f), dbToY(curve.rms[i]));
+                }});
+                ctx.lineTo(fToX(curve.f[curve.f.length - 1]), padT + plotH);
+                ctx.closePath();
+                ctx.fill();
+
+                // 6. RMS Curve (Pink)
+                ctx.strokeStyle = '#ff007f';
+                ctx.lineWidth = 1.3;
+                ctx.beginPath();
+                curve.f.forEach((f, i) => {{
+                    const x = fToX(f), y = dbToY(curve.rms[i]);
+                    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+                }});
+                ctx.stroke();
+
+                // 7. Peak Curve (Cyan)
+                ctx.strokeStyle = '#00e5ff';
+                ctx.lineWidth = 1.4;
+                ctx.beginPath();
+                curve.f.forEach((f, i) => {{
+                    const x = fToX(f), y = dbToY(curve.pk[i]);
+                    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+                }});
+                ctx.stroke();
+            }}
+
+            // 8. Legend Box (Top-Right)
+            const legX = padL + plotW - 130;
+            const legY = padT + 8;
+            ctx.fillStyle = 'rgba(11, 14, 20, 0.85)';
+            ctx.fillRect(legX, legY, 122, 38);
+            ctx.strokeStyle = '#232936';
+            ctx.strokeRect(legX, legY, 122, 38);
+
+            // Peak
+            ctx.strokeStyle = '#00e5ff'; ctx.lineWidth = 2;
+            ctx.beginPath(); ctx.moveTo(legX + 8, legY + 12); ctx.lineTo(legX + 24, legY + 12); ctx.stroke();
+            ctx.fillStyle = '#f0f3f6'; ctx.font = '9px sans-serif'; ctx.textAlign = 'left';
+            ctx.fillText('Peak Level', legX + 30, legY + 12);
+
+            // RMS
+            ctx.strokeStyle = '#ff007f'; ctx.lineWidth = 2;
+            ctx.beginPath(); ctx.moveTo(legX + 8, legY + 26); ctx.lineTo(legX + 24, legY + 26); ctx.stroke();
+            ctx.fillText('RMS Energy', legX + 30, legY + 26);
         }}
 
         function renderSummaryTable() {{
