@@ -1245,7 +1245,7 @@ class SessionPromptController:
 
         # If mode is 'auto'
         if self.mode == 'auto':
-            rec_params, rec_info = self._audit_track(filepath, print_card=False)
+            rec_params, rec_info, _, _ = self._audit_track(filepath, print_card=False)
             dsp_str = rec_info.get("dsp_params", "--phase min --dither shibata")
             print(f">>> [Auto-Recommended] {os.path.basename(filepath)} -> {dsp_str}")
             self.track_decisions[filepath] = rec_params
@@ -1256,7 +1256,7 @@ class SessionPromptController:
             return None, 'album'
 
         # If mode is 'ask' -> Interactive Card Prompt
-        rec_params, rec_info = self._audit_track(filepath, print_card=True, track_idx=track_idx, total_tracks=total_tracks)
+        rec_params, rec_info, prov_info, sr = self._audit_track(filepath, print_card=True, track_idx=track_idx, total_tracks=total_tracks)
         dsp_str = rec_info.get("dsp_params", "--phase min --dither shibata")
 
         # Check if an album analysis summary / report exists in the folder
@@ -1270,8 +1270,10 @@ class SessionPromptController:
             "filepath": filepath,
             "track_idx": track_idx,
             "total_tracks": total_tracks,
+            "sr": sr,
             "rec_params": rec_params,
             "rec_info": rec_info,
+            "prov_info": prov_info,
             "has_summary": has_summary,
             "album_dir": album_dir
         }
@@ -1486,7 +1488,7 @@ class SessionPromptController:
             "dither_mode": rec_dither,
             "mqa_mode": rec_mqa,
             "steep": rec_steep
-        }, rec
+        }, rec, prov_info, sr
 
 
 def main():

@@ -3566,6 +3566,7 @@ HTML_PAGE = """<!DOCTYPE html>
         function renderInteractivePromptUI(pData) {
             const scopeBadge = document.getElementById('upsampleModalScopeBadge');
             const srcInput = document.getElementById('upsampleSrcPath');
+            const dstInput = document.getElementById('upsampleDstDir');
             const initialLaunchControls = document.getElementById('initialLaunchControls');
             const interactiveDecisionControls = document.getElementById('interactiveDecisionControls');
 
@@ -3578,18 +3579,53 @@ HTML_PAGE = """<!DOCTYPE html>
             scopeBadge.style.color = 'var(--accent-yellow)';
 
             srcInput.value = pData.filepath || '';
+            if (pData.album_dir && (!dstInput.value || dstInput.value.trim() === '')) {
+                fetch(`/api/upsample/dest_preview?path=${encodeURIComponent(pData.album_dir)}`)
+                    .then(r => r.json())
+                    .then(d => { if (d && d.dest_dir) dstInput.value = d.dest_dir; })
+                    .catch(() => {});
+            }
 
             // Populate Forensic Audit Card
             const recInfo = pData.rec_info || {};
             const recParams = pData.rec_params || {};
+            const provInfo = pData.prov_info || {};
+            const primary = provInfo.primary || {};
+            const vis = provInfo.visual_morphology || {};
+            const pk = vis.primary_knee || {};
+            const purity = vis.stopband_purity || {};
+            const srKhz = pData.sr ? (pData.sr / 1000).toFixed(1) : '44.1';
 
             document.getElementById('promptTrackTitle').textContent = `[Track ${pData.track_idx}/${pData.total_tracks}] ${pData.track_file || 'Track'}`;
-            document.getElementById('promptProvLabel').textContent = recInfo.action ? (recInfo.is_potential ? 'POTENTIAL ' : '') + recInfo.action.toUpperCase() : 'STANDARD MASTER';
-            document.getElementById('promptFormatMeta').textContent = `Auditing Master: ${pData.track_file}`;
-            document.getElementById('promptMetricsRow').textContent = recInfo.filter_cutoff_khz ? `📐 Detected Cutoff: ${recInfo.filter_cutoff_khz} kHz` : 'Standard Nyquist Master';
-            document.getElementById('promptActionDesc').textContent = recInfo.action ? `${recInfo.action}` : 'Direct Sinc Upsampling';
+            
+            const provLabel = primary.label ? `${primary.label.toUpperCase()} [${primary.confidence || 'HIGH'} CONFIDENCE]` : (recInfo.action ? recInfo.action.toUpperCase() : 'STANDARD MASTER');
+            const provEl = document.getElementById('promptProvLabel');
+            provEl.textContent = provLabel;
+            provEl.className = 'provenance-tag ' + (primary.label === 'Native Master' ? 'badge-provenance-native' : (primary.label === 'Lowpass Filtered' ? 'badge-provenance-lowpass' : 'badge-provenance-upsampled'));
+
+            document.getElementById('promptFormatMeta').textContent = `Source Format: ${srKhz} kHz • 2 Channels • Master FLAC`;
+            
+            let metricText = '';
+            if (pk && pk.is_brickwall_knee) {
+                metricText += `📐 Brickwall Knee: ${pk.freq_khz ? pk.freq_khz.toFixed(1) : ''} kHz (Slope: ${pk.steepest_slope_db_per_khz ? pk.steepest_slope_db_per_khz.toFixed(1) : ''} dB/kHz, Drop: ${pk.drop_db ? pk.drop_db.toFixed(1) : ''} dB) • `;
+            }
+            if (purity && purity.has_stopband) {
+                metricText += `📻 Stopband: ${purity.purity_label || 'Clean'} • `;
+            }
+            metricText += `📊 64-Bit Sinc Polyphase Reconstruction`;
+            document.getElementById('promptMetricsRow').textContent = metricText;
+
+            document.getElementById('promptActionDesc').textContent = recInfo.action ? `${recInfo.action}` : 'Direct 64-Bit Sinc Upsampling';
             document.getElementById('promptDspFlag').textContent = recInfo.dsp_params || '--phase min --dither shibata';
-            document.getElementById('promptTechnicalRationale').textContent = recInfo.details || 'Applies strict 64-bit float precision sinc filter tailored to this track.';
+            
+            // Detailed Technical Rationale
+            if (recInfo.details) {
+                document.getElementById('promptTechnicalRationale').textContent = recInfo.details;
+            } else if (primary.label === 'Lowpass Filtered') {
+                document.getElementById('promptTechnicalRationale').textContent = 'A steep lowpass reconstruction knee was detected. A minimum-phase apodizing sinc filter is recommended to eliminate pre-ringing impulse artefacts and suppress ultrasonic alias imaging without touching audible frequencies.';
+            } else {
+                document.getElementById('promptTechnicalRationale').textContent = 'Preserves pristine bit-perfect audio fidelity across audible octaves while providing optimal 64-bit double-precision sinc reconstruction with psychoacoustic 24-bit Shibata noise shaping.';
+            }
 
             // Populate form overrides from recommended parameters
             const rateSelect = document.getElementById('upsampleRate');
@@ -3611,7 +3647,7 @@ HTML_PAGE = """<!DOCTYPE html>
                 apodizingCheck.checked = true;
                 cutoffInput.disabled = false;
                 cutoffInput.value = Math.round(recParams.cutoff_hz);
-                if (cutoffHint) cutoffHint.textContent = `Recommended (${cutoffInput.value} Hz)`;
+                if (cutoffHint) cutoffHint.textContent = `Recommended (${cutoffInput.value} Hz Knee)`;
             } else if (recParams.apodizing) {
                 apodizingCheck.checked = true;
                 cutoffInput.disabled = false;
@@ -3630,6 +3666,70 @@ HTML_PAGE = """<!DOCTYPE html>
             }
         }
 
+        async function startUpsampleAlbumBatch(interactiveMode = true) {
+            if (!currentPath) {
+                alert('Please navigate to an album directory first.');
+                return;
+            }
+
+            let dstDir = '';
+            try {
+                const res = await fetch(`/api/upsample/dest_preview?path=${encodeURIComponent(currentPath)}`);
+                const data = await res.json();
+                if (data && data.dest_dir) {
+                    dstDir = data.dest_dir;
+                }
+            } catch (err) {}
+
+            const payload = {
+                source_path: currentPath,
+                dest_dir: dstDir,
+                rate: '4x',
+                phase: 'min',
+                apodizing: false,
+                cutoff_hz: null,
+                steep: false,
+                dither: 'shibata',
+                mqa: 'adaptive',
+                overwrite: 'off',
+                report: true,
+                interactive: interactiveMode,
+                use_recommended: true
+            };
+
+            try {
+                closeUpsampleModal();
+                updateHeaderUpsampleUI({ 
+                    status: 'running', 
+                    stage: 'Scanning Headroom & Auditing Track 1...', 
+                    progress_percent: 2, 
+                    current_track: 'Auditing Track 1...',
+                    track_index: 1,
+                    total_tracks: directoryData && directoryData.files ? directoryData.files.length : 1
+                });
+
+                const res = await fetch('/api/upsample/start', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+                const data = await res.json();
+                if (data.status !== 'ok') {
+                    dismissUpsampleHeaderWidget();
+                    alert('Failed to start upsampling session: ' + (data.message || 'Unknown error'));
+                    return;
+                }
+
+                activeUpsampleJob = data;
+                lastLogIdx = 0;
+                activePromptTrack = null;
+                startPollingUpsampleStatus();
+            } catch (err) {
+                dismissUpsampleHeaderWidget();
+                alert('Error starting upsampler: ' + err.message);
+            }
+        }
+
         function openUpsampleModalForTrack() {
             if (!currentAnalysis || !currentAnalysis.filepath) {
                 alert('Please select and analyze a track first.');
@@ -3639,7 +3739,7 @@ HTML_PAGE = """<!DOCTYPE html>
         }
 
         function openUpsampleModalForCurrentFolder() {
-            openUpsampleModal('album', currentPath);
+            startUpsampleAlbumBatch(true);
         }
 
         function closeUpsampleModal() {
@@ -3802,6 +3902,14 @@ HTML_PAGE = """<!DOCTYPE html>
             };
 
             try {
+                closeUpsampleModal();
+                updateHeaderUpsampleUI({ 
+                    status: 'running', 
+                    stage: 'Scanning Headroom & Auditing...', 
+                    progress_percent: 2, 
+                    current_track: 'Initializing...' 
+                });
+
                 const res = await fetch('/api/upsample/start', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
@@ -3809,17 +3917,17 @@ HTML_PAGE = """<!DOCTYPE html>
                 });
                 const data = await res.json();
                 if (data.status !== 'ok') {
+                    dismissUpsampleHeaderWidget();
                     alert('Failed to start upsampling job: ' + (data.message || 'Unknown error'));
                     return;
                 }
 
-                closeUpsampleModal();
                 activeUpsampleJob = data;
                 lastLogIdx = 0;
                 activePromptTrack = null;
-                updateHeaderUpsampleUI({ status: 'running', stage: 'Scanning Headroom...', progress_percent: 2, current_track: 'Initializing...' });
                 startPollingUpsampleStatus();
             } catch (err) {
+                dismissUpsampleHeaderWidget();
                 alert('Error submitting upsampling job: ' + err.message);
             }
         }
