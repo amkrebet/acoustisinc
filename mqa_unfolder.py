@@ -18,7 +18,7 @@ def probe_mqa_track(filepath=None, pcm_int32=None, sr=44100):
     """
     sig = detect_mqa_signature(filepath=filepath, pcm_int32=pcm_int32, sr=sr)
     if sig.get("is_mqa"):
-        orig_sr = sig.get("original_sr") or (sr * 2)
+        orig_sr = sig.get("original_sr") or sr
         is_studio = sig.get("is_studio", False)
         return True, orig_sr, is_studio, sig
     return False, sr, False, sig

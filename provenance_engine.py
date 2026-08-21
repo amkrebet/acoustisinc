@@ -166,7 +166,7 @@ def detect_mqa_signature(filepath=None, pcm_int32=None, sr=44100):
                             pass
                 if details["is_mqa"]:
                     if details["original_sr"] is None:
-                        details["original_sr"] = sr * 2
+                        details["original_sr"] = sr
                     return details
         except Exception:
             pass
@@ -477,16 +477,20 @@ class ProvenanceRuleEngine:
 
         if mqa_info and mqa_info.get("is_mqa"):
             mqa_cfg = rules.get("mqa_rules", {})
-            orig_sr = mqa_info.get("original_sr") or (sr * 2)
+            orig_sr = mqa_info.get("original_sr") or sr
             is_studio = mqa_info.get("is_studio", False)
             tag_name = "MQA Studio Master" if is_studio else "MQA Authenticated Master"
             meth = mqa_info.get("method", "BITSTREAM")
+            if orig_sr <= sr:
+                details_text = f"MQA container detected via {meth} on {sr/1000:.1f} kHz native master (no ultrasonic subbands folded)."
+            else:
+                details_text = f"Folded MQA ultrasonic subband detected via {meth}. Original Master: {orig_sr/1000:.1f} kHz."
             primary_prov = {
                 "label": f"{tag_name} (Orig: {orig_sr/1000:.1f} kHz)",
                 "confidence": mqa_cfg.get("confidence", "High"),
                 "score": mqa_cfg.get("confidence_score", 0.99),
                 "badge_class": mqa_cfg.get("badge_class", "badge-provenance-mqa"),
-                "details": f"Folded MQA ultrasonic subband detected via {meth}. Original Master: {orig_sr/1000:.1f} kHz."
+                "details": details_text
             }
         elif is_zero_stuffed:
             z_spec = rules.get("zero_stuffing", {})
@@ -977,16 +981,30 @@ def generate_dsp_recommendation(primary_prov, bitdepth_info, mqa_info, sr, nyqui
             "dsp_params": "--cutoff 21500 --steep"
         }
     elif "MQA" in label or (mqa_info and mqa_info.get("is_mqa")):
-        return {
-            "action_type": action_prefix,
-            "is_potential": is_potential,
-            "action": "Adaptive MQA Subband Unfold + Psychoacoustic Gating",
-            "action_short": "Adaptive MQA Unfold",
-            "risk_level": "Minimal Risk",
-            "risk_class": "risk-minimal",
-            "details": "MQA subband packaging detected. Unfold with psychoacoustic noise-gating to reconstruct transient details while suppressing high-frequency quantization noise.",
-            "dsp_params": "--mqa adaptive --dither shibata"
-        }
+        orig_sr = (mqa_info.get("original_sr") if mqa_info else None) or sr
+        if orig_sr <= sr:
+            return {
+                "action_type": action_prefix,
+                "is_potential": is_potential,
+                "action": f"MQA LSB De-Hashing & 24-Bit Re-Dithering ({sr/1000.0:.1f} kHz Native Master)",
+                "action_short": "Strip MQA Hash",
+                "risk_level": "Minimal Risk — Recommended",
+                "risk_class": "risk-minimal",
+                "details": f"MQA packaging detected on a {sr/1000.0:.1f} kHz native master (no ultrasonic subbands folded into container). Strip pseudo-random LSB bitstream payload to eliminate digital hash, apply 24-bit TPDF dither, and upsample with Shibata noise shaping.",
+                "dsp_params": "--mqa strip --dither shibata"
+            }
+        else:
+            orig_sr_str = f"{orig_sr:,} Hz"
+            return {
+                "action_type": action_prefix,
+                "is_potential": is_potential,
+                "action": f"Adaptive MQA Subband Unfold + Psychoacoustic Gating ({orig_sr_str} Master)",
+                "action_short": "Adaptive MQA Unfold",
+                "risk_level": "Minimal Risk",
+                "risk_class": "risk-minimal",
+                "details": f"MQA subband packaging detected (Original Master: {orig_sr_str}). Unfold with psychoacoustic noise-gating to reconstruct transient details while suppressing high-frequency quantization noise.",
+                "dsp_params": "--mqa adaptive --dither shibata"
+            }
     elif bitdepth_info and bitdepth_info.get("is_zero_padded"):
         tz = bitdepth_info.get("trailing_zero_bits", 8)
         eff = bitdepth_info.get("effective_bits", 16)

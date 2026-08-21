@@ -466,9 +466,27 @@ def copy_metadata_and_update_replaygain(src_path, dst_path, track_peak_lin, albu
             if hasattr(dst, 'clear_pictures'):
                 dst.clear_pictures()
 
+            # MQA tag keys to sanitize when saving upsampled / processed clean PCM
+            MQA_TAG_KEYS = {
+                "MQAENCODER", 
+                "ORIGINALSAMPLERATE", 
+                "MQAAUTHENTICATION", 
+                "MQA_SAMPLE_RATE", 
+                "MQA_ORIGINAL_SAMPLE_RATE",
+                "MQA_FLAGS"
+            }
+
             for key, value in src.tags.items():
-                if not key.upper().startswith("REPLAYGAIN_"):
-                    dst.tags[key] = value
+                ku = key.upper()
+                if ku.startswith("REPLAYGAIN_"):
+                    continue
+                if ku in MQA_TAG_KEYS:
+                    continue
+                if ku == "ENCODER":
+                    v_str = str(value[0] if isinstance(value, list) else value)
+                    if "MQA" in v_str.upper():
+                        continue
+                dst.tags[key] = value
 
             dest_dir = os.path.dirname(dst_path)
             cover_written = False
@@ -764,11 +782,19 @@ def process_track(filepath, dest_dir, gain_factor, album_max_peak_lin, queue, ph
                     print(f"{elapsed()} [MQA Pre-Processor] Detected {studio_tag} -> Stripping MQA payload bits & re-dithering...")
                     data, samplerate = strip_mqa_payload(data, samplerate)
                 elif mqa_mode == 'simple' and samplerate in (44100, 48000):
-                    print(f"{elapsed()} [MQA Pre-Processor] Detected {studio_tag} (Original Master: {orig_mqa_sr:,} Hz) -> Simple linear subband unfold ({samplerate} Hz -> {samplerate*2} Hz)...")
-                    data, samplerate = unfold_mqa_simple(data, samplerate)
+                    if orig_mqa_sr and orig_mqa_sr <= samplerate:
+                        print(f"{elapsed()} [MQA Pre-Processor] Detected {studio_tag} ({orig_mqa_sr:,} Hz native master, no ultrasonic subbands) -> Auto-routing to Strip & Re-Dither...")
+                        data, samplerate = strip_mqa_payload(data, samplerate)
+                    else:
+                        print(f"{elapsed()} [MQA Pre-Processor] Detected {studio_tag} (Original Master: {orig_mqa_sr:,} Hz) -> Simple linear subband unfold ({samplerate} Hz -> {samplerate*2} Hz)...")
+                        data, samplerate = unfold_mqa_simple(data, samplerate)
                 elif mqa_mode == 'adaptive' and samplerate in (44100, 48000):
-                    print(f"{elapsed()} [MQA Pre-Processor] Detected {studio_tag} (Original Master: {orig_mqa_sr:,} Hz) -> Adaptive companded unfold ({samplerate} Hz -> {samplerate*2} Hz | <= -95 dBFS floor)...")
-                    data, samplerate = unfold_mqa_adaptive(data, samplerate)
+                    if orig_mqa_sr and orig_mqa_sr <= samplerate:
+                        print(f"{elapsed()} [MQA Pre-Processor] Detected {studio_tag} ({orig_mqa_sr:,} Hz native master, no ultrasonic subbands) -> Auto-routing to Strip & Re-Dither...")
+                        data, samplerate = strip_mqa_payload(data, samplerate)
+                    else:
+                        print(f"{elapsed()} [MQA Pre-Processor] Detected {studio_tag} (Original Master: {orig_mqa_sr:,} Hz) -> Adaptive companded unfold ({samplerate} Hz -> {samplerate*2} Hz | <= -95 dBFS floor)...")
+                        data, samplerate = unfold_mqa_adaptive(data, samplerate)
         except Exception as e:
             pass
 
@@ -923,11 +949,13 @@ def process_album_folder(source_album_dir, dest_album_dir, queue, default_params
     gain_factor, album_max_peak_lin = scan_album(files)
     max_retries = 4; retry_count = 0; album_success = False
     last_track_params = default_params
+    processed_tracks = []
 
     while not album_success and retry_count <= max_retries:
         clipped_in_pass = False
         max_overshoot_peak = 0.0
         pass_futures = []
+        processed_tracks = []
 
         for idx, f in enumerate(files, 1):
             dest_file = os.path.join(dest_album_dir, os.path.basename(f))
@@ -943,6 +971,9 @@ def process_album_folder(source_album_dir, dest_album_dir, queue, default_params
 
             if prompt_ctrl is not None:
                 track_params, skip = prompt_ctrl.resolve_track_params(f, idx, len(files), default_params)
+                if skip == 'album' or getattr(prompt_ctrl, 'skip_album', False):
+                    print(f">>> Skipping remainder of album: {os.path.basename(source_album_dir)}\n")
+                    break
                 if skip:
                     continue
             else:
@@ -963,6 +994,24 @@ def process_album_folder(source_album_dir, dest_album_dir, queue, default_params
             )
             if fut is not None:
                 pass_futures.append(fut)
+            
+            t_recipe = {
+                "cli_params": f"--phase {track_params['phase_mode']} --dither {track_params['dither_mode']}" + (f" --cutoff {int(track_params['cutoff_hz'])}" if track_params.get('cutoff_hz') else "") + (f" --mqa {track_params['mqa_mode']}" if track_params.get('mqa_mode') != 'adaptive' else "") + (" --steep" if track_params.get('steep') else ""),
+                "topology_name": f"{track_params['phase_mode'].upper()} APODIZING" if (track_params.get('apodizing') or track_params.get('cutoff_hz')) else f"{track_params['phase_mode'].upper()}",
+                "gain_factor": gain_factor,
+                "gain_db": 20.0 * np.log10(gain_factor),
+                "cutoff_hz": track_params.get('cutoff_hz'),
+                "phase_mode": track_params['phase_mode'],
+                "dither_mode": track_params['dither_mode'],
+                "mqa_mode": track_params['mqa_mode'],
+                "steep": track_params.get('steep', False),
+                "date": time.strftime("%Y-%m-%d %H:%M:%S")
+            }
+            processed_tracks.append({
+                "src_path": f,
+                "dst_path": dest_file,
+                "recipe": t_recipe
+            })
             if clipped:
                 clipped_in_pass = True
                 max_overshoot_peak = out_peak
@@ -1018,23 +1067,32 @@ def process_album_folder(source_album_dir, dest_album_dir, queue, default_params
     print(f"\n>>> Directory completed cleanly! (Gain Factor: {gain_factor:.6f})")
 
     # Generate Full Before & After Comparative Upsampling Report
-    pairs = [(f, os.path.join(dest_album_dir, os.path.basename(f))) for f in files]
-    alb_name = os.path.basename(source_album_dir) or "Album"
-    applied_recipe = {
-        "cli_params": f"--phase {last_track_params['phase_mode']} --dither {last_track_params['dither_mode']}" + (f" --cutoff {int(last_track_params['cutoff_hz'])}" if last_track_params.get('cutoff_hz') else "") + (f" --mqa {last_track_params['mqa_mode']}" if last_track_params.get('mqa_mode') != 'adaptive' else "") + (" --steep" if last_track_params.get('steep') else ""),
-        "topology_name": f"{last_track_params['phase_mode'].upper()} APODIZING" if (last_track_params.get('apodizing') or last_track_params.get('cutoff_hz')) else f"{last_track_params['phase_mode'].upper()}",
-        "gain_factor": gain_factor,
-        "gain_db": 20.0 * np.log10(gain_factor),
-        "cutoff_hz": last_track_params.get('cutoff_hz')
-    }
-    try:
-        html_rep, md_rep = generate_comparative_report(pairs, alb_name, applied_recipe, dest_album_dir)
-        if html_rep:
-            print(f"\n   📊 [Comparative Upsampling Report Generated]")
-            print(f"      Interactive HTML Report: {html_rep}")
-            print(f"      Markdown Summary Report: {md_rep}")
-    except Exception as e:
-        print(f"   [Notice] Could not generate comparative report: {e}")
+    # ONLY analyze and generate reports if tracks were actually processed and album was not skipped
+    is_album_skipped = bool(prompt_ctrl and getattr(prompt_ctrl, 'skip_album', False))
+    if not is_album_skipped and processed_tracks:
+        valid_items = [t for t in processed_tracks if os.path.exists(t["dst_path"])]
+        if valid_items:
+            alb_name = os.path.basename(source_album_dir) or "Album"
+            applied_recipe = {
+                "cli_params": f"--phase {last_track_params['phase_mode']} --dither {last_track_params['dither_mode']}" + (f" --cutoff {int(last_track_params['cutoff_hz'])}" if last_track_params.get('cutoff_hz') else "") + (f" --mqa {last_track_params['mqa_mode']}" if last_track_params.get('mqa_mode') != 'adaptive' else "") + (" --steep" if last_track_params.get('steep') else ""),
+                "topology_name": f"{last_track_params['phase_mode'].upper()} APODIZING" if (last_track_params.get('apodizing') or last_track_params.get('cutoff_hz')) else f"{last_track_params['phase_mode'].upper()}",
+                "gain_factor": gain_factor,
+                "gain_db": 20.0 * np.log10(gain_factor),
+                "cutoff_hz": last_track_params.get('cutoff_hz'),
+                "date": time.strftime("%Y-%m-%d %H:%M:%S")
+            }
+            try:
+                html_rep, md_rep = generate_comparative_report(valid_items, alb_name, applied_recipe, dest_album_dir)
+                if html_rep:
+                    print(f"\n   📊 [Comparative Upsampling Report Generated]")
+                    print(f"      Interactive HTML Report: {html_rep}")
+                    print(f"      Markdown Summary Report: {md_rep}")
+            except Exception as e:
+                print(f"   [Notice] Could not generate comparative report: {e}")
+    elif is_album_skipped:
+        print(f"   [Report Notice] Album skipped by user. Comparative report analysis bypassed.")
+    elif not processed_tracks:
+        print(f"   [Report Notice] No tracks upsampled in this session. Comparative report analysis bypassed.")
 
 
 # ==============================================================================
@@ -1049,6 +1107,7 @@ class SessionPromptController:
         self.album_overwrite_mode = None  # None, 'on', 'off'
         self.default_params = default_params or {}
         self.locked_params = None
+        self.skip_album = False
         self.current_album_dir = None
         self.track_decisions = {}
         self.overwrite_decisions = {}
@@ -1068,6 +1127,7 @@ class SessionPromptController:
             if self.album_overwrite_mode is not None:
                 print(f"\n[AcoustiSinc] Resetting per-album overwrite setting for new directory: {folder_name}")
                 self.album_overwrite_mode = None
+            self.skip_album = False
         self.current_album_dir = album_dir
 
     def resolve_overwrite(self, dest_path, src_filepath, track_idx=1, total_tracks=1):
@@ -1190,73 +1250,149 @@ class SessionPromptController:
             self.track_decisions[filepath] = rec_params
             return rec_params, False
 
+        # If user chose to skip the rest of the album
+        if self.skip_album:
+            return None, 'album'
+
         # If mode is 'ask' -> Interactive Card Prompt
         rec_params, rec_info = self._audit_track(filepath, print_card=True, track_idx=track_idx, total_tracks=total_tracks)
         dsp_str = rec_info.get("dsp_params", "--phase min --dither shibata")
 
-        print("--------------------------------------------------------------------------------")
-        print("[Y] Accept for this track (Default)    |  [A] Auto-apply recommended for ALL remaining")
-        print("[C] Apply this recipe to REST of album |  [E] Edit parameters")
-        print("[S] Skip track                         |  [Q] Quit")
-        try:
-            choice = input("Choice [Y/a/c/e/s/q]: ").strip().lower()
-        except EOFError:
-            choice = 'y'
+        # Check if an album analysis summary / report exists in the folder
+        album_dir = self.current_album_dir or os.path.dirname(filepath)
+        album_summary_path = self._find_album_summary(album_dir)
+        has_summary = (album_summary_path is not None)
 
-        if choice in ['', 'y', 'yes']:
-            print(f">>> Applying recipe to {os.path.basename(filepath)}: {dsp_str}\n")
-            self.track_decisions[filepath] = rec_params
-            return rec_params, False
+        while True:
+            print("--------------------------------------------------------------------------------")
+            print("[Y] Accept for this track (Default)    |  [A] Auto-apply recommended for ALL remaining")
+            print("[C] Apply this recipe to REST of album |  [E] Edit parameters")
+            if has_summary:
+                print("[S] Skip this track                    |  [K] Skip REST of this album")
+                print("[V] View Album Analysis Summary        |  [Q] Quit")
+                prompt_str = "Choice [Y/a/c/e/s/k/v/q]: "
+            else:
+                print("[S] Skip this track                    |  [K] Skip REST of this album")
+                print("[Q] Quit")
+                prompt_str = "Choice [Y/a/c/e/s/k/q]: "
 
-        elif choice in ['a', 'all']:
-            print(f">>> Adopting recommended recipes automatically for this and ALL remaining tracks.\n")
-            self.mode = 'auto'
-            self.track_decisions[filepath] = rec_params
-            return rec_params, False
+            try:
+                choice = input(prompt_str).strip().lower()
+            except EOFError:
+                choice = 'y'
 
-        elif choice in ['c', 'continue', 'freeze']:
-            print(f">>> Freezing recipe ({dsp_str}) for the REST of this album directory.\n")
-            self.mode = 'locked'
-            self.locked_params = rec_params
-            self.track_decisions[filepath] = rec_params
-            return rec_params, False
+            if choice in ['v', 'view', 'summary']:
+                if album_summary_path:
+                    self._display_album_summary(album_summary_path)
+                else:
+                    print("\n⚠️  No album analysis summary file found in this folder.\n")
+                continue
 
-        elif choice in ['e', 'edit']:
-            custom_input = input("Enter custom CLI flags (e.g. --cutoff 22050 --phase min): ").strip()
-            edited = dict(rec_params)
-            if "--cutoff" in custom_input or "--apodize" in custom_input:
-                m = re.search(r"--(?:cutoff|apodize)\s+(\d+)", custom_input)
-                if m:
-                    edited['cutoff_hz'] = float(m.group(1))
-                    edited['apodizing'] = True
-            if "--phase" in custom_input:
-                m = re.search(r"--phase\s+(\w+)", custom_input)
-                if m: edited['phase_mode'] = m.group(1)
-            if "--dither" in custom_input:
-                m = re.search(r"--dither\s+(\w+)", custom_input)
-                if m: edited['dither_mode'] = m.group(1)
-            if "--mqa" in custom_input:
-                m = re.search(r"--mqa\s+(\w+)", custom_input)
-                if m: edited['mqa_mode'] = m.group(1)
+            if choice in ['', 'y', 'yes']:
+                print(f">>> Applying recipe to {os.path.basename(filepath)}: {dsp_str}\n")
+                self.track_decisions[filepath] = rec_params
+                return rec_params, False
 
-            scope = input("Apply custom recipe to: [1] This track only (Default)  [2] Rest of album: ").strip()
-            if scope == '2':
+            elif choice in ['a', 'all']:
+                print(f">>> Adopting recommended recipes automatically for this and ALL remaining tracks.\n")
+                self.mode = 'auto'
+                self.track_decisions[filepath] = rec_params
+                return rec_params, False
+
+            elif choice in ['c', 'continue', 'freeze']:
+                print(f">>> Freezing recipe ({dsp_str}) for the REST of this album directory.\n")
                 self.mode = 'locked'
-                self.locked_params = edited
-            self.track_decisions[filepath] = edited
-            return edited, False
+                self.locked_params = rec_params
+                self.track_decisions[filepath] = rec_params
+                return rec_params, False
 
-        elif choice in ['s', 'skip']:
-            print(f">>> Skipping track: {os.path.basename(filepath)}\n")
-            return None, True
+            elif choice in ['e', 'edit']:
+                custom_input = input("Enter custom CLI flags (e.g. --cutoff 22050 --phase min): ").strip()
+                edited = dict(rec_params)
+                if "--cutoff" in custom_input or "--apodize" in custom_input:
+                    m = re.search(r"--(?:cutoff|apodize)\s+(\d+)", custom_input)
+                    if m:
+                        edited['cutoff_hz'] = float(m.group(1))
+                        edited['apodizing'] = True
+                if "--phase" in custom_input:
+                    m = re.search(r"--phase\s+(\w+)", custom_input)
+                    if m: edited['phase_mode'] = m.group(1)
+                if "--dither" in custom_input:
+                    m = re.search(r"--dither\s+(\w+)", custom_input)
+                    if m: edited['dither_mode'] = m.group(1)
+                if "--mqa" in custom_input:
+                    m = re.search(r"--mqa\s+(\w+)", custom_input)
+                    if m: edited['mqa_mode'] = m.group(1)
 
-        elif choice in ['q', 'quit', 'abort']:
-            print("\n[AcoustiSinc] Processing aborted by user.")
-            sys.exit(0)
-        else:
-            print(f">>> Applying recipe to {os.path.basename(filepath)}: {dsp_str}\n")
-            self.track_decisions[filepath] = rec_params
-            return rec_params, False
+                scope = input("Apply custom recipe to: [1] This track only (Default)  [2] Rest of album: ").strip()
+                if scope == '2':
+                    self.mode = 'locked'
+                    self.locked_params = edited
+                self.track_decisions[filepath] = edited
+                return edited, False
+
+            elif choice in ['s', 'skip', 'skip_track']:
+                print(f">>> Skipping track: {os.path.basename(filepath)}\n")
+                return None, 'track'
+
+            elif choice in ['k', 'skip_album', 'skip_rest', 'skip_all']:
+                alb_label = os.path.basename(self.current_album_dir or os.path.dirname(filepath)) or "album"
+                print(f">>> Skipping this track and the REST of album directory: {alb_label}\n")
+                self.skip_album = True
+                return None, 'album'
+
+            elif choice in ['q', 'quit', 'abort']:
+                print("\n[AcoustiSinc] Processing aborted by user.")
+                sys.exit(0)
+            else:
+                print(f">>> Applying recipe to {os.path.basename(filepath)}: {dsp_str}\n")
+                self.track_decisions[filepath] = rec_params
+                return rec_params, False
+
+    def _find_album_summary(self, album_dir):
+        if not album_dir or not os.path.exists(album_dir):
+            return None
+        candidate_names = [
+            'ALBUM_REPORT.md',
+            'album_report.md',
+            'ALBUM_SUMMARY.md',
+            'album_summary.md',
+            'analysis_summary.md',
+            'ANALYSIS_SUMMARY.md',
+            'album_analysis.md',
+            'ALBUM_ANALYSIS.md',
+            'PROVENANCE_SUMMARY.md',
+            'provenance_summary.md',
+            'report.md',
+            'REPORT.md'
+        ]
+        for name in candidate_names:
+            p = os.path.join(album_dir, name)
+            if os.path.exists(p) and os.path.isfile(p):
+                return p
+        try:
+            for entry in os.scandir(album_dir):
+                if entry.is_file() and entry.name.lower().endswith(('_report.md', '_summary.md', 'album_report.md')):
+                    return entry.path
+        except Exception:
+            pass
+        return None
+
+    def _display_album_summary(self, summary_path):
+        if not summary_path or not os.path.exists(summary_path):
+            print("\n⚠️  No album analysis summary file found in this folder.\n")
+            return
+        filename = os.path.basename(summary_path)
+        print(f"\n================================================================================")
+        print(f"📋 ALBUM ANALYSIS SUMMARY: {filename}")
+        print(f"================================================================================")
+        try:
+            with open(summary_path, 'r', encoding='utf-8', errors='replace') as f:
+                content = f.read()
+            print(content)
+        except Exception as e:
+            print(f"[Error reading album summary]: {e}")
+        print(f"================================================================================\n")
 
     def _audit_track(self, filepath, print_card=False, track_idx=None, total_tracks=None):
         try:
@@ -1471,15 +1607,21 @@ def main():
         file_writer_pool.shutdown(wait=True)
 
         dest_file = os.path.join(target_dir, os.path.basename(source_path))
-        applied_recipe = {
+        t_recipe = {
             "cli_params": f"--phase {t_params['phase_mode']} --dither {t_params['dither_mode']}" + (f" --cutoff {int(t_params['cutoff_hz'])}" if t_params.get('cutoff_hz') else "") + (f" --mqa {t_params['mqa_mode']}" if t_params.get('mqa_mode') != 'adaptive' else "") + (" --steep" if t_params.get('steep') else ""),
             "topology_name": f"{t_params['phase_mode'].upper()} APODIZING" if (t_params.get('apodizing') or t_params.get('cutoff_hz')) else f"{t_params['phase_mode'].upper()}",
             "gain_factor": gain_factor,
             "gain_db": 20.0 * np.log10(gain_factor),
-            "cutoff_hz": t_params.get('cutoff_hz')
+            "cutoff_hz": t_params.get('cutoff_hz'),
+            "phase_mode": t_params['phase_mode'],
+            "dither_mode": t_params['dither_mode'],
+            "mqa_mode": t_params['mqa_mode'],
+            "steep": t_params.get('steep', False),
+            "date": time.strftime("%Y-%m-%d %H:%M:%S")
         }
+        applied_recipe = dict(t_recipe)
         try:
-            html_rep, md_rep = generate_comparative_report([(source_path, dest_file)], os.path.basename(source_path), applied_recipe, target_dir)
+            html_rep, md_rep = generate_comparative_report([{"src_path": source_path, "dst_path": dest_file, "recipe": t_recipe}], os.path.basename(source_path), applied_recipe, target_dir)
             if html_rep:
                 print(f"\n   📊 [Comparative Upsampling Report Generated]")
                 print(f"      Interactive HTML Report: {html_rep}")

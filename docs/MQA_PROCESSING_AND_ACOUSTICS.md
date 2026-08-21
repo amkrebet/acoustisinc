@@ -75,5 +75,9 @@ python upsampler.py "/Music/Hi-Res/Album" --mqa ignore
   * In 16-bit MQA-CD tracks, Bit 16 (the lowest bit) is continuously overwritten with pseudo-random MQA packet control streams. On a standard non-MQA DAC, this toggles like **correlated high-frequency hash noise**, degrading effective dynamic range from $96\text{ dB}$ down to $\approx 84\text{--}88\text{ dB}$.
 * **24-Bit MQA Releases**:
   * The lower 8 bits (bits 0–7) hold the compressed lossy subband payload instead of physical analog dither. If unfolded without noise-gating, quantization noise from the 8-bit subband leaks into the audible spectrum.
+* **1x Native Masters ($44.1\text{ kHz}$ / $48.0\text{ kHz}$)**:
+  * When `ORIGINALSAMPLERATE` matches the container rate ($\le 48.0\text{ kHz}$), no ultrasonic subbands exist. Unfolding is automatically bypassed and routed to `--mqa strip` to prevent pseudo-random LSB noise from being injected into the $24\text{--}48\text{ kHz}$ spectrum.
 * **The `--mqa strip` Solution**:
   * Zero-masks the pseudo-random packet payload and applies **64-bit TPDF dither**, restoring a pure $24\text{-bit}$ linear PCM container with a pitch-black $-115\text{ dBFS}$ to $-144\text{ dBFS}$ noise floor.
+* **Output Tag Sanitization**:
+  * Upsampled files have all legacy MQA metadata tags (`MQAENCODER`, `ORIGINALSAMPLERATE`, `MQAAUTHENTICATION`, etc.) stripped so downstream DACs and audio streamers recognize the output purely as bit-perfect, standard high-resolution PCM.

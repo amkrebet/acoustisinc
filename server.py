@@ -237,6 +237,85 @@ class FolderScanManager:
 folder_scan_mgr = FolderScanManager()
 
 
+def find_album_summary_in_dir(target_path):
+    """
+    Locates an existing album analysis summary or report in the target directory or its mirror directory.
+    """
+    if not target_path or not os.path.exists(target_path):
+        return None
+
+    if os.path.isfile(target_path):
+        target_path = os.path.dirname(target_path)
+
+    candidates = [
+        ("ALBUM_REPORT.html", "html"),
+        ("album_report.html", "html"),
+        ("ALBUM_REPORT.md", "markdown"),
+        ("album_report.md", "markdown"),
+        ("ALBUM_SUMMARY.md", "markdown"),
+        ("album_summary.md", "markdown"),
+        ("analysis_summary.md", "markdown"),
+        ("ANALYSIS_SUMMARY.md", "markdown"),
+        ("PROVENANCE_SUMMARY.md", "markdown"),
+        ("provenance_summary.md", "markdown"),
+        ("report.md", "markdown"),
+        ("REPORT.md", "markdown"),
+    ]
+
+    dirs_to_check = [target_path]
+
+    # Check paired mirror directory (e.g., source FLAC_music vs upsampled 1xxK_min output)
+    if "/FLAC_music/music/" in target_path:
+        paired = target_path.replace("/FLAC_music/music/", "/1xxK_min/music/")
+        if os.path.exists(paired) and os.path.isdir(paired):
+            dirs_to_check.append(paired)
+    elif "/1xxK_min/music/" in target_path:
+        paired = target_path.replace("/1xxK_min/music/", "/FLAC_music/music/")
+        if os.path.exists(paired) and os.path.isdir(paired):
+            dirs_to_check.append(paired)
+
+    for d in dirs_to_check:
+        for fname, ftype in candidates:
+            fp = os.path.join(d, fname)
+            if os.path.exists(fp) and os.path.isfile(fp):
+                return {
+                    "filename": fname,
+                    "path": fp,
+                    "type": ftype,
+                    "size_bytes": os.path.getsize(fp),
+                    "is_mirror": (d != target_path)
+                }
+
+    # Search for any album report / summary report file in directory
+    for d in dirs_to_check:
+        try:
+            entries = sorted(os.listdir(d))
+            for entry in entries:
+                el = entry.lower()
+                if el.endswith(('_report.html', 'album_report.html')):
+                    fp = os.path.join(d, entry)
+                    return {
+                        "filename": entry,
+                        "path": fp,
+                        "type": "html",
+                        "size_bytes": os.path.getsize(fp),
+                        "is_mirror": (d != target_path)
+                    }
+                elif el.endswith(('_report.md', 'album_report.md', '_summary.md')):
+                    fp = os.path.join(d, entry)
+                    return {
+                        "filename": entry,
+                        "path": fp,
+                        "type": "markdown",
+                        "size_bytes": os.path.getsize(fp),
+                        "is_mirror": (d != target_path)
+                    }
+        except Exception:
+            pass
+
+    return None
+
+
 def get_directory_contents(target_path, fresh=True):
     """
     Lists subdirectories and audio files in target_path with rich metadata.
@@ -328,6 +407,7 @@ def get_directory_contents(target_path, fresh=True):
         parts.append({"name": segment, "path": accum})
 
     parent_path = os.path.dirname(target_path) if target_path != "/" else "/"
+    album_summary = find_album_summary_in_dir(target_path)
 
     return {
         "current_path": target_path,
@@ -335,6 +415,7 @@ def get_directory_contents(target_path, fresh=True):
         "breadcrumbs": parts,
         "folders": folders,
         "files": files,
+        "album_summary": album_summary,
         "gpu_enabled": gpu_engine.enabled,
         "gpu_device": gpu_engine.device_name
     }
@@ -990,6 +1071,105 @@ HTML_PAGE = """<!DOCTYPE html>
             display: inline-block;
         }
         @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+        .modal-backdrop {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100vw;
+            height: 100vh;
+            background: rgba(0, 0, 0, 0.78);
+            backdrop-filter: blur(5px);
+            z-index: 1000;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 24px;
+        }
+        .modal-content {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            width: 92vw;
+            max-width: 1280px;
+            height: 88vh;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            box-shadow: 0 16px 48px rgba(0,0,0,0.85);
+            animation: badge-fade-in 0.2s ease;
+        }
+        .modal-header {
+            padding: 12px 20px;
+            background: #11141a;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 12px;
+            flex-shrink: 0;
+        }
+        .modal-body {
+            flex: 1;
+            overflow: auto;
+            padding: 24px;
+            background: var(--bg);
+        }
+        .modal-iframe {
+            width: 100%;
+            height: 100%;
+            min-height: 72vh;
+            border: none;
+            background: #0a0c10;
+            border-radius: 6px;
+        }
+        .markdown-rendered {
+            color: var(--text);
+            font-size: 0.88rem;
+            line-height: 1.6;
+        }
+        .markdown-rendered table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 16px 0 24px;
+            font-size: 0.84rem;
+        }
+        .markdown-rendered th, .markdown-rendered td {
+            border: 1px solid #30363d;
+            padding: 8px 12px;
+            text-align: left;
+        }
+        .markdown-rendered th {
+            background: #161b22;
+            color: var(--text-heading);
+            font-weight: 600;
+        }
+        .markdown-rendered tr:nth-child(even) {
+            background: rgba(255, 255, 255, 0.02);
+        }
+        .markdown-rendered h1, .markdown-rendered h2, .markdown-rendered h3 {
+            color: var(--text-heading);
+            margin: 18px 0 10px;
+        }
+        .markdown-rendered h1 { font-size: 1.4rem; border-bottom: 1px solid #30363d; padding-bottom: 8px; }
+        .markdown-rendered h2 { font-size: 1.15rem; }
+        .markdown-rendered h3 { font-size: 0.95rem; }
+        .markdown-rendered hr {
+            border: 0;
+            border-top: 1px solid #30363d;
+            margin: 20px 0;
+        }
+        .markdown-rendered code {
+            background: #161b22;
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-family: monospace;
+            color: var(--accent-cyan);
+            border: 1px solid #30363d;
+        }
+        .markdown-rendered li {
+            margin-left: 20px;
+            margin-bottom: 6px;
+        }
     </style>
 </head>
 <body>
@@ -1000,6 +1180,7 @@ HTML_PAGE = """<!DOCTYPE html>
             <span id="gpuStatusBadge" class="gpu-badge">⚡ GPU Initializing...</span>
         </div>
         <div class="bookmarks">
+            <button id="headerBtnSummary" class="btn-bookmark" style="display: none; background: rgba(0, 229, 255, 0.15); border-color: rgba(0, 229, 255, 0.45); color: var(--accent-cyan); font-weight: 600;" onclick="openAlbumSummary()" title="View Album Analysis Summary">📋 Album Summary</button>
             <button class="btn-bookmark" onclick="loadDirectory('/mnt/PrimaryFS/FLAC_music/music', true)">📁 Music Library</button>
             <button class="btn-bookmark" onclick="loadDirectory('/mnt/PrimaryFS/FLAC_music/music/Qobuz Downloads', true)">🎧 Qobuz Releases</button>
             <button class="btn-bookmark" onclick="loadDirectory('/mnt/PrimaryFS/1xxK_min/music', true)">⚡ Upsampled Output</button>
@@ -1019,6 +1200,13 @@ HTML_PAGE = """<!DOCTYPE html>
                 </div>
                 <input type="text" class="search-box" id="pathBar" placeholder="Path..." value="" onchange="navigateToPathBar()" />
                 <input type="text" class="search-box" id="searchBox" placeholder="Filter albums & tracks..." />
+                <div id="albumSummaryBanner" style="display: none; padding: 6px 10px; background: rgba(0, 229, 255, 0.08); border: 1px solid rgba(0, 229, 255, 0.3); border-radius: 5px; justify-content: space-between; align-items: center; gap: 8px;">
+                    <div style="display: flex; align-items: center; gap: 6px; overflow: hidden; min-width: 0;">
+                        <span style="font-size: 0.85rem; flex-shrink: 0;">📋</span>
+                        <span id="albumSummaryBannerLabel" style="font-size: 0.75rem; font-weight: 600; color: var(--accent-cyan); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">Album Analysis Summary</span>
+                    </div>
+                    <button class="btn-bookmark" style="padding: 2px 8px; font-size: 0.72rem; flex-shrink: 0; background: var(--surface); color: var(--accent-cyan); border-color: var(--accent-cyan);" onclick="openAlbumSummary()">View</button>
+                </div>
             </div>
             <div class="tree-list" id="treeList">
                 <div style="padding: 20px; text-align: center; color: #8b949e;">
@@ -1287,10 +1475,12 @@ HTML_PAGE = """<!DOCTYPE html>
 
                 renderBreadcrumbs(directoryData.breadcrumbs, directoryData.parent_path);
                 renderDirectory('');
+                updateAlbumSummaryUI(directoryData.album_summary);
 
                 // Connect SSE stream for progressive fresh folder badges
                 startFolderStream(currentPath, fresh);
             } catch (err) {
+                updateAlbumSummaryUI(null);
                 treeList.innerHTML = `<div style="padding: 20px; color: var(--accent-red); text-align: center;">Failed to load directory:<br><small>${err.message}</small></div>`;
             }
         }
@@ -2370,9 +2560,191 @@ HTML_PAGE = """<!DOCTYPE html>
             });
         }
 
+        // ==========================================
+        // Album Analysis Summary Modal Logic
+        // ==========================================
+        let currentAlbumSummary = null;
+        let currentSummaryRawUrl = '';
+        let currentSummaryText = '';
+
+        function updateAlbumSummaryUI(summaryInfo) {
+            currentAlbumSummary = summaryInfo;
+            const banner = document.getElementById('albumSummaryBanner');
+            const headerBtn = document.getElementById('headerBtnSummary');
+            const bannerLabel = document.getElementById('albumSummaryBannerLabel');
+
+            if (summaryInfo && summaryInfo.filename) {
+                const labelText = summaryInfo.filename + (summaryInfo.is_mirror ? ' (Output)' : '');
+                if (banner) {
+                    banner.style.display = 'flex';
+                    if (bannerLabel) bannerLabel.textContent = labelText;
+                }
+                if (headerBtn) {
+                    headerBtn.style.display = 'inline-block';
+                    headerBtn.title = `View ${labelText}`;
+                }
+            } else {
+                if (banner) banner.style.display = 'none';
+                if (headerBtn) headerBtn.style.display = 'none';
+            }
+        }
+
+        async function openAlbumSummary() {
+            const modal = document.getElementById('albumSummaryModal');
+            const body = document.getElementById('modalSummaryBody');
+            const badge = document.getElementById('modalSummaryBadge');
+            const extBtn = document.getElementById('modalOpenExternalBtn');
+            const copyBtn = document.getElementById('btnCopySummary');
+
+            if (!modal) return;
+            modal.style.display = 'flex';
+            body.innerHTML = '<div style="text-align: center; padding: 40px; color: var(--text-muted);"><div class="spinner" style="margin: 0 auto 10px;"></div>Loading album analysis summary...</div>';
+            if (copyBtn) copyBtn.textContent = '📋 Copy';
+
+            try {
+                const res = await fetch(`/api/album_summary?path=${encodeURIComponent(currentPath)}`);
+                const data = await res.json();
+                if (!data || !data.found) {
+                    badge.textContent = 'NOT FOUND';
+                    body.innerHTML = '<div style="padding: 40px; text-align: center; color: var(--text-muted);"><svg width="48" height="48" fill="none" stroke="currentColor" viewBox="0 0 24 24" style="margin-bottom: 12px; opacity: 0.5;"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"></path></svg><h3>No Album Analysis Summary Found</h3><p style="margin-top: 8px; font-size: 0.85rem;">No ALBUM_REPORT.html, ALBUM_REPORT.md, or summary report was found in this folder or its mirror.</p></div>';
+                    extBtn.style.display = 'none';
+                    return;
+                }
+
+                badge.textContent = data.filename + (data.is_mirror ? ' (Mirror Folder)' : '');
+                currentSummaryRawUrl = data.raw_url;
+                currentSummaryText = data.content || '';
+
+                if (data.type === 'html') {
+                    extBtn.style.display = 'inline-block';
+                    body.innerHTML = `<iframe class="modal-iframe" src="${data.raw_url}" style="width: 100%; height: 100%; min-height: 72vh; border: none; border-radius: 6px; background: #0d1117;"></iframe>`;
+                } else {
+                    extBtn.style.display = 'none';
+                    const rendered = renderMarkdownToHtml(data.content);
+                    body.innerHTML = `<div class="markdown-rendered">${rendered}</div>`;
+                }
+            } catch (err) {
+                body.innerHTML = `<div style="padding: 24px; color: var(--accent-red); text-align: center;">Failed to load album summary:<br><small>${escapeHtml(err.message)}</small></div>`;
+            }
+        }
+
+        function closeAlbumSummaryModal() {
+            const modal = document.getElementById('albumSummaryModal');
+            if (modal) modal.style.display = 'none';
+            const body = document.getElementById('modalSummaryBody');
+            if (body) body.innerHTML = '';
+        }
+
+        function openAlbumSummaryExternal() {
+            if (currentSummaryRawUrl) {
+                window.open(currentSummaryRawUrl, '_blank');
+            }
+        }
+
+        async function copyAlbumSummaryText() {
+            const copyBtn = document.getElementById('btnCopySummary');
+            if (!currentSummaryText) return;
+            try {
+                await navigator.clipboard.writeText(currentSummaryText);
+                if (copyBtn) copyBtn.textContent = '✅ Copied!';
+                setTimeout(() => { if (copyBtn) copyBtn.textContent = '📋 Copy'; }, 2000);
+            } catch (err) {
+                if (copyBtn) copyBtn.textContent = '❌ Failed';
+            }
+        }
+
+        function renderMarkdownToHtml(md) {
+            if (!md) return '';
+            let lines = md.split('\\n');
+            let html = [];
+            let inTable = false;
+            let tableHeaderDone = false;
+
+            for (let line of lines) {
+                let trimmed = line.trim();
+
+                // Table parsing
+                if (trimmed.startsWith('|') && trimmed.endsWith('|')) {
+                    let cells = trimmed.split('|').slice(1, -1).map(c => c.trim());
+                    if (cells.every(c => /^:?-+:?$/.test(c))) {
+                        tableHeaderDone = true;
+                        continue;
+                    }
+                    if (!inTable) {
+                        html.push('<table>');
+                        inTable = true;
+                        tableHeaderDone = false;
+                    }
+                    let tag = tableHeaderDone ? 'td' : 'th';
+                    html.push('<tr>' + cells.map(c => `<${tag}>${formatInlineMd(c)}</${tag}>`).join('') + '</tr>');
+                    continue;
+                } else if (inTable) {
+                    html.push('</table>');
+                    inTable = false;
+                    tableHeaderDone = false;
+                }
+
+                if (!trimmed) {
+                    html.push('<div style="height: 10px;"></div>');
+                    continue;
+                }
+
+                if (trimmed.startsWith('### ')) {
+                    html.push(`<h3>${formatInlineMd(trimmed.substring(4))}</h3>`);
+                } else if (trimmed.startsWith('## ')) {
+                    html.push(`<h2>${formatInlineMd(trimmed.substring(3))}</h2>`);
+                } else if (trimmed.startsWith('# ')) {
+                    html.push(`<h1>${formatInlineMd(trimmed.substring(2))}</h1>`);
+                } else if (trimmed === '---' || trimmed === '***') {
+                    html.push('<hr>');
+                } else if (trimmed.startsWith('- ') || trimmed.startsWith('* ')) {
+                    html.push(`<li>${formatInlineMd(trimmed.substring(2))}</li>`);
+                } else {
+                    html.push(`<p>${formatInlineMd(trimmed)}</p>`);
+                }
+            }
+            if (inTable) html.push('</table>');
+            return html.join('\\n');
+        }
+
+        function formatInlineMd(str) {
+            return escapeHtml(str)
+                .replace(/\\*\\*(.*?)\\*\\*/g, '<strong>$1</strong>')
+                .replace(/\\*(.*?)\\*/g, '<em>$1</em>')
+                .replace(/`(.*?)`/g, '<code>$1</code>');
+        }
+
+        // Close modal on Escape key
+        window.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') closeAlbumSummaryModal();
+        });
+
         // Initialize on load
         loadDirectory(currentPath, true);
     </script>
+
+    <!-- Album Analysis Summary Modal -->
+    <div id="albumSummaryModal" class="modal-backdrop" style="display: none;" onclick="if(event.target===this) closeAlbumSummaryModal()">
+        <div class="modal-content">
+            <div class="modal-header">
+                <div style="display: flex; align-items: center; gap: 10px; min-width: 0;">
+                    <span style="font-size: 1.05rem; font-weight: 700; color: var(--text-heading); white-space: nowrap;">📋 Album Analysis Summary</span>
+                    <span id="modalSummaryBadge" class="brand-badge" style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">ALBUM_REPORT</span>
+                </div>
+                <div style="display: flex; align-items: center; gap: 8px; flex-shrink: 0;">
+                    <button class="btn-bookmark" id="btnCopySummary" onclick="copyAlbumSummaryText()">📋 Copy</button>
+                    <button class="btn-bookmark" id="modalOpenExternalBtn" onclick="openAlbumSummaryExternal()" style="display: none;">↗️ Open Tab</button>
+                    <button class="btn-bookmark" onclick="closeAlbumSummaryModal()" style="font-size: 1.2rem; padding: 2px 10px; line-height: 1;">&times;</button>
+                </div>
+            </div>
+            <div class="modal-body" id="modalSummaryBody">
+                <div style="text-align: center; padding: 40px; color: var(--text-muted);">
+                    <div class="spinner" style="margin: 0 auto 10px;"></div>
+                    Loading album analysis summary...
+                </div>
+            </div>
+        </div>
+    </div>
 </body>
 </html>"""
 
@@ -2516,6 +2888,58 @@ class ForensicWebHandler(BaseHTTPRequestHandler):
                         self.wfile.write(chunk)
                     except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                         break
+
+        elif path == "/api/album_summary":
+            target = params.get("path", [""])[0]
+            summary_info = find_album_summary_in_dir(target)
+            if not summary_info:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"status": "ok", "found": False, "message": "No album analysis summary found"}).encode("utf-8"))
+            else:
+                try:
+                    with open(summary_info["path"], "r", encoding="utf-8", errors="replace") as f:
+                        content = f.read()
+                    res = {
+                        "status": "ok",
+                        "found": True,
+                        "filename": summary_info["filename"],
+                        "path": summary_info["path"],
+                        "type": summary_info["type"],
+                        "is_mirror": summary_info.get("is_mirror", False),
+                        "raw_url": f"/api/raw_summary?path={urllib.parse.quote(summary_info['path'])}",
+                        "content": content
+                    }
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps(res).encode("utf-8"))
+                except Exception as e:
+                    self.send_response(500)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"status": "error", "message": str(e)}).encode("utf-8"))
+
+        elif path == "/api/raw_summary":
+            target = params.get("path", [""])[0]
+            if not os.path.exists(target) or not os.path.isfile(target):
+                self.send_response(404)
+                self.end_headers()
+                return
+
+            mime = "text/html; charset=utf-8" if target.lower().endswith(".html") else "text/plain; charset=utf-8"
+            try:
+                with open(target, "rb") as f:
+                    data = f.read()
+                self.send_response(200)
+                self.send_header("Content-Type", mime)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+            except Exception:
+                self.send_response(500)
+                self.end_headers()
         else:
             self.send_response(404)
             self.end_headers()

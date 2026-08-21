@@ -15,12 +15,12 @@ import numpy as np
 import soundfile as sf
 from analyser import analyze_audio_forensics, encode_spectrogram_and_lookup, load_audio_resilient
 
-def audit_track_pair(src_path, dst_path, applied_recipe=None):
+def audit_track_pair(src_path, dst_path, applied_recipe=None, track_recipe=None):
     """
-    Audits a single track before and after upsampling.
+    Audits a single track before and after upsampling with per-track forensic recipe metadata.
     """
     filename = os.path.basename(src_path)
-    rec = applied_recipe or {}
+    rec = track_recipe or applied_recipe or {}
 
     # 1. Analyze Source (Before)
     try:
@@ -64,10 +64,17 @@ def audit_track_pair(src_path, dst_path, applied_recipe=None):
     src_knee = (prov_src.get("visual_morphology") or {}).get("primary_knee") or {}
     dst_knee = (prov_dst.get("visual_morphology") or {}).get("primary_knee") or {}
 
+    exec_date = rec.get("date", time.strftime('%Y-%m-%d %H:%M:%S'))
+
     return {
         "filename": filename,
-        "src_path": src_path,
-        "dst_path": dst_path,
+        "src_path": os.path.abspath(src_path),
+        "dst_path": os.path.abspath(dst_path),
+        "applied_params": rec.get("cli_params", "--phase min --dither shibata"),
+        "applied_topology": rec.get("topology_name", "Standard Sinc"),
+        "gain_factor": rec.get("gain_factor", 1.0),
+        "gain_db": rec.get("gain_db", 0.0),
+        "timestamp": exec_date,
         "src_sr": sr_src,
         "dst_sr": sr_dst,
         "src_nyquist": sr_src / 2000.0,
@@ -101,20 +108,32 @@ def audit_track_pair(src_path, dst_path, applied_recipe=None):
 def generate_comparative_report(source_target_pairs, album_title, applied_recipe, output_dir):
     """
     Analyzes before and after audio files and writes:
-      1. An individual <track_stem>_report.html and <track_stem>_report.md for every track.
+      1. An individual <track_stem>_report.html and <track_stem>_report.md for every track with per-file recipes and source master paths.
       2. If multiple tracks, an aggregate ALBUM_REPORT.html and ALBUM_REPORT.md.
     """
     os.makedirs(output_dir, exist_ok=True)
     t0 = time.time()
     
     comparisons = []
-    for src_path, dst_path in source_target_pairs:
-        if not os.path.exists(src_path) or not os.path.exists(dst_path):
+    for pair in source_target_pairs:
+        if isinstance(pair, dict):
+            src_path = pair.get("src_path")
+            dst_path = pair.get("dst_path")
+            track_recipe = pair.get("recipe")
+        elif isinstance(pair, (list, tuple)) and len(pair) >= 3:
+            src_path, dst_path, track_recipe = pair[0], pair[1], pair[2]
+        elif isinstance(pair, (list, tuple)) and len(pair) == 2:
+            src_path, dst_path = pair[0], pair[1]
+            track_recipe = None
+        else:
+            continue
+
+        if not src_path or not dst_path or not os.path.exists(src_path) or not os.path.exists(dst_path):
             continue
 
         filename = os.path.basename(src_path)
         print(f"   [Report Analysis] Auditing Before/After: {filename}...")
-        item = audit_track_pair(src_path, dst_path, applied_recipe=applied_recipe)
+        item = audit_track_pair(src_path, dst_path, applied_recipe=applied_recipe, track_recipe=track_recipe)
         comparisons.append(item)
 
         # Generate individual per-track report alongside the audio file
@@ -122,8 +141,8 @@ def generate_comparative_report(source_target_pairs, album_title, applied_recipe
         track_html_path = os.path.join(output_dir, f"{track_stem}_report.html")
         track_md_path = os.path.join(output_dir, f"{track_stem}_report.md")
 
-        write_single_track_html_report(track_html_path, item, applied_recipe)
-        write_single_track_markdown_report(track_md_path, item, applied_recipe)
+        write_single_track_html_report(track_html_path, item, track_recipe or applied_recipe)
+        write_single_track_markdown_report(track_md_path, item, track_recipe or applied_recipe)
 
     if not comparisons:
         return None, None
@@ -146,13 +165,22 @@ def generate_comparative_report(source_target_pairs, album_title, applied_recipe
 
 
 def write_single_track_markdown_report(filepath, item, applied_recipe):
+    rec = applied_recipe or {}
+    exec_date = item.get("timestamp", rec.get("date", time.strftime('%Y-%m-%d %H:%M:%S')))
+    cli_params = item.get("applied_params", rec.get("cli_params", "Default"))
+    topology = item.get("applied_topology", rec.get("topology_name", "Standard Sinc"))
+    gain_fac = item.get("gain_factor", rec.get("gain_factor", 1.0))
+    gain_db = item.get("gain_db", rec.get("gain_db", 0.0))
+
     with open(filepath, "w", encoding="utf-8") as f:
         f.write(f"# 🔬 AcoustiSinc Track Upsampling Report\n\n")
         f.write(f"**Track File**: `{item['filename']}`  \n")
-        f.write(f"**Execution Date**: `{time.strftime('%Y-%m-%d %H:%M:%S')}`  \n")
-        f.write(f"**Applied Recipe**: `{applied_recipe.get('cli_params', 'Default')}`  \n")
-        f.write(f"**Filter Topology**: `{applied_recipe.get('topology_name', 'Standard')}`  \n")
-        f.write(f"**Headroom Gain Multiplier**: `{applied_recipe.get('gain_factor', 1.0):.6f}` ({applied_recipe.get('gain_db', 0.0):+.2f} dB)  \n\n")
+        f.write(f"**Source Master File**: `{item['src_path']}`  \n")
+        f.write(f"**Target Output File**: `{item['dst_path']}`  \n")
+        f.write(f"**Execution Date**: `{exec_date}`  \n")
+        f.write(f"**Applied Recipe**: `{cli_params}`  \n")
+        f.write(f"**Filter Topology**: `{topology}`  \n")
+        f.write(f"**Headroom Gain Multiplier**: `{gain_fac:.6f}` ({gain_db:+.2f} dB)  \n\n")
         f.write(f"---\n\n")
         f.write(f"## 📊 Before vs After Forensic Statistics\n\n")
         f.write(f"| Metric | Source Master (Before) | AcoustiSinc Upsampled (After) |\n")
@@ -320,13 +348,18 @@ def write_single_track_html_report(filepath, item, applied_recipe):
 
     <div class="header-card">
         <h1>🔬 AcoustiSinc Track Upsampling Report</h1>
-        <p style="color: var(--text-muted); font-size: 0.9rem;">Track: <strong style="color: #fff;">{item['filename']}</strong></p>
+        <p style="color: #fff; font-size: 1.05rem; font-weight: 600; margin-bottom: 4px;">{item['filename']}</p>
+        <div style="margin: 10px 0; font-size: 0.84rem; color: var(--text-muted); line-height: 1.7;">
+            <div>📁 <strong style="color: var(--text);">Source Master File:</strong> <code style="color: var(--accent-cyan); background: #0d1117; padding: 2px 6px; border-radius: 4px; border: 1px solid #30363d;">{item['src_path']}</code></div>
+            <div>⚡ <strong style="color: var(--text);">Target Output File:</strong> <code style="color: var(--accent-green); background: #0d1117; padding: 2px 6px; border-radius: 4px; border: 1px solid #30363d;">{item['dst_path']}</code></div>
+            <div>⏱️ <strong style="color: var(--text);">Execution Date:</strong> <span>{item.get('timestamp', applied_recipe.get('date', time.strftime('%Y-%m-%d %H:%M:%S')))}</span></div>
+        </div>
         <div class="badge-row">
             <span class="badge">Strict 64-Bit Float</span>
             <span class="badge">FLAC Level 5 Output</span>
-            <span class="badge">{applied_recipe.get('topology_name', 'Sinc Reconstruction')}</span>
-            <span class="badge badge-recipe">{applied_recipe.get('cli_params', '--phase min --dither shibata')}</span>
-            <span class="badge" style="color: var(--accent-orange); border-color: rgba(255,145,0,0.3);">Gain: {applied_recipe.get('gain_factor', 1.0):.4f} ({applied_recipe.get('gain_db', 0.0):+.2f} dB)</span>
+            <span class="badge">{item.get('applied_topology', applied_recipe.get('topology_name', 'Sinc Reconstruction'))}</span>
+            <span class="badge badge-recipe">{item.get('applied_params', applied_recipe.get('cli_params', '--phase min --dither shibata'))}</span>
+            <span class="badge" style="color: var(--accent-orange); border-color: rgba(255,145,0,0.3);">Gain: {item.get('gain_factor', applied_recipe.get('gain_factor', 1.0)):.4f} ({item.get('gain_db', applied_recipe.get('gain_db', 0.0)):+.2f} dB)</span>
         </div>
     </div>
 
@@ -449,24 +482,6 @@ def write_single_track_html_report(filepath, item, applied_recipe):
             ctx.fillText('Amplitude (dBFS)', 0, 0);
             ctx.restore();
 
-            // 2. Reference Quantization Noise Floor Lines
-            // 16-bit PCM Floor (-96.33 dBFS)
-            const y16 = dbToY(-96.33);
-            ctx.strokeStyle = 'rgba(255, 171, 0, 0.4)';
-            ctx.lineWidth = 1;
-            ctx.setLineDash([3, 3]);
-            ctx.beginPath(); ctx.moveTo(padL, y16); ctx.lineTo(padL + plotW, y16); ctx.stroke();
-            ctx.fillStyle = 'rgba(255, 171, 0, 0.85)';
-            ctx.textAlign = 'left';
-            ctx.fillText('16-bit Floor (-96 dB)', padL + 6, y16 - 6);
-
-            // 24-bit PCM Floor (-144.49 dBFS)
-            const y24 = dbToY(-144.49);
-            ctx.strokeStyle = 'rgba(0, 229, 255, 0.35)';
-            ctx.setLineDash([3, 3]);
-            ctx.beginPath(); ctx.moveTo(padL, y24); ctx.lineTo(padL + plotW, y24); ctx.stroke();
-            ctx.fillStyle = 'rgba(0, 229, 255, 0.75)';
-            ctx.fillText('24-bit Floor (-144 dB)', padL + 6, y24 - 6);
 
             // 3. Vertical Frequency Grid & Axis Ticks
             let fTicks = [0, 5, 10, 15, 20, 22.05];
@@ -612,22 +627,33 @@ def write_single_track_html_report(filepath, item, applied_recipe):
 
 
 def write_album_markdown_report(filepath, comparisons, album_title, applied_recipe):
+    exec_date = time.strftime('%Y-%m-%d %H:%M:%S')
     with open(filepath, "w", encoding="utf-8") as f:
         f.write(f"# 🔬 AcoustiSinc Album Upsampling Report\n\n")
         f.write(f"**Album**: `{album_title}`  \n")
-        f.write(f"**Execution Date**: `{time.strftime('%Y-%m-%d %H:%M:%S')}`  \n")
-        f.write(f"**Applied Recipe**: `{applied_recipe.get('cli_params', 'Default')}`  \n")
-        f.write(f"**Filter Topology**: `{applied_recipe.get('topology_name', 'Standard')}`  \n")
-        f.write(f"**Headroom Gain Multiplier**: `{applied_recipe.get('gain_factor', 1.0):.6f}` ({applied_recipe.get('gain_db', 0.0):+.2f} dB)  \n\n")
+        f.write(f"**Execution Date**: `{exec_date}`  \n")
+        f.write(f"**Total Tracks Processed**: `{len(comparisons)}`  \n")
+        f.write(f"**Album Headroom Gain Multiplier**: `{applied_recipe.get('gain_factor', 1.0):.6f}` ({applied_recipe.get('gain_db', 0.0):+.2f} dB)  \n\n")
         f.write(f"---\n\n")
         f.write(f"## 📊 Album Track Forensic Metrics Table\n\n")
-        f.write(f"| Track Filename | Source Format | Target Format | Source DR | Target DR | Source Peak | Target Peak | Source LUFS | Target LUFS | Size (MB) |\n")
-        f.write(f"| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |\n")
+        f.write(f"| Track Filename | Source Format | Target Format | Applied Recipe | Source DR | Target DR | Source Peak | Target Peak | Size (MB) |\n")
+        f.write(f"| :--- | :---: | :---: | :--- | :---: | :---: | :---: | :---: | :---: |\n")
 
         for c in comparisons:
             src_fmt = f"{c['src_sr']/1000.0:.1f}k / {c['src_sub_format']}"
             dst_fmt = f"{c['dst_sr']/1000.0:.1f}k / {c['dst_sub_format']}"
-            f.write(f"| `{c['filename']}` | {src_fmt} | **{dst_fmt}** | DR {c['src_dr']} | **DR {c['dst_dr']}** | {c['src_peak_dbfs']:.2f} dBFS | **{c['dst_peak_dbfs']:.2f} dBFS** | {c['src_lufs']} | {c['dst_lufs']} | {c['src_size_mb']} $\\to$ {c['dst_size_mb']} |\n")
+            rec_str = c.get('applied_params', applied_recipe.get('cli_params', 'Default'))
+            f.write(f"| `{c['filename']}` | {src_fmt} | **{dst_fmt}** | `{rec_str}` | DR {c['src_dr']} | **DR {c['dst_dr']}** | {c['src_peak_dbfs']:.2f} dBFS | **{c['dst_peak_dbfs']:.2f} dBFS** | {c['src_size_mb']} $\\to$ {c['dst_size_mb']} |\n")
+
+        f.write(f"\n---\n\n")
+        f.write(f"## 📁 Individual Track Source & Processing Details\n\n")
+        f.write(f"| Track | Source Master File Path | Target Output File Path | Execution Date | Applied Recipe | Topology |\n")
+        f.write(f"| :--- | :--- | :--- | :---: | :--- | :--- |\n")
+        for c in comparisons:
+            t_date = c.get('timestamp', exec_date)
+            t_rec = c.get('applied_params', applied_recipe.get('cli_params', 'Default'))
+            t_top = c.get('applied_topology', applied_recipe.get('topology_name', 'Standard Sinc'))
+            f.write(f"| `{c['filename']}` | `{c['src_path']}` | `{c['dst_path']}` | `{t_date}` | `{t_rec}` | {t_top} |\n")
 
         f.write(f"\n---\n\n")
         f.write(f"### 🛡️ Quality Standards Guarantee\n")
@@ -782,17 +808,34 @@ def write_album_html_report(filepath, comparisons, album_title, applied_recipe):
 
     <div class="header-card">
         <h1>🔬 AcoustiSinc Forensic Album Report</h1>
-        <p style="color: var(--text-muted); font-size: 0.9rem;">Album: <strong style="color: #fff;">{album_title}</strong></p>
+        <p style="color: #fff; font-size: 1.1rem; font-weight: 600; margin-bottom: 4px;">Album: {album_title}</p>
+        <p style="color: var(--text-muted); font-size: 0.85rem; margin-bottom: 12px;">Processed {len(comparisons)} tracks with strict 64-bit double precision</p>
         <div class="badge-row">
             <span class="badge">Strict 64-Bit Float</span>
             <span class="badge">FLAC Level 5 Output</span>
-            <span class="badge">{applied_recipe.get('topology_name', 'Sinc Reconstruction')}</span>
-            <span class="badge badge-recipe">{applied_recipe.get('cli_params', '--phase min --dither shibata')}</span>
-            <span class="badge" style="color: var(--accent-orange); border-color: rgba(255,145,0,0.3);">Gain: {applied_recipe.get('gain_factor', 1.0):.4f} ({applied_recipe.get('gain_db', 0.0):+.2f} dB)</span>
+            <span class="badge">{len(comparisons)} Tracks</span>
+            <span class="badge" style="color: var(--accent-orange); border-color: rgba(255,145,0,0.3);">Gain Multiplier: {applied_recipe.get('gain_factor', 1.0):.4f} ({applied_recipe.get('gain_db', 0.0):+.2f} dB)</span>
         </div>
     </div>
 
     <div class="track-nav" id="trackNav"></div>
+
+    <!-- Inspector Header Card -->
+    <div class="pane-card" style="margin-bottom: 20px;">
+        <div class="pane-title" style="margin-bottom: 8px;">
+            <span id="insTrackTitle" style="font-size: 1.05rem; font-weight: 600; color: #fff;">Track Title</span>
+            <span id="insBadgeRow" style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
+                <span id="insTopologyBadge" class="badge">--</span>
+                <span id="insRecipeBadge" class="badge badge-recipe">--</span>
+                <span id="insGainBadge" class="badge" style="color: var(--accent-orange); border-color: rgba(255,145,0,0.3);">--</span>
+            </span>
+        </div>
+        <div style="font-size: 0.84rem; color: var(--text-muted); line-height: 1.7;">
+            <div>📁 <strong style="color: var(--text);">Source Master File:</strong> <code id="insSrcPath" style="color: var(--accent-cyan); background: #0d1117; padding: 2px 6px; border-radius: 4px; border: 1px solid #30363d;">--</code></div>
+            <div>⚡ <strong style="color: var(--text);">Target Output File:</strong> <code id="insDstPath" style="color: var(--accent-green); background: #0d1117; padding: 2px 6px; border-radius: 4px; border: 1px solid #30363d;">--</code></div>
+            <div>⏱️ <strong style="color: var(--text);">Execution Date:</strong> <span id="insExecDate">--</span></div>
+        </div>
+    </div>
 
     <div class="comparison-grid">
         <!-- Before (Source) -->
@@ -860,9 +903,10 @@ def write_album_html_report(filepath, comparisons, album_title, applied_recipe):
         <table>
             <thead>
                 <tr>
-                    <th>Track Filename</th>
+                    <th>Track & Source Path</th>
                     <th>Source Format</th>
                     <th>Upsampled Target</th>
+                    <th>Applied Recipe</th>
                     <th>Source DR</th>
                     <th>Target DR</th>
                     <th>Source Peak</th>
@@ -894,6 +938,16 @@ def write_album_html_report(filepath, comparisons, album_title, applied_recipe):
             currentIdx = idx;
             renderNav();
             const item = data[idx];
+
+            document.getElementById('insTrackTitle').textContent = `${{idx + 1}}. ${{item.filename}}`;
+            document.getElementById('insSrcPath').textContent = item.src_path;
+            document.getElementById('insDstPath').textContent = item.dst_path;
+            document.getElementById('insExecDate').textContent = item.timestamp || '--';
+            document.getElementById('insTopologyBadge').textContent = item.applied_topology || 'Standard Sinc';
+            document.getElementById('insRecipeBadge').textContent = item.applied_params || '--';
+            const gFac = item.gain_factor != null ? item.gain_factor.toFixed(4) : '1.0000';
+            const gDb = item.gain_db != null ? ((item.gain_db >= 0 ? '+' : '') + item.gain_db.toFixed(2)) : '+0.00';
+            document.getElementById('insGainBadge').textContent = 'Gain: ' + gFac + ' (' + gDb + ' dB)';
 
             document.getElementById('srcFmtBadge').textContent = `${{item.src_sr / 1000}}kHz / ${{item.src_sub_format}}`;
             document.getElementById('dstFmtBadge').textContent = `${{item.dst_sr / 1000}}kHz / ${{item.dst_sub_format}}`;
@@ -983,24 +1037,6 @@ def write_album_html_report(filepath, comparisons, album_title, applied_recipe):
             ctx.fillText('Amplitude (dBFS)', 0, 0);
             ctx.restore();
 
-            // 2. Reference Quantization Noise Floor Lines
-            // 16-bit PCM Floor (-96.33 dBFS)
-            const y16 = dbToY(-96.33);
-            ctx.strokeStyle = 'rgba(255, 171, 0, 0.4)';
-            ctx.lineWidth = 1;
-            ctx.setLineDash([3, 3]);
-            ctx.beginPath(); ctx.moveTo(padL, y16); ctx.lineTo(padL + plotW, y16); ctx.stroke();
-            ctx.fillStyle = 'rgba(255, 171, 0, 0.85)';
-            ctx.textAlign = 'left';
-            ctx.fillText('16-bit Floor (-96 dB)', padL + 6, y16 - 6);
-
-            // 24-bit PCM Floor (-144.49 dBFS)
-            const y24 = dbToY(-144.49);
-            ctx.strokeStyle = 'rgba(0, 229, 255, 0.35)';
-            ctx.setLineDash([3, 3]);
-            ctx.beginPath(); ctx.moveTo(padL, y24); ctx.lineTo(padL + plotW, y24); ctx.stroke();
-            ctx.fillStyle = 'rgba(0, 229, 255, 0.75)';
-            ctx.fillText('24-bit Floor (-144 dB)', padL + 6, y24 - 6);
 
             // 3. Vertical Frequency Grid & Axis Ticks
             let fTicks = [0, 5, 10, 15, 20, 22.05];
@@ -1135,9 +1171,13 @@ def write_album_html_report(filepath, comparisons, album_title, applied_recipe):
             data.forEach((item, idx) => {{
                 const tr = document.createElement('tr');
                 tr.innerHTML = `
-                    <td><strong>${{item.filename}}</strong></td>
+                    <td>
+                        <strong>${{item.filename}}</strong><br>
+                        <code style="font-size: 0.72rem; color: #8b949e; word-break: break-all;">${{item.src_path}}</code>
+                    </td>
                     <td class="val-src">${{item.src_sr / 1000}}k / ${{item.src_sub_format}}</td>
                     <td class="val-good">${{item.dst_sr / 1000}}k / ${{item.dst_sub_format}}</td>
+                    <td><code class="badge badge-recipe" style="font-size: 0.72rem;">${{item.applied_params || '--'}}</code></td>
                     <td>DR ${{item.src_dr}}</td>
                     <td class="val-good">DR ${{item.dst_dr}}</td>
                     <td>${{item.src_peak_dbfs}} dBFS</td>
