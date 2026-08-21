@@ -28,6 +28,8 @@ import urllib.parse
 import threading
 import queue
 import html
+import subprocess
+import signal
 from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
 import soundfile as sf
 import numpy as np
@@ -314,6 +316,294 @@ def find_album_summary_in_dir(target_path):
             pass
 
     return None
+
+
+def derive_default_destination_dir(source_path):
+    """
+    Computes a smart default mirror destination directory for upsampling.
+    e.g., /mnt/PrimaryFS/FLAC_music/music/Artist/Album -> /mnt/PrimaryFS/1xxK_min/music/Artist/Album
+    """
+    if not source_path:
+        return ""
+    src_abs = os.path.abspath(source_path)
+    if os.path.isfile(src_abs):
+        src_dir = os.path.dirname(src_abs)
+    else:
+        src_dir = src_abs
+
+    if "/FLAC_music/music/" in src_dir:
+        return src_dir.replace("/FLAC_music/music/", "/1xxK_min/music/")
+    elif "/FLAC_music/" in src_dir:
+        return src_dir.replace("/FLAC_music/", "/1xxK_min/")
+    elif "/flac_music/" in src_dir.lower():
+        idx = src_dir.lower().find("/flac_music/")
+        return src_dir[:idx] + "/1xxK_min/" + src_dir[idx + len("/flac_music/"):]
+    else:
+        return src_dir.rstrip(os.sep) + "_upsampled_min"
+
+
+class UpsampleJobManager:
+    """
+    Manages asynchronous background upsampling subprocess jobs with real-time log streaming,
+    progress parsing, stage tracking, and safe process group cancellation.
+    """
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.status = "idle"  # idle, running, completed, failed, cancelled
+        self.job_id = None
+        self.mode = "album"  # track, album
+        self.src_path = None
+        self.dst_dir = None
+        self.current_track = ""
+        self.track_index = 0
+        self.total_tracks = 0
+        self.progress_percent = 0.0
+        self.stage = "Idle"
+        self.log_lines = []  # list of dict: {"time": "HH:MM:SS", "text": "...", "idx": n}
+        self.error_message = ""
+        self.report_path = None
+        self.proc = None
+        self.start_time = 0
+        self.end_time = 0
+
+    def start_job(self, config):
+        with self.lock:
+            if self.status == "running":
+                return {"status": "error", "message": "An upsampling job is already running."}
+
+            src_path = config.get("source_path", "").strip()
+            if not src_path or not os.path.exists(src_path):
+                return {"status": "error", "message": f"Source path not found: {src_path}"}
+
+            is_file = os.path.isfile(src_path)
+            self.mode = "track" if is_file else "album"
+            self.src_path = os.path.abspath(src_path)
+
+            dst_dir = config.get("dest_dir", "").strip()
+            if not dst_dir:
+                dst_dir = derive_default_destination_dir(self.src_path)
+            self.dst_dir = os.path.abspath(dst_dir)
+            try:
+                os.makedirs(self.dst_dir, exist_ok=True)
+            except Exception as e:
+                return {"status": "error", "message": f"Failed to create target directory: {e}"}
+
+            cmd = [
+                sys.executable, "-u", "/home/amkrebet/upsample/upsampler.py",
+                self.src_path,
+                "-o", self.dst_dir
+            ]
+
+            rate = config.get("rate")
+            if rate and str(rate).lower() not in ["4x", "auto", "default"]:
+                cmd.extend(["-r", str(rate)])
+
+            phase = config.get("phase", "min")
+            if phase in ["min", "linear"]:
+                cmd.extend(["--phase", phase])
+
+            cutoff = config.get("cutoff_hz")
+            if cutoff:
+                try:
+                    c_val = float(cutoff)
+                    if c_val > 0:
+                        cmd.extend(["--cutoff", str(int(c_val))])
+                except (ValueError, TypeError):
+                    pass
+            elif config.get("apodizing"):
+                cmd.append("--apodizing")
+
+            if config.get("steep"):
+                cmd.append("--steep")
+
+            dither = config.get("dither", "shibata")
+            if dither == "none":
+                cmd.append("--no-dither")
+            elif dither in ["shibata", "high_rate"]:
+                cmd.extend(["--dither", dither])
+
+            mqa = config.get("mqa", "adaptive")
+            if mqa in ["adaptive", "simple", "strip", "ignore"]:
+                cmd.extend(["--mqa", mqa])
+
+            overwrite = config.get("overwrite", "on")
+            cmd.extend(["--overwrite", "on" if str(overwrite).lower() in ["on", "true", "1"] else "off"])
+
+            if config.get("use_recommended"):
+                cmd.extend(["--use-recommended", "auto"])
+
+            # Count total tracks if album
+            if is_file:
+                total_t = 1
+            else:
+                try:
+                    total_t = len([f for f in os.listdir(self.src_path) if f.lower().endswith(('.flac', '.wav', '.aiff', '.m4a')) and not f.endswith('.WIP')])
+                except Exception:
+                    total_t = 0
+
+            self.status = "running"
+            self.job_id = f"job_{int(time.time())}"
+            self.current_track = os.path.basename(self.src_path) if is_file else "Preparing..."
+            self.track_index = 0
+            self.total_tracks = max(1, total_t)
+            self.progress_percent = 2.0
+            self.stage = "Initializing"
+            self.log_lines = []
+            self.error_message = ""
+            self.report_path = None
+            self.start_time = time.time()
+            self.end_time = 0
+
+            try:
+                self.proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                    preexec_fn=os.setsid
+                )
+            except Exception as e:
+                self.status = "failed"
+                self.error_message = f"Failed to spawn upsampler: {e}"
+                return {"status": "error", "message": self.error_message}
+
+            t = threading.Thread(target=self._worker_reader, args=(self.proc, self.job_id), daemon=True)
+            t.start()
+
+            return {
+                "status": "ok",
+                "job_id": self.job_id,
+                "mode": self.mode,
+                "src_path": self.src_path,
+                "dst_dir": self.dst_dir,
+                "total_tracks": self.total_tracks,
+                "cmd": " ".join(cmd)
+            }
+
+    def _worker_reader(self, proc, job_id):
+        import re
+        line_idx = 0
+        while True:
+            line = proc.stdout.readline()
+            if not line:
+                if proc.poll() is not None:
+                    break
+                time.sleep(0.02)
+                continue
+
+            clean_line = line.rstrip("\r\n")
+            t_str = time.strftime("%H:%M:%S")
+            line_idx += 1
+
+            with self.lock:
+                if self.job_id != job_id:
+                    break
+
+                self.log_lines.append({"time": t_str, "text": clean_line, "idx": line_idx})
+                if len(self.log_lines) > 2000:
+                    self.log_lines.pop(0)
+
+                # Parse status indicators
+                if "Scanning" in clean_line and "headroom" in clean_line.lower():
+                    self.stage = "Analyzing Headroom"
+                    self.progress_percent = max(self.progress_percent, 5.0)
+
+                m_trk = re.search(r'\[(\d+)/(\d+)\]\s+(?:Processing track:\s+)?(.+)', clean_line)
+                if m_trk:
+                    cur_idx = int(m_trk.group(1))
+                    tot_idx = int(m_trk.group(2))
+                    trk_name = os.path.basename(m_trk.group(3).strip())
+                    self.track_index = cur_idx
+                    self.total_tracks = tot_idx
+                    self.current_track = trk_name
+                    self.stage = f"Resampling [{cur_idx}/{tot_idx}] (64-bit Sinc)"
+                    pct = 10.0 + ((cur_idx - 1) / max(1, tot_idx)) * 75.0
+                    self.progress_percent = max(self.progress_percent, round(pct, 1))
+
+                if "Tagging" in clean_line or "ReplayGain" in clean_line:
+                    self.stage = "Tagging & ReplayGain"
+                    self.progress_percent = max(self.progress_percent, 85.0)
+
+                if "[Report Analysis]" in clean_line or "Auditing Before/After" in clean_line:
+                    self.stage = "Auditing Spectrograms & Reports"
+                    self.progress_percent = max(self.progress_percent, 90.0)
+
+                m_rep = re.search(r'HTML:\s*([^\s)]+)', clean_line)
+                if m_rep:
+                    rep_candidate = m_rep.group(1).strip()
+                    if os.path.exists(rep_candidate):
+                        self.report_path = rep_candidate
+
+                if "Completed" in clean_line and "ALBUM_REPORT.html" in clean_line:
+                    self.stage = "Finalizing Reports"
+                    self.progress_percent = 98.0
+
+        return_code = proc.wait()
+        with self.lock:
+            if self.job_id != job_id:
+                return
+
+            self.end_time = time.time()
+            if self.status == "cancelled":
+                self.stage = "Cancelled"
+            elif return_code == 0:
+                self.status = "completed"
+                self.progress_percent = 100.0
+                self.stage = "Finished Successfully"
+                # Discover report path if not parsed
+                if not self.report_path:
+                    alb_rep = os.path.join(self.dst_dir, "ALBUM_REPORT.html")
+                    if os.path.exists(alb_rep):
+                        self.report_path = alb_rep
+                    elif self.mode == "track":
+                        stem = os.path.splitext(os.path.basename(self.src_path))[0]
+                        trk_rep = os.path.join(self.dst_dir, f"{stem}_report.html")
+                        if os.path.exists(trk_rep):
+                            self.report_path = trk_rep
+            else:
+                self.status = "failed"
+                self.stage = "Failed"
+                self.error_message = f"Process exited with non-zero status code {return_code}"
+
+    def cancel_job(self):
+        with self.lock:
+            if self.status != "running" or self.proc is None:
+                return {"status": "error", "message": "No job is currently running."}
+            try:
+                os.killpg(os.getpgid(self.proc.pid), signal.SIGTERM)
+                self.status = "cancelled"
+                self.stage = "Cancelled by user"
+                self.end_time = time.time()
+                return {"status": "ok", "message": "Job cancellation signal sent."}
+            except Exception as e:
+                return {"status": "error", "message": f"Cancellation error: {e}"}
+
+    def get_status(self, since_idx=0):
+        with self.lock:
+            filtered_logs = [l for l in self.log_lines if l["idx"] > since_idx]
+            elapsed = (self.end_time if self.end_time else time.time()) - self.start_time if self.start_time else 0
+            return {
+                "status": self.status,
+                "job_id": self.job_id,
+                "mode": self.mode,
+                "src_path": self.src_path,
+                "dst_dir": self.dst_dir,
+                "current_track": self.current_track,
+                "track_index": self.track_index,
+                "total_tracks": self.total_tracks,
+                "progress_percent": self.progress_percent,
+                "stage": self.stage,
+                "error_message": self.error_message,
+                "report_path": self.report_path,
+                "report_url": f"/api/raw_summary?path={urllib.parse.quote(self.report_path)}" if self.report_path else None,
+                "elapsed_seconds": round(elapsed, 1),
+                "logs": filtered_logs,
+                "max_log_idx": self.log_lines[-1]["idx"] if self.log_lines else since_idx
+            }
+
+
+upsample_job_mgr = UpsampleJobManager()
 
 
 def get_directory_contents(target_path, fresh=True):
@@ -1167,8 +1457,174 @@ HTML_PAGE = """<!DOCTYPE html>
             border: 1px solid #30363d;
         }
         .markdown-rendered li {
-            margin-left: 20px;
-            margin-bottom: 6px;
+        /* Upsample Studio Modal & Form Styles */
+        .modal-upsample-dialog {
+            max-width: 680px;
+            height: auto;
+            max-height: 90vh;
+        }
+        .form-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 12px;
+            margin-top: 10px;
+        }
+        .form-group {
+            display: flex;
+            flex-direction: column;
+            gap: 5px;
+        }
+        .form-group.full-width {
+            grid-column: 1 / -1;
+        }
+        .form-label {
+            font-size: 0.78rem;
+            font-weight: 600;
+            color: var(--text-heading);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+        .form-input, .form-select {
+            background: #0d1117;
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 8px 10px;
+            color: var(--text-heading);
+            font-size: 0.82rem;
+            outline: none;
+            transition: border-color 0.15s;
+            width: 100%;
+        }
+        .form-input:focus, .form-select:focus {
+            border-color: var(--accent-cyan);
+        }
+        .form-checkbox-row {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 0.80rem;
+            color: var(--text);
+            cursor: pointer;
+            user-select: none;
+            padding: 4px 0;
+        }
+        .preset-pill-group {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+            margin-bottom: 12px;
+        }
+        .preset-pill {
+            background: #21262d;
+            border: 1px solid var(--border);
+            color: var(--text);
+            padding: 4px 10px;
+            font-size: 0.75rem;
+            border-radius: 12px;
+            cursor: pointer;
+            transition: all 0.15s ease;
+        }
+        .preset-pill:hover {
+            border-color: var(--accent-cyan);
+            color: var(--accent-cyan);
+            background: rgba(0, 229, 255, 0.08);
+        }
+        .preset-pill.active {
+            background: rgba(0, 229, 255, 0.15);
+            border-color: var(--accent-cyan);
+            color: var(--accent-cyan);
+            font-weight: 600;
+        }
+
+        /* Floating Upsample Telemetry & Progress Drawer */
+        .upsample-drawer {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            z-index: 10000;
+            width: 500px;
+            max-width: calc(100vw - 40px);
+            background: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 10px;
+            box-shadow: 0 12px 40px rgba(0,0,0,0.75);
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            animation: badge-fade-in 0.25s ease;
+            transition: all 0.2s ease;
+        }
+        .upsample-drawer.minimized .drawer-body,
+        .upsample-drawer.minimized .drawer-terminal-container {
+            display: none !important;
+        }
+        .drawer-header {
+            padding: 10px 14px;
+            background: #11141a;
+            border-bottom: 1px solid #30363d;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 10px;
+        }
+        .drawer-body {
+            padding: 14px;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            background: #161b22;
+        }
+        .drawer-progress-track {
+            width: 100%;
+            height: 8px;
+            background: #0d1117;
+            border-radius: 4px;
+            overflow: hidden;
+            border: 1px solid #30363d;
+            position: relative;
+        }
+        .drawer-progress-fill {
+            height: 100%;
+            width: 0%;
+            background: linear-gradient(90deg, #00e5ff, #00e676);
+            border-radius: 4px;
+            transition: width 0.3s ease;
+        }
+        .drawer-progress-fill.running {
+            background-size: 20px 20px;
+            background-image: linear-gradient(45deg, rgba(255, 255, 255, 0.15) 25%, transparent 25%, transparent 50%, rgba(255, 255, 255, 0.15) 50%, rgba(255, 255, 255, 0.15) 75%, transparent 75%, transparent);
+            animation: progress-stripes 1s linear infinite;
+        }
+        @keyframes progress-stripes {
+            0% { background-position: 0 0; }
+            100% { background-position: 20px 0; }
+        }
+        .drawer-terminal-container {
+            border-top: 1px solid #30363d;
+            background: #0a0c10;
+            max-height: 180px;
+            overflow-y: auto;
+            padding: 8px 12px;
+            font-family: ui-monospace, SFMono-Regular, "SF Mono", monospace;
+            font-size: 0.72rem;
+            color: #8b949e;
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+        }
+        .drawer-terminal-line {
+            white-space: pre-wrap;
+            word-break: break-all;
+            line-height: 1.35;
+        }
+        .drawer-terminal-line.highlight {
+            color: var(--accent-cyan);
+            font-weight: 600;
+        }
+        .drawer-terminal-line.error {
+            color: #ff5252;
+            font-weight: 600;
         }
     </style>
 </head>
@@ -1180,6 +1636,7 @@ HTML_PAGE = """<!DOCTYPE html>
             <span id="gpuStatusBadge" class="gpu-badge">⚡ GPU Initializing...</span>
         </div>
         <div class="bookmarks">
+            <button id="headerBtnUpsample" class="btn-bookmark" style="display: none; background: rgba(0, 230, 118, 0.15); border-color: rgba(0, 230, 118, 0.45); color: #00e676; font-weight: 600;" onclick="openUpsampleModalForCurrentFolder()" title="Launch AcoustiSinc Upsampling Studio for this folder">⚡ Upsample Album</button>
             <button id="headerBtnSummary" class="btn-bookmark" style="display: none; background: rgba(0, 229, 255, 0.15); border-color: rgba(0, 229, 255, 0.45); color: var(--accent-cyan); font-weight: 600;" onclick="openAlbumSummary()" title="View Album Analysis Summary">📋 Album Summary</button>
             <button class="btn-bookmark" onclick="loadDirectory('/mnt/PrimaryFS/FLAC_music/music', true)">📁 Music Library</button>
             <button class="btn-bookmark" onclick="loadDirectory('/mnt/PrimaryFS/FLAC_music/music/Qobuz Downloads', true)">🎧 Qobuz Releases</button>
@@ -1274,6 +1731,11 @@ HTML_PAGE = """<!DOCTYPE html>
                                 <div id="actionCodeContainer" style="display: none; margin-top: 2px;">
                                     <span style="font-size: 0.72rem; color: var(--text-muted); margin-right: 6px;">DSP Flag:</span>
                                     <code class="action-code" id="actionCode">--</code>
+                                </div>
+                                <div id="actionRecButtons" style="display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap;">
+                                    <button class="btn-bookmark" style="background: rgba(0, 230, 118, 0.15); color: #00e676; border-color: rgba(0, 230, 118, 0.4); font-weight: 600; font-size: 0.78rem; padding: 4px 10px;" onclick="quickUpsampleCurrentTrack()">⚡ Upsample Track (Recommended)</button>
+                                    <button class="btn-bookmark" style="background: rgba(0, 229, 255, 0.12); color: var(--accent-cyan); border-color: rgba(0, 229, 255, 0.35); font-weight: 600; font-size: 0.78rem; padding: 4px 10px;" onclick="openUpsampleModalForTrack()">⚙️ Custom Track Recipe...</button>
+                                    <button class="btn-bookmark" style="background: rgba(255, 234, 0, 0.12); color: var(--accent-yellow); border-color: rgba(255, 234, 0, 0.35); font-weight: 600; font-size: 0.78rem; padding: 4px 10px;" onclick="openUpsampleModalForCurrentFolder()">⚡ Upsample Entire Album...</button>
                                 </div>
                             </div>
                         </div>
@@ -1476,11 +1938,18 @@ HTML_PAGE = """<!DOCTYPE html>
                 renderBreadcrumbs(directoryData.breadcrumbs, directoryData.parent_path);
                 renderDirectory('');
                 updateAlbumSummaryUI(directoryData.album_summary);
+                const hasAudioFiles = directoryData.files && directoryData.files.length > 0;
+                const headerUpsampleBtn = document.getElementById('headerBtnUpsample');
+                if (headerUpsampleBtn) {
+                    headerUpsampleBtn.style.display = hasAudioFiles ? 'inline-block' : 'none';
+                }
 
                 // Connect SSE stream for progressive fresh folder badges
                 startFolderStream(currentPath, fresh);
             } catch (err) {
                 updateAlbumSummaryUI(null);
+                const headerUpsampleBtn = document.getElementById('headerBtnUpsample');
+                if (headerUpsampleBtn) headerUpsampleBtn.style.display = 'none';
                 treeList.innerHTML = `<div style="padding: 20px; color: var(--accent-red); text-align: center;">Failed to load directory:<br><small>${err.message}</small></div>`;
             }
         }
@@ -2714,9 +3183,436 @@ HTML_PAGE = """<!DOCTYPE html>
                 .replace(/`(.*?)`/g, '<code>$1</code>');
         }
 
+        // ==========================================
+        // AcoustiSinc Upsampling Studio & Job Telemetry
+        // ==========================================
+        let upsamplePollTimer = null;
+        let lastLogIdx = 0;
+        let activeUpsampleJob = null;
+        let upsampleTargetMode = 'album';
+
+        async function openUpsampleModal(mode = 'album', customSrcPath = null) {
+            upsampleTargetMode = mode;
+            const modal = document.getElementById('upsampleModal');
+            const scopeBadge = document.getElementById('upsampleModalScopeBadge');
+            const srcInput = document.getElementById('upsampleSrcPath');
+            const dstInput = document.getElementById('upsampleDstDir');
+
+            let srcPath = customSrcPath;
+            if (!srcPath) {
+                if (mode === 'track') {
+                    srcPath = currentAnalysis ? currentAnalysis.filepath : (directoryData && directoryData.files && directoryData.files[0] ? directoryData.files[0].path : '');
+                } else {
+                    srcPath = currentPath;
+                }
+            }
+
+            if (!srcPath) {
+                alert('Please select a track or navigate to an album folder first.');
+                return;
+            }
+
+            srcInput.value = srcPath;
+            scopeBadge.textContent = mode === 'track' ? 'SINGLE TRACK' : 'ALBUM BATCH';
+            scopeBadge.style.background = mode === 'track' ? 'rgba(0, 229, 255, 0.15)' : 'rgba(0, 230, 118, 0.15)';
+            scopeBadge.style.borderColor = mode === 'track' ? 'rgba(0, 229, 255, 0.4)' : 'rgba(0, 230, 118, 0.4)';
+            scopeBadge.style.color = mode === 'track' ? 'var(--accent-cyan)' : '#00e676';
+
+            try {
+                const res = await fetch(`/api/upsample/dest_preview?path=${encodeURIComponent(srcPath)}`);
+                const data = await res.json();
+                if (data && data.dest_dir) {
+                    dstInput.value = data.dest_dir;
+                }
+            } catch (err) {
+                dstInput.value = '';
+            }
+
+            applyForensicRecommendationPreset();
+            modal.style.display = 'flex';
+        }
+
+        function openUpsampleModalForTrack() {
+            if (!currentAnalysis || !currentAnalysis.filepath) {
+                alert('Please select and analyze a track first.');
+                return;
+            }
+            openUpsampleModal('track', currentAnalysis.filepath);
+        }
+
+        function openUpsampleModalForCurrentFolder() {
+            openUpsampleModal('album', currentPath);
+        }
+
+        function closeUpsampleModal() {
+            const modal = document.getElementById('upsampleModal');
+            if (modal) modal.style.display = 'none';
+        }
+
+        function toggleCutoffInput() {
+            const enableCheck = document.getElementById('upsampleCutoffEnable');
+            const cutoffInput = document.getElementById('upsampleCutoffHz');
+            cutoffInput.disabled = !enableCheck.checked;
+            if (enableCheck.checked && !cutoffInput.value) {
+                cutoffInput.value = '22050';
+            }
+        }
+
+        function applyForensicRecommendationPreset() {
+            setActivePresetPill('presetBtnRecommended');
+            const rateSelect = document.getElementById('upsampleRate');
+            const phaseSelect = document.getElementById('upsamplePhase');
+            const cutoffCheck = document.getElementById('upsampleCutoffEnable');
+            const cutoffInput = document.getElementById('upsampleCutoffHz');
+            const cutoffHint = document.getElementById('cutoffHint');
+            const ditherSelect = document.getElementById('upsampleDither');
+            const mqaSelect = document.getElementById('upsampleMqa');
+            const steepCheck = document.getElementById('upsampleSteep');
+
+            rateSelect.value = '4x';
+            phaseSelect.value = 'min';
+            ditherSelect.value = 'shibata';
+            mqaSelect.value = 'adaptive';
+            steepCheck.checked = false;
+            cutoffCheck.checked = false;
+            cutoffInput.disabled = true;
+            cutoffInput.value = '';
+            if (cutoffHint) cutoffHint.textContent = 'Optional';
+
+            if (currentAnalysis && currentAnalysis.provenance) {
+                const p = currentAnalysis.provenance;
+                const rec = p.recommendation || {};
+                const paramsStr = rec.dsp_params || '';
+
+                if (paramsStr.includes('--phase linear')) {
+                    phaseSelect.value = 'linear';
+                } else if (paramsStr.includes('--phase min') || paramsStr.includes('--filter min')) {
+                    phaseSelect.value = 'min';
+                }
+
+                if (rec.filter_cutoff_khz) {
+                    cutoffCheck.checked = true;
+                    cutoffInput.disabled = false;
+                    const hz = Math.round(rec.filter_cutoff_khz * 1000);
+                    cutoffInput.value = hz;
+                    if (cutoffHint) cutoffHint.textContent = `Auto-detected (${rec.filter_cutoff_khz} kHz)`;
+                } else if (paramsStr.includes('--cutoff') || paramsStr.includes('--apod')) {
+                    cutoffCheck.checked = true;
+                    cutoffInput.disabled = false;
+                    const m = paramsStr.match(/--cutoff\\s+(\\d+)/);
+                    cutoffInput.value = m ? m[1] : '22050';
+                    if (cutoffHint) cutoffHint.textContent = `Recommended (${cutoffInput.value} Hz)`;
+                }
+
+                if (paramsStr.includes('--steep')) {
+                    steepCheck.checked = true;
+                }
+
+                if (paramsStr.includes('--mqa strip')) {
+                    mqaSelect.value = 'strip';
+                } else if (paramsStr.includes('--mqa ignore')) {
+                    mqaSelect.value = 'ignore';
+                }
+            }
+        }
+
+        function applyDefaultPreset(type) {
+            const rateSelect = document.getElementById('upsampleRate');
+            const phaseSelect = document.getElementById('upsamplePhase');
+            const cutoffCheck = document.getElementById('upsampleCutoffEnable');
+            const cutoffInput = document.getElementById('upsampleCutoffHz');
+            const ditherSelect = document.getElementById('upsampleDither');
+            const mqaSelect = document.getElementById('upsampleMqa');
+            const steepCheck = document.getElementById('upsampleSteep');
+
+            rateSelect.value = '4x';
+            ditherSelect.value = 'shibata';
+            mqaSelect.value = 'adaptive';
+            steepCheck.checked = false;
+
+            if (type === '4x') {
+                setActivePresetPill('presetBtnAudiophile4x');
+                phaseSelect.value = 'min';
+                cutoffCheck.checked = false;
+                cutoffInput.disabled = true;
+                cutoffInput.value = '';
+            } else if (type === 'apod') {
+                setActivePresetPill('presetBtnApodizing');
+                phaseSelect.value = 'min';
+                cutoffCheck.checked = true;
+                cutoffInput.disabled = false;
+                cutoffInput.value = '22050';
+            }
+        }
+
+        function setActivePresetPill(btnId) {
+            ['presetBtnRecommended', 'presetBtnAudiophile4x', 'presetBtnApodizing'].forEach(id => {
+                const el = document.getElementById(id);
+                if (el) el.classList.toggle('active', id === btnId);
+            });
+        }
+
+        async function quickUpsampleCurrentTrack() {
+            if (!currentAnalysis || !currentAnalysis.filepath) {
+                alert('Please select a track first.');
+                return;
+            }
+            await openUpsampleModal('track', currentAnalysis.filepath);
+            applyForensicRecommendationPreset();
+            startUpsampleJob();
+        }
+
+        async function startUpsampleJob() {
+            const srcPath = document.getElementById('upsampleSrcPath').value.trim();
+            const dstDir = document.getElementById('upsampleDstDir').value.trim();
+            const rate = document.getElementById('upsampleRate').value;
+            const phase = document.getElementById('upsamplePhase').value;
+            const cutoffEnable = document.getElementById('upsampleCutoffEnable').checked;
+            const cutoffHz = cutoffEnable ? document.getElementById('upsampleCutoffHz').value : null;
+            const steep = document.getElementById('upsampleSteep').checked;
+            const dither = document.getElementById('upsampleDither').value;
+            const mqa = document.getElementById('upsampleMqa').value;
+            const overwrite = document.getElementById('upsampleOverwrite').value;
+            const report = document.getElementById('upsampleReport').checked;
+
+            if (!srcPath) {
+                alert('Source path is required.');
+                return;
+            }
+
+            const payload = {
+                source_path: srcPath,
+                dest_dir: dstDir,
+                rate: rate,
+                phase: phase,
+                cutoff_hz: cutoffHz,
+                steep: steep,
+                dither: dither,
+                mqa: mqa,
+                overwrite: overwrite,
+                report: report,
+                use_recommended: false
+            };
+
+            try {
+                const res = await fetch('/api/upsample/start', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+                const data = await res.json();
+                if (data.status !== 'ok') {
+                    alert('Failed to start upsampling job: ' + (data.message || 'Unknown error'));
+                    return;
+                }
+
+                closeUpsampleModal();
+                activeUpsampleJob = data;
+                lastLogIdx = 0;
+                showUpsampleDrawer(data);
+                startPollingUpsampleStatus();
+            } catch (err) {
+                alert('Error submitting upsampling job: ' + err.message);
+            }
+        }
+
+        function showUpsampleDrawer(jobData) {
+            const drawer = document.getElementById('upsampleJobDrawer');
+            const title = document.getElementById('drawerTitle');
+            const badge = document.getElementById('drawerStatusBadge');
+            const stageText = document.getElementById('drawerStageText');
+            const fill = document.getElementById('drawerProgressFill');
+            const progressText = document.getElementById('drawerProgressText');
+            const trackText = document.getElementById('drawerTrackText');
+            const elapsedText = document.getElementById('drawerElapsedText');
+            const btnReport = document.getElementById('drawerBtnReport');
+            const btnDest = document.getElementById('drawerBtnDest');
+            const btnCancel = document.getElementById('drawerBtnCancel');
+            const logsContainer = document.getElementById('drawerTerminalLogs');
+
+            if (!drawer) return;
+
+            drawer.style.display = 'flex';
+            drawer.classList.remove('minimized');
+            const displayName = jobData.src_path.split('/').filter(Boolean).pop() || 'Item';
+            title.textContent = `⚡ Upsampling: ${displayName}`;
+            badge.textContent = 'RUNNING';
+            badge.style.background = 'rgba(0, 229, 255, 0.15)';
+            badge.style.borderColor = 'rgba(0, 229, 255, 0.4)';
+            badge.style.color = 'var(--accent-cyan)';
+            stageText.textContent = 'Initializing DSP pipeline...';
+            fill.style.width = '3%';
+            fill.className = 'drawer-progress-fill running';
+            progressText.textContent = '0%';
+            trackText.textContent = 'Starting 64-bit GPU polyphase sinc engine...';
+            elapsedText.textContent = '00:00';
+            btnReport.style.display = 'none';
+            btnDest.style.display = 'none';
+            btnCancel.style.display = 'inline-block';
+            if (logsContainer) logsContainer.innerHTML = '';
+        }
+
+        function startPollingUpsampleStatus() {
+            if (upsamplePollTimer) clearInterval(upsamplePollTimer);
+            upsamplePollTimer = setInterval(pollUpsampleStatus, 800);
+            pollUpsampleStatus();
+        }
+
+        async function pollUpsampleStatus() {
+            try {
+                const res = await fetch(`/api/upsample/status?since_log=${lastLogIdx}`);
+                const data = await res.json();
+                if (!data) return;
+
+                const badge = document.getElementById('drawerStatusBadge');
+                const stageText = document.getElementById('drawerStageText');
+                const fill = document.getElementById('drawerProgressFill');
+                const progressText = document.getElementById('drawerProgressText');
+                const trackText = document.getElementById('drawerTrackText');
+                const elapsedText = document.getElementById('drawerElapsedText');
+                const btnReport = document.getElementById('drawerBtnReport');
+                const btnDest = document.getElementById('drawerBtnDest');
+                const btnCancel = document.getElementById('drawerBtnCancel');
+                const logsContainer = document.getElementById('drawerTerminalLogs');
+
+                if (data.logs && data.logs.length > 0) {
+                    data.logs.forEach(l => {
+                        lastLogIdx = Math.max(lastLogIdx, l.idx);
+                        if (logsContainer) {
+                            const lineEl = document.createElement('div');
+                            lineEl.className = 'drawer-terminal-line' + (l.text.includes('Error') ? ' error' : l.text.includes('Complete') || l.text.includes('==') ? ' highlight' : '');
+                            lineEl.textContent = `[${l.time}] ${l.text}`;
+                            logsContainer.appendChild(lineEl);
+                        }
+                    });
+                    const terminal = document.getElementById('drawerTerminal');
+                    if (terminal) terminal.scrollTop = terminal.scrollHeight;
+                }
+
+                const elSec = Math.floor(data.elapsed_seconds || 0);
+                const m = Math.floor(elSec / 60);
+                const s = elSec % 60;
+                elapsedText.textContent = `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+
+                stageText.textContent = data.stage || 'Processing...';
+                const pct = Math.min(100, Math.max(0, data.progress_percent || 0));
+                fill.style.width = `${pct}%`;
+                progressText.textContent = `${pct.toFixed(0)}%`;
+
+                if (data.current_track) {
+                    trackText.textContent = `[${data.track_index || 1}/${data.total_tracks || 1}] ${data.current_track}`;
+                }
+
+                if (data.status === 'completed') {
+                    badge.textContent = 'COMPLETED';
+                    badge.style.background = 'rgba(0, 230, 118, 0.15)';
+                    badge.style.borderColor = 'rgba(0, 230, 118, 0.4)';
+                    badge.style.color = '#00e676';
+                    fill.className = 'drawer-progress-fill';
+                    fill.style.width = '100%';
+                    progressText.textContent = '100%';
+                    btnCancel.style.display = 'none';
+                    if (data.report_url) {
+                        btnReport.style.display = 'inline-block';
+                        btnReport.setAttribute('data-report-url', data.report_url);
+                        btnReport.setAttribute('data-report-path', data.report_path);
+                    }
+                    if (data.dst_dir) {
+                        btnDest.style.display = 'inline-block';
+                        btnDest.setAttribute('data-dest-dir', data.dst_dir);
+                    }
+                    clearInterval(upsamplePollTimer);
+                    upsamplePollTimer = null;
+                } else if (data.status === 'failed') {
+                    badge.textContent = 'FAILED';
+                    badge.style.background = 'rgba(255, 23, 68, 0.15)';
+                    badge.style.borderColor = 'rgba(255, 23, 68, 0.4)';
+                    badge.style.color = '#ff5252';
+                    fill.className = 'drawer-progress-fill';
+                    btnCancel.style.display = 'none';
+                    stageText.textContent = data.error_message || 'Process failed';
+                    clearInterval(upsamplePollTimer);
+                    upsamplePollTimer = null;
+                } else if (data.status === 'cancelled') {
+                    badge.textContent = 'CANCELLED';
+                    badge.style.background = 'rgba(255, 234, 0, 0.15)';
+                    badge.style.borderColor = 'rgba(255, 234, 0, 0.4)';
+                    badge.style.color = 'var(--accent-yellow)';
+                    fill.className = 'drawer-progress-fill';
+                    btnCancel.style.display = 'none';
+                    clearInterval(upsamplePollTimer);
+                    upsamplePollTimer = null;
+                }
+            } catch (err) {}
+        }
+
+        async function cancelUpsampleJob() {
+            if (!confirm('Are you sure you want to abort the current upsampling job?')) return;
+            try {
+                const res = await fetch('/api/upsample/cancel', { method: 'POST' });
+                const data = await res.json();
+                if (data.status !== 'ok') {
+                    alert('Failed to cancel job: ' + (data.message || 'Unknown error'));
+                }
+            } catch (err) {
+                alert('Error cancelling job: ' + err.message);
+            }
+        }
+
+        function toggleUpsampleTerminal() {
+            const terminal = document.getElementById('drawerTerminal');
+            if (!terminal) return;
+            const isShown = terminal.style.display !== 'none';
+            terminal.style.display = isShown ? 'none' : 'flex';
+            if (!isShown) terminal.scrollTop = terminal.scrollHeight;
+        }
+
+        function toggleUpsampleDrawerMinimize() {
+            const drawer = document.getElementById('upsampleJobDrawer');
+            if (drawer) drawer.classList.toggle('minimized');
+        }
+
+        function dismissUpsampleDrawer() {
+            const drawer = document.getElementById('upsampleJobDrawer');
+            if (drawer) drawer.style.display = 'none';
+            if (upsamplePollTimer) {
+                clearInterval(upsamplePollTimer);
+                upsamplePollTimer = null;
+            }
+        }
+
+        function viewGeneratedReport() {
+            const btnReport = document.getElementById('drawerBtnReport');
+            const reportUrl = btnReport ? btnReport.getAttribute('data-report-url') : null;
+            if (reportUrl) {
+                const modal = document.getElementById('albumSummaryModal');
+                const body = document.getElementById('modalSummaryBody');
+                const badge = document.getElementById('modalSummaryBadge');
+                const extBtn = document.getElementById('modalOpenExternalBtn');
+                if (modal && body) {
+                    modal.style.display = 'flex';
+                    badge.textContent = 'ALBUM_REPORT.html (Freshly Mastered)';
+                    extBtn.style.display = 'inline-block';
+                    currentSummaryRawUrl = reportUrl;
+                    body.innerHTML = `<iframe class="modal-iframe" src="${reportUrl}" style="width: 100%; height: 100%; min-height: 72vh; border: none; border-radius: 6px; background: #0d1117;"></iframe>`;
+                }
+            }
+        }
+
+        function jumpToUpsampleDestination() {
+            const btnDest = document.getElementById('drawerBtnDest');
+            const destDir = btnDest ? btnDest.getAttribute('data-dest-dir') : null;
+            if (destDir) {
+                loadDirectory(destDir, true);
+            }
+        }
+
         // Close modal on Escape key
         window.addEventListener('keydown', (e) => {
-            if (e.key === 'Escape') closeAlbumSummaryModal();
+            if (e.key === 'Escape') {
+                closeAlbumSummaryModal();
+                closeUpsampleModal();
+            }
         });
 
         // Initialize on load
@@ -2743,6 +3639,150 @@ HTML_PAGE = """<!DOCTYPE html>
                     Loading album analysis summary...
                 </div>
             </div>
+        </div>
+    </div>
+
+    <!-- Upsample Configuration Modal -->
+    <div id="upsampleModal" class="modal-backdrop" style="display: none;" onclick="if(event.target===this) closeUpsampleModal()">
+        <div class="modal-content modal-upsample-dialog">
+            <div class="modal-header">
+                <div style="display: flex; align-items: center; gap: 10px; min-width: 0;">
+                    <span style="font-size: 1.1rem; font-weight: 700; color: var(--text-heading); white-space: nowrap;">⚡ AcoustiSinc Upsampling Studio</span>
+                    <span id="upsampleModalScopeBadge" class="brand-badge" style="background: rgba(0, 230, 118, 0.15); border-color: rgba(0, 230, 118, 0.4); color: #00e676;">ALBUM BATCH</span>
+                </div>
+                <button class="btn-bookmark" onclick="closeUpsampleModal()" style="font-size: 1.2rem; padding: 2px 10px; line-height: 1;">&times;</button>
+            </div>
+            <div class="modal-body" style="padding: 16px 20px;">
+                <div class="preset-pill-group">
+                    <button class="preset-pill active" id="presetBtnRecommended" onclick="applyForensicRecommendationPreset()">✨ Apply Forensic Recommendation</button>
+                    <button class="preset-pill" id="presetBtnAudiophile4x" onclick="applyDefaultPreset('4x')">🎧 Standard 4x Audiophile</button>
+                    <button class="preset-pill" id="presetBtnApodizing" onclick="applyDefaultPreset('apod')">🛡️ Apodizing Ringing-Filter (22.05k)</button>
+                </div>
+
+                <div class="form-grid">
+                    <div class="form-group full-width">
+                        <label class="form-label">Source Input Path</label>
+                        <input type="text" class="form-input" id="upsampleSrcPath" readonly style="color: var(--text-muted); background: #11141a;" />
+                    </div>
+
+                    <div class="form-group full-width">
+                        <label class="form-label">Destination Output Directory</label>
+                        <input type="text" class="form-input" id="upsampleDstDir" placeholder="/mnt/PrimaryFS/1xxK_min/music/..." />
+                    </div>
+
+                    <div class="form-group">
+                        <label class="form-label">Target Sample Rate</label>
+                        <select class="form-select" id="upsampleRate">
+                            <option value="4x" selected>Auto 4x Native (176.4k / 192k)</option>
+                            <option value="192000">192.0 kHz</option>
+                            <option value="176400">176.4 kHz</option>
+                            <option value="384000">384.0 kHz (8x)</option>
+                            <option value="352800">352.8 kHz (8x)</option>
+                        </select>
+                    </div>
+
+                    <div class="form-group">
+                        <label class="form-label">Filter Phase Mode</label>
+                        <select class="form-select" id="upsamplePhase">
+                            <option value="min" selected>Minimum Phase (Apodizing / Anti-Ringing)</option>
+                            <option value="linear">Linear Phase (Symmetric Time Response)</option>
+                        </select>
+                    </div>
+
+                    <div class="form-group">
+                        <label class="form-label">
+                            <span>Reconstruction Cutoff</span>
+                            <span id="cutoffHint" style="font-size: 0.70rem; color: var(--text-muted);">Optional</span>
+                        </label>
+                        <div style="display: flex; gap: 6px; align-items: center;">
+                            <input type="checkbox" id="upsampleCutoffEnable" onchange="toggleCutoffInput()" style="cursor: pointer;" />
+                            <input type="number" class="form-input" id="upsampleCutoffHz" placeholder="22050" min="10000" max="192000" step="50" disabled />
+                            <span style="font-size: 0.75rem; color: var(--text-muted);">Hz</span>
+                        </div>
+                    </div>
+
+                    <div class="form-group">
+                        <label class="form-label">Dither & Noise Shaping</label>
+                        <select class="form-select" id="upsampleDither">
+                            <option value="shibata" selected>Shibata (Psychoacoustic High-Order, 24-bit)</option>
+                            <option value="high_rate">High Rate Flat Dither</option>
+                            <option value="none">None (Direct In-Register Float64)</option>
+                        </select>
+                    </div>
+
+                    <div class="form-group">
+                        <label class="form-label">MQA Payload Policy</label>
+                        <select class="form-select" id="upsampleMqa">
+                            <option value="adaptive" selected>adaptive (Subband Unfold + Noise Gate)</option>
+                            <option value="strip">strip (Mask LSB Hash & Re-dither)</option>
+                            <option value="ignore">ignore (Treat as Raw Linear PCM)</option>
+                        </select>
+                    </div>
+
+                    <div class="form-group">
+                        <label class="form-label">File Overwrite Mode</label>
+                        <select class="form-select" id="upsampleOverwrite">
+                            <option value="on" selected>Overwrite Existing Output</option>
+                            <option value="off">Skip Existing Output</option>
+                        </select>
+                    </div>
+
+                    <div class="form-group full-width" style="margin-top: 4px;">
+                        <div style="display: flex; gap: 16px; flex-wrap: wrap;">
+                            <label class="form-checkbox-row">
+                                <input type="checkbox" id="upsampleSteep" />
+                                <span>Sharp 500 Hz Transition Band (Steep)</span>
+                            </label>
+                            <label class="form-checkbox-row">
+                                <input type="checkbox" id="upsampleReport" checked />
+                                <span>Generate Comparative HTML/MD Reports</span>
+                            </label>
+                        </div>
+                    </div>
+                </div>
+
+                <div style="display: flex; justify-content: flex-end; gap: 10px; margin-top: 20px; border-top: 1px solid #30363d; padding-top: 14px;">
+                    <button class="btn-bookmark" onclick="closeUpsampleModal()" style="padding: 7px 14px;">Cancel</button>
+                    <button class="btn-bookmark" onclick="startUpsampleJob()" style="background: rgba(0, 230, 118, 0.2); border-color: rgba(0, 230, 118, 0.6); color: #00e676; font-weight: 700; padding: 7px 18px; font-size: 0.88rem;">⚡ Start Upsampling</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Floating Telemetry & Progress Drawer -->
+    <div id="upsampleJobDrawer" class="upsample-drawer" style="display: none;">
+        <div class="drawer-header">
+            <div style="display: flex; align-items: center; gap: 8px; min-width: 0;">
+                <span style="font-size: 0.95rem;">⚡</span>
+                <span id="drawerTitle" style="font-size: 0.85rem; font-weight: 700; color: var(--text-heading); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">AcoustiSinc DSP Studio</span>
+                <span id="drawerStatusBadge" class="brand-badge" style="background: rgba(0, 229, 255, 0.15); color: var(--accent-cyan);">RUNNING</span>
+            </div>
+            <div style="display: flex; align-items: center; gap: 6px; flex-shrink: 0;">
+                <button class="btn-bookmark" onclick="toggleUpsampleTerminal()" id="drawerConsoleToggleBtn" title="Toggle Live Console Output" style="padding: 2px 7px; font-size: 0.72rem;">📜 Logs</button>
+                <button class="btn-bookmark" onclick="toggleUpsampleDrawerMinimize()" title="Minimize / Expand" style="padding: 2px 7px; font-size: 0.72rem;">—</button>
+                <button class="btn-bookmark" onclick="dismissUpsampleDrawer()" title="Close Drawer" style="padding: 2px 7px; font-size: 0.72rem;">&times;</button>
+            </div>
+        </div>
+        <div class="drawer-body">
+            <div style="display: flex; justify-content: space-between; align-items: center; font-size: 0.78rem;">
+                <span id="drawerStageText" style="color: var(--accent-cyan); font-weight: 600;">Initializing...</span>
+                <span id="drawerProgressText" style="font-weight: 700; color: var(--text-heading);">0%</span>
+            </div>
+            <div class="drawer-progress-track">
+                <div class="drawer-progress-fill running" id="drawerProgressFill"></div>
+            </div>
+            <div style="display: flex; justify-content: space-between; align-items: center; font-size: 0.74rem; color: var(--text-muted);">
+                <div id="drawerTrackText" style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 320px;">Preparing audio stream...</div>
+                <div id="drawerElapsedText">00:00</div>
+            </div>
+            <div style="display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px;">
+                <button class="btn-bookmark" id="drawerBtnReport" onclick="viewGeneratedReport()" style="display: none; background: rgba(0, 229, 255, 0.15); color: var(--accent-cyan); border-color: rgba(0, 229, 255, 0.4); font-size: 0.76rem; font-weight: 600; padding: 4px 10px;">📋 View Album Report</button>
+                <button class="btn-bookmark" id="drawerBtnDest" onclick="jumpToUpsampleDestination()" style="display: none; background: rgba(88, 166, 255, 0.15); color: var(--accent-blue); border-color: rgba(88, 166, 255, 0.4); font-size: 0.76rem; font-weight: 600; padding: 4px 10px;">📂 Open Destination</button>
+                <button class="btn-bookmark" id="drawerBtnCancel" onclick="cancelUpsampleJob()" style="background: rgba(255, 23, 68, 0.15); color: #ff5252; border-color: rgba(255, 23, 68, 0.4); font-size: 0.76rem; font-weight: 600; padding: 4px 10px;">⛔ Abort</button>
+            </div>
+        </div>
+        <div class="drawer-terminal-container" id="drawerTerminal" style="display: none;">
+            <div id="drawerTerminalLogs"></div>
         </div>
     </div>
 </body>
@@ -2940,6 +3980,59 @@ class ForensicWebHandler(BaseHTTPRequestHandler):
             except Exception:
                 self.send_response(500)
                 self.end_headers()
+        elif path == "/api/upsample/status":
+            since_log = 0
+            try:
+                since_log = int(params.get("since_log", ["0"])[0])
+            except Exception:
+                pass
+            status_data = upsample_job_mgr.get_status(since_idx=since_log)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(status_data).encode("utf-8"))
+
+        elif path == "/api/upsample/dest_preview":
+            src = params.get("path", [""])[0]
+            dest = derive_default_destination_dir(src)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"status": "ok", "source_path": src, "dest_dir": dest}).encode("utf-8"))
+
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def do_POST(self):
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+
+        if path == "/api/upsample/start":
+            content_length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_length).decode('utf-8')
+            try:
+                config = json.loads(body)
+            except Exception as e:
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"status": "error", "message": f"Invalid JSON body: {e}"}).encode("utf-8"))
+                return
+
+            res = upsample_job_mgr.start_job(config)
+            self.send_response(200 if res.get("status") == "ok" else 400)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(res).encode("utf-8"))
+
+        elif path == "/api/upsample/cancel":
+            res = upsample_job_mgr.cancel_job()
+            self.send_response(200 if res.get("status") == "ok" else 400)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(res).encode("utf-8"))
+
         else:
             self.send_response(404)
             self.end_headers()
