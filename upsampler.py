@@ -31,6 +31,7 @@ import pyopencl.array as cla
 from pyvkfft.fft import rfftn, irfftn, clear_vkfftapp_cache
 import io
 import re
+import json
 from PIL import Image
 from mutagen import File
 from mutagen.flac import FLAC, Picture
@@ -1263,6 +1264,19 @@ class SessionPromptController:
         album_summary_path = self._find_album_summary(album_dir)
         has_summary = (album_summary_path is not None)
 
+        # Emit structured machine-readable prompt for Web UI
+        prompt_payload = {
+            "track_file": os.path.basename(filepath),
+            "filepath": filepath,
+            "track_idx": track_idx,
+            "total_tracks": total_tracks,
+            "rec_params": rec_params,
+            "rec_info": rec_info,
+            "has_summary": has_summary,
+            "album_dir": album_dir
+        }
+        print(f"\n__PROMPT_JSON__:{json.dumps(prompt_payload)}", flush=True)
+
         while True:
             print("--------------------------------------------------------------------------------")
             print("[Y] Accept for this track (Default)    |  [A] Auto-apply recommended for ALL remaining")
@@ -1277,9 +1291,25 @@ class SessionPromptController:
                 prompt_str = "Choice [Y/a/c/e/s/k/q]: "
 
             try:
-                choice = input(prompt_str).strip().lower()
+                raw_input = input(prompt_str).strip()
             except EOFError:
-                choice = 'y'
+                raw_input = 'y'
+
+            # Parse structured response from Web UI if provided
+            if raw_input.startswith("__RESP_JSON__:"):
+                try:
+                    resp_dict = json.loads(raw_input[len("__RESP_JSON__:"):])
+                    choice = resp_dict.get("choice", "y").strip().lower()
+                    custom_params = resp_dict.get("custom_params")
+                    if custom_params and isinstance(custom_params, dict):
+                        rec_params.update(custom_params)
+                        if rec_params.get("cutoff_hz"):
+                            rec_params["apodizing"] = True
+                        dsp_str = f"--phase {rec_params.get('phase_mode', 'min')} --dither {rec_params.get('dither_mode', 'shibata')}" + (f" --cutoff {int(rec_params['cutoff_hz'])}" if rec_params.get('cutoff_hz') else "")
+                except Exception:
+                    choice = "y"
+            else:
+                choice = raw_input.lower()
 
             if choice in ['v', 'view', 'summary']:
                 if album_summary_path:

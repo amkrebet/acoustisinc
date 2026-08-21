@@ -363,12 +363,13 @@ class UpsampleJobManager:
         self.error_message = ""
         self.report_path = None
         self.proc = None
+        self.prompt_data = None
         self.start_time = 0
         self.end_time = 0
 
     def start_job(self, config):
         with self.lock:
-            if self.status == "running":
+            if self.status in ["running", "waiting_for_input"]:
                 return {"status": "error", "message": "An upsampling job is already running."}
 
             src_path = config.get("source_path", "").strip()
@@ -429,7 +430,11 @@ class UpsampleJobManager:
             overwrite = config.get("overwrite", "on")
             cmd.extend(["--overwrite", "on" if str(overwrite).lower() in ["on", "true", "1"] else "off"])
 
-            if config.get("use_recommended"):
+            # Interactive mode by default so user can review/edit/skip per batch upsampler
+            interactive = config.get("interactive", True)
+            if interactive:
+                cmd.extend(["--use-recommended", "ask"])
+            elif config.get("use_recommended"):
                 cmd.extend(["--use-recommended", "auto"])
 
             # Count total tracks if album
@@ -443,7 +448,7 @@ class UpsampleJobManager:
 
             self.status = "running"
             self.job_id = f"job_{int(time.time())}"
-            self.current_track = os.path.basename(self.src_path) if is_file else "Preparing..."
+            self.current_track = os.path.basename(self.src_path) if is_file else "Scanning Album..."
             self.track_index = 0
             self.total_tracks = max(1, total_t)
             self.progress_percent = 2.0
@@ -451,12 +456,14 @@ class UpsampleJobManager:
             self.log_lines = []
             self.error_message = ""
             self.report_path = None
+            self.prompt_data = None
             self.start_time = time.time()
             self.end_time = 0
 
             try:
                 self.proc = subprocess.Popen(
                     cmd,
+                    stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     text=True,
@@ -504,6 +511,19 @@ class UpsampleJobManager:
                 if len(self.log_lines) > 2000:
                     self.log_lines.pop(0)
 
+                # Check for interactive prompt from upsampler
+                if clean_line.startswith("__PROMPT_JSON__:"):
+                    try:
+                        p_data = json.loads(clean_line[len("__PROMPT_JSON__:"):])
+                        self.status = "waiting_for_input"
+                        self.prompt_data = p_data
+                        self.current_track = p_data.get("track_file", self.current_track)
+                        self.track_index = p_data.get("track_idx", self.track_index)
+                        self.total_tracks = p_data.get("total_tracks", self.total_tracks)
+                        self.stage = f"Awaiting Input [{self.track_index}/{self.total_tracks}]"
+                    except Exception:
+                        pass
+
                 # Parse status indicators
                 if "Scanning" in clean_line and "headroom" in clean_line.lower():
                     self.stage = "Analyzing Headroom"
@@ -545,6 +565,7 @@ class UpsampleJobManager:
                 return
 
             self.end_time = time.time()
+            self.prompt_data = None
             if self.status == "cancelled":
                 self.stage = "Cancelled"
             elif return_code == 0:
@@ -566,18 +587,38 @@ class UpsampleJobManager:
                 self.stage = "Failed"
                 self.error_message = f"Process exited with non-zero status code {return_code}"
 
+    def send_response(self, resp_dict):
+        with self.lock:
+            if self.status != "waiting_for_input" or not self.proc or not self.proc.stdin:
+                return {"status": "error", "message": "No job is currently waiting for input."}
+            try:
+                line = f"__RESP_JSON__:{json.dumps(resp_dict)}\n"
+                self.proc.stdin.write(line)
+                self.proc.stdin.flush()
+                self.status = "running"
+                self.prompt_data = None
+                self.stage = f"Resampling [{self.track_index}/{self.total_tracks}] (64-bit Sinc)"
+                return {"status": "ok"}
+            except Exception as e:
+                return {"status": "error", "message": f"Failed to send response to upsampler: {e}"}
+
     def cancel_job(self):
         with self.lock:
-            if self.status != "running" or self.proc is None:
-                return {"status": "error", "message": "No job is currently running."}
-            try:
-                os.killpg(os.getpgid(self.proc.pid), signal.SIGTERM)
-                self.status = "cancelled"
-                self.stage = "Cancelled by user"
-                self.end_time = time.time()
-                return {"status": "ok", "message": "Job cancellation signal sent."}
-            except Exception as e:
-                return {"status": "error", "message": f"Cancellation error: {e}"}
+            if self.proc is not None:
+                try:
+                    os.killpg(os.getpgid(self.proc.pid), signal.SIGTERM)
+                except Exception:
+                    pass
+                try:
+                    self.proc.terminate()
+                except Exception:
+                    pass
+            self.status = "idle"
+            self.proc = None
+            self.stage = "Idle"
+            self.prompt_data = None
+            self.end_time = time.time()
+            return {"status": "ok", "message": "Job aborted successfully."}
 
     def get_status(self, since_idx=0):
         with self.lock:
@@ -597,6 +638,7 @@ class UpsampleJobManager:
                 "error_message": self.error_message,
                 "report_path": self.report_path,
                 "report_url": f"/api/raw_summary?path={urllib.parse.quote(self.report_path)}" if self.report_path else None,
+                "prompt_data": self.prompt_data,
                 "elapsed_seconds": round(elapsed, 1),
                 "logs": filtered_logs,
                 "max_log_idx": self.log_lines[-1]["idx"] if self.log_lines else since_idx
@@ -616,13 +658,20 @@ def get_directory_contents(target_path, fresh=True):
         target_path = os.path.expanduser(target_path)
     target_path = os.path.abspath(target_path)
 
+    # If target_path is a file, use its parent directory
+    if os.path.isfile(target_path):
+        target_path = os.path.dirname(target_path)
+
+    # If target_path does not exist, walk up to deepest existing ancestor directory
+    while target_path and not os.path.exists(target_path) and target_path != "/":
+        target_path = os.path.dirname(target_path)
+    if not target_path or not os.path.exists(target_path):
+        target_path = INITIAL_ROOT
+    if os.path.isfile(target_path):
+        target_path = os.path.dirname(target_path)
+
     if fresh:
         clear_folder_cache(target_path)
-
-    if not os.path.exists(target_path):
-        return {"error": f"Path does not exist: {target_path}"}
-    if not os.path.isdir(target_path):
-        return {"error": f"Path is not a directory: {target_path}"}
 
     folders = []
     files = []
@@ -630,7 +679,15 @@ def get_directory_contents(target_path, fresh=True):
     try:
         entries = sorted(os.listdir(target_path), key=lambda s: s.lower())
     except Exception as e:
-        return {"error": f"Cannot read directory: {str(e)}"}
+        return {
+            "error": f"Cannot read directory: {str(e)}",
+            "current_path": target_path,
+            "parent_path": os.path.dirname(target_path) if target_path != "/" else "/",
+            "breadcrumbs": [{"name": "/", "path": "/"}],
+            "folders": [],
+            "dirs": [],
+            "files": []
+        }
 
     for name in entries:
         if name.startswith("."):
@@ -704,6 +761,7 @@ def get_directory_contents(target_path, fresh=True):
         "parent_path": parent_path,
         "breadcrumbs": parts,
         "folders": folders,
+        "dirs": folders,
         "files": files,
         "album_summary": album_summary,
         "gpu_enabled": gpu_engine.enabled,
@@ -1457,70 +1515,152 @@ HTML_PAGE = """<!DOCTYPE html>
             border: 1px solid #30363d;
         }
         .markdown-rendered li {
-        /* Upsample Studio Modal & Form Styles */
+        /* Upsample Studio Modal & Spacious Form Styles */
         .modal-upsample-dialog {
-            max-width: 680px;
+            max-width: 900px;
+            width: 94vw;
             height: auto;
-            max-height: 90vh;
+            max-height: 94vh;
+            display: flex;
+            flex-direction: column;
+            border-radius: 12px;
+            border: 1px solid #30363d;
+            box-shadow: 0 20px 50px rgba(0, 0, 0, 0.85), 0 0 1px 1px rgba(255, 255, 255, 0.06);
+            background: #0d1117;
         }
-        .form-grid {
+        .modal-section-card {
+            background: rgba(22, 27, 34, 0.75);
+            border: 1px solid #30363d;
+            border-radius: 8px;
+            padding: 14px 18px;
+            margin-bottom: 12px;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+        .modal-section-header {
+            font-size: 0.76rem;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            color: var(--accent-cyan);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 4px;
+        }
+        .form-grid-3 {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 14px;
+        }
+        .form-grid-2 {
             display: grid;
             grid-template-columns: 1fr 1fr;
-            gap: 12px;
-            margin-top: 10px;
+            gap: 14px;
         }
         .form-group {
             display: flex;
             flex-direction: column;
-            gap: 5px;
+            gap: 6px;
         }
         .form-group.full-width {
             grid-column: 1 / -1;
         }
         .form-label {
-            font-size: 0.78rem;
+            font-size: 0.80rem;
             font-weight: 600;
             color: var(--text-heading);
             display: flex;
             align-items: center;
             justify-content: space-between;
         }
-        .form-input, .form-select {
-            background: #0d1117;
-            border: 1px solid var(--border);
-            border-radius: 6px;
-            padding: 8px 10px;
-            color: var(--text-heading);
-            font-size: 0.82rem;
-            outline: none;
-            transition: border-color 0.15s;
-            width: 100%;
+        .form-label-sub {
+            font-size: 0.70rem;
+            font-weight: normal;
+            color: var(--text-muted);
         }
-        .form-input:focus, .form-select:focus {
-            border-color: var(--accent-cyan);
-        }
-        .form-checkbox-row {
+        .form-path-row {
             display: flex;
             align-items: center;
             gap: 8px;
+            width: 100%;
+        }
+        .form-input, .form-select {
+            background: #090d13;
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 8px 12px;
+            color: var(--text-heading);
+            font-size: 0.85rem;
+            outline: none;
+            transition: all 0.15s ease;
+            width: 100%;
+            height: 40px;
+            box-sizing: border-box;
+        }
+        .form-input:focus, .form-select:focus {
+            border-color: var(--accent-cyan);
+            box-shadow: 0 0 0 2px rgba(0, 229, 255, 0.15);
+        }
+        .form-input[readonly] {
+            color: #8b949e;
+            background: #11151c;
+            border-color: #21262d;
+            font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
             font-size: 0.80rem;
-            color: var(--text);
+        }
+        .btn-browse {
+            padding: 0 16px;
+            height: 40px;
+            background: #21262d;
+            border: 1px solid var(--border);
+            color: var(--accent-cyan);
+            border-radius: 6px;
+            font-weight: 600;
+            cursor: pointer;
+            white-space: nowrap;
+            font-size: 0.82rem;
+            transition: all 0.15s ease;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            flex-shrink: 0;
+        }
+        .btn-browse:hover {
+            border-color: var(--accent-cyan);
+            background: rgba(0, 229, 255, 0.15);
+        }
+        .form-checkbox-card {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 9px 12px;
+            background: rgba(13, 17, 23, 0.7);
+            border: 1px solid #30363d;
+            border-radius: 6px;
             cursor: pointer;
             user-select: none;
-            padding: 4px 0;
+            transition: all 0.15s ease;
+            height: 40px;
+            box-sizing: border-box;
+        }
+        .form-checkbox-card:hover {
+            border-color: var(--accent-cyan);
+            background: rgba(0, 229, 255, 0.05);
         }
         .preset-pill-group {
             display: flex;
             gap: 8px;
             flex-wrap: wrap;
-            margin-bottom: 12px;
+            margin-bottom: 6px;
         }
         .preset-pill {
             background: #21262d;
             border: 1px solid var(--border);
             color: var(--text);
-            padding: 4px 10px;
-            font-size: 0.75rem;
+            padding: 5px 12px;
+            font-size: 0.76rem;
             border-radius: 12px;
             cursor: pointer;
             transition: all 0.15s ease;
@@ -1537,81 +1677,103 @@ HTML_PAGE = """<!DOCTYPE html>
             font-weight: 600;
         }
 
-        /* Floating Upsample Telemetry & Progress Drawer */
-        .upsample-drawer {
-            position: fixed;
-            bottom: 20px;
-            right: 20px;
-            z-index: 10000;
-            width: 500px;
-            max-width: calc(100vw - 40px);
-            background: #161b22;
+        /* Interactive Decision Prompt & UI Styles */
+        .prompt-audit-card {
+            background: rgba(22, 27, 34, 0.98);
             border: 1px solid #30363d;
-            border-radius: 10px;
-            box-shadow: 0 12px 40px rgba(0,0,0,0.75);
+            border-left: 5px solid var(--accent-cyan);
+            border-radius: 8px;
+            padding: 14px 18px;
+            margin-bottom: 12px;
             display: flex;
             flex-direction: column;
-            overflow: hidden;
-            animation: badge-fade-in 0.25s ease;
-            transition: all 0.2s ease;
+            gap: 8px;
+            font-size: 0.84rem;
+            animation: badge-fade-in 0.2s ease;
         }
-        .upsample-drawer.minimized .drawer-body,
-        .upsample-drawer.minimized .drawer-terminal-container {
-            display: none !important;
+        .decision-btn-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 10px;
+            margin-top: 14px;
         }
-        .drawer-header {
-            padding: 10px 14px;
-            background: #11141a;
-            border-bottom: 1px solid #30363d;
+        .btn-decision {
+            padding: 11px 14px;
+            font-size: 0.84rem;
+            font-weight: 600;
+            border-radius: 6px;
+            cursor: pointer;
             display: flex;
-            justify-content: space-between;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 4px;
+            transition: all 0.15s;
+            outline: none;
+            text-align: center;
+        }
+        .btn-decision-sub {
+            font-size: 0.70rem;
+            font-weight: normal;
+            opacity: 0.85;
+        }
+        .btn-decision-primary {
+            background: rgba(0, 229, 255, 0.18);
+            border: 1px solid var(--accent-cyan);
+            color: var(--accent-cyan);
+        }
+        .btn-decision-primary:hover {
+            background: rgba(0, 229, 255, 0.32);
+        }
+        .btn-decision-auto {
+            background: rgba(0, 230, 118, 0.18);
+            border: 1px solid #00e676;
+            color: #00e676;
+        }
+        .btn-decision-auto:hover {
+            background: rgba(0, 230, 118, 0.32);
+        }
+        .btn-decision-lock {
+            background: rgba(186, 104, 200, 0.18);
+            border: 1px solid #ce93d8;
+            color: #ce93d8;
+        }
+        .btn-decision-lock:hover {
+            background: rgba(186, 104, 200, 0.32);
+        }
+        .btn-decision-skip {
+            background: rgba(255, 171, 0, 0.15);
+            border: 1px solid #ffab00;
+            color: #ffab00;
+        }
+        .btn-decision-skip:hover {
+            background: rgba(255, 171, 0, 0.28);
+        }
+        .btn-decision-abort {
+            background: rgba(255, 23, 68, 0.15);
+            border: 1px solid #ff5252;
+            color: #ff5252;
+        }
+        .btn-decision-abort:hover {
+            background: rgba(255, 23, 68, 0.28);
+        }
+        .folder-picker-item {
+            display: flex;
             align-items: center;
             gap: 10px;
-        }
-        .drawer-body {
-            padding: 14px;
-            display: flex;
-            flex-direction: column;
-            gap: 10px;
-            background: #161b22;
-        }
-        .drawer-progress-track {
-            width: 100%;
-            height: 8px;
-            background: #0d1117;
+            padding: 9px 12px;
+            border-bottom: 1px solid #21262d;
+            cursor: pointer;
+            transition: background 0.15s;
             border-radius: 4px;
-            overflow: hidden;
-            border: 1px solid #30363d;
-            position: relative;
         }
-        .drawer-progress-fill {
-            height: 100%;
-            width: 0%;
-            background: linear-gradient(90deg, #00e5ff, #00e676);
-            border-radius: 4px;
-            transition: width 0.3s ease;
+        .folder-picker-item:hover {
+            background: rgba(0, 229, 255, 0.1);
         }
-        .drawer-progress-fill.running {
-            background-size: 20px 20px;
-            background-image: linear-gradient(45deg, rgba(255, 255, 255, 0.15) 25%, transparent 25%, transparent 50%, rgba(255, 255, 255, 0.15) 50%, rgba(255, 255, 255, 0.15) 75%, transparent 75%, transparent);
-            animation: progress-stripes 1s linear infinite;
-        }
-        @keyframes progress-stripes {
-            0% { background-position: 0 0; }
-            100% { background-position: 20px 0; }
-        }
-        .drawer-terminal-container {
-            border-top: 1px solid #30363d;
-            background: #0a0c10;
-            max-height: 180px;
-            overflow-y: auto;
-            padding: 8px 12px;
-            font-family: ui-monospace, SFMono-Regular, "SF Mono", monospace;
-            font-size: 0.72rem;
-            color: #8b949e;
-            display: flex;
-            flex-direction: column;
-            gap: 2px;
+        @keyframes pulse-glow {
+            0% { opacity: 0.6; transform: scale(0.92); }
+            50% { opacity: 1; transform: scale(1.1); }
+            100% { opacity: 0.6; transform: scale(0.92); }
         }
         .drawer-terminal-line {
             white-space: pre-wrap;
@@ -1637,6 +1799,22 @@ HTML_PAGE = """<!DOCTYPE html>
         </div>
         <div class="bookmarks">
             <button id="headerBtnUpsample" class="btn-bookmark" style="display: none; background: rgba(0, 230, 118, 0.15); border-color: rgba(0, 230, 118, 0.45); color: #00e676; font-weight: 600;" onclick="openUpsampleModalForCurrentFolder()" title="Launch AcoustiSinc Upsampling Studio for this folder">⚡ Upsample Album</button>
+
+            <!-- Active Header Status Widget (Replaces button during active upsampling to avoid overlap) -->
+            <div id="headerUpsampleWidget" style="display: none; align-items: center; gap: 8px; background: #11141a; border: 1px solid rgba(0, 229, 255, 0.4); border-radius: 6px; padding: 2px 8px;">
+                <span id="headerUpsampleDot" style="display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--accent-cyan); box-shadow: 0 0 8px var(--accent-cyan);"></span>
+                <span id="headerUpsampleTitle" style="font-size: 0.78rem; font-weight: 600; color: var(--text-heading); max-width: 220px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">⚡ Upsampling...</span>
+                <span id="headerUpsampleBadge" class="brand-badge" style="font-size: 0.68rem; padding: 1px 5px;">0%</span>
+                <div style="width: 60px; height: 6px; background: #0d1117; border-radius: 3px; overflow: hidden; border: 1px solid #30363d;">
+                    <div id="headerUpsampleFill" style="height: 100%; width: 0%; background: linear-gradient(90deg, #00e5ff, #00e676); transition: width 0.3s;"></div>
+                </div>
+                <button class="btn-bookmark" id="headerUpsamplePromptBtn" onclick="reopenActivePromptModal()" title="Review Pending Decision" style="display: none; background: rgba(255, 234, 0, 0.2); color: var(--accent-yellow); border-color: var(--accent-yellow); padding: 1px 6px; font-size: 0.70rem; font-weight: 700;">⚠️ Review Decision</button>
+                <button class="btn-bookmark" id="headerUpsampleReportBtn" onclick="viewGeneratedReport()" title="View Album Report" style="display: none; background: rgba(0, 229, 255, 0.2); color: var(--accent-cyan); border-color: var(--accent-cyan); padding: 1px 6px; font-size: 0.70rem; font-weight: 600;">📋 Report</button>
+                <button class="btn-bookmark" id="headerUpsampleLogsBtn" onclick="toggleUpsampleLogModal()" title="View Processing Logs" style="padding: 1px 6px; font-size: 0.70rem;">📜 Logs</button>
+                <button class="btn-bookmark" id="headerUpsampleAbortBtn" onclick="cancelUpsampleJob()" title="Abort Upsampling" style="background: rgba(255, 23, 68, 0.15); color: #ff5252; border-color: rgba(255, 23, 68, 0.4); padding: 1px 6px; font-size: 0.70rem;">⛔ Abort</button>
+                <button class="btn-bookmark" id="headerUpsampleDismissBtn" onclick="dismissUpsampleHeaderWidget()" title="Dismiss" style="display: none; padding: 1px 6px; font-size: 0.70rem;">&times;</button>
+            </div>
+
             <button id="headerBtnSummary" class="btn-bookmark" style="display: none; background: rgba(0, 229, 255, 0.15); border-color: rgba(0, 229, 255, 0.45); color: var(--accent-cyan); font-weight: 600;" onclick="openAlbumSummary()" title="View Album Analysis Summary">📋 Album Summary</button>
             <button class="btn-bookmark" onclick="loadDirectory('/mnt/PrimaryFS/FLAC_music/music', true)">📁 Music Library</button>
             <button class="btn-bookmark" onclick="loadDirectory('/mnt/PrimaryFS/FLAC_music/music/Qobuz Downloads', true)">🎧 Qobuz Releases</button>
@@ -3190,6 +3368,75 @@ HTML_PAGE = """<!DOCTYPE html>
         let lastLogIdx = 0;
         let activeUpsampleJob = null;
         let upsampleTargetMode = 'album';
+        let currentPromptData = null;
+        let activePromptTrack = null;
+        let folderPickerTargetInputId = 'upsampleDstDir';
+        let folderPickerCurrentPath = '/mnt/PrimaryFS/FLAC_music/music';
+
+        async function openFolderPicker(targetInputId) {
+            folderPickerTargetInputId = targetInputId;
+            const currentVal = document.getElementById(targetInputId) ? document.getElementById(targetInputId).value.trim() : '';
+            folderPickerCurrentPath = currentVal || currentPath || '/mnt/PrimaryFS';
+            const modal = document.getElementById('folderPickerModal');
+            if (modal) modal.style.display = 'flex';
+            await loadFolderPickerDirectory(folderPickerCurrentPath);
+        }
+
+        function closeFolderPicker() {
+            const modal = document.getElementById('folderPickerModal');
+            if (modal) modal.style.display = 'none';
+        }
+
+        async function loadFolderPickerDirectory(targetPath) {
+            folderPickerCurrentPath = targetPath;
+            const pathBar = document.getElementById('folderPickerPathBar');
+            const listEl = document.getElementById('folderPickerList');
+            if (pathBar) pathBar.value = targetPath;
+            if (listEl) {
+                listEl.innerHTML = '<div style="padding: 24px; text-align: center; color: #8b949e;"><div class="spinner" style="margin: 0 auto 10px;"></div>Loading folders...</div>';
+            }
+
+            try {
+                const res = await fetch(`/api/browse?path=${encodeURIComponent(targetPath)}`);
+                const data = await res.json();
+                if (!data || !listEl) return;
+
+                folderPickerCurrentPath = data.current_path;
+                if (pathBar) pathBar.value = data.current_path;
+
+                let html = '';
+                if (data.parent_path && data.parent_path !== data.current_path) {
+                    html += `<div class="folder-picker-item" onclick="loadFolderPickerDirectory('${data.parent_path.replace(/'/g, "\\'")}')">
+                        <span style="font-size: 1.1rem;">📁</span>
+                        <span style="font-weight: 600; color: var(--accent-cyan);">.. [Up to Parent Folder]</span>
+                    </div>`;
+                }
+
+                if (data.dirs && data.dirs.length > 0) {
+                    data.dirs.forEach(d => {
+                        html += `<div class="folder-picker-item" onclick="loadFolderPickerDirectory('${d.path.replace(/'/g, "\\'")}')">
+                            <span style="font-size: 1.1rem;">📁</span>
+                            <span style="color: var(--text-heading); font-weight: 500;">${d.name}</span>
+                        </div>`;
+                    });
+                } else {
+                    html += `<div style="padding: 16px; color: var(--text-muted); font-size: 0.82rem;">No subdirectories found in this folder.</div>`;
+                }
+                listEl.innerHTML = html;
+            } catch (err) {
+                if (listEl) listEl.innerHTML = `<div style="padding: 16px; color: #ff5252;">Error loading directory: ${err.message}</div>`;
+            }
+        }
+
+        function selectFolderPickerChoice() {
+            const pathBar = document.getElementById('folderPickerPathBar');
+            const chosenPath = pathBar ? pathBar.value.trim() : folderPickerCurrentPath;
+            const targetInput = document.getElementById(folderPickerTargetInputId);
+            if (targetInput) {
+                targetInput.value = chosenPath;
+            }
+            closeFolderPicker();
+        }
 
         async function openUpsampleModal(mode = 'album', customSrcPath = null) {
             upsampleTargetMode = mode;
@@ -3197,7 +3444,17 @@ HTML_PAGE = """<!DOCTYPE html>
             const scopeBadge = document.getElementById('upsampleModalScopeBadge');
             const srcInput = document.getElementById('upsampleSrcPath');
             const dstInput = document.getElementById('upsampleDstDir');
+            const initialLaunchControls = document.getElementById('initialLaunchControls');
+            const interactiveDecisionControls = document.getElementById('interactiveDecisionControls');
 
+            // If an active job is currently waiting for input, show the prompt UI
+            if (activeUpsampleJob && activeUpsampleJob.status === 'waiting_for_input' && currentPromptData) {
+                renderInteractivePromptUI(currentPromptData);
+                modal.style.display = 'flex';
+                return;
+            }
+
+            // Normal initial launcher setup
             let srcPath = customSrcPath;
             if (!srcPath) {
                 if (mode === 'track') {
@@ -3218,6 +3475,12 @@ HTML_PAGE = """<!DOCTYPE html>
             scopeBadge.style.borderColor = mode === 'track' ? 'rgba(0, 229, 255, 0.4)' : 'rgba(0, 230, 118, 0.4)';
             scopeBadge.style.color = mode === 'track' ? 'var(--accent-cyan)' : '#00e676';
 
+            if (initialLaunchControls) initialLaunchControls.style.display = 'grid';
+            if (interactiveDecisionControls) interactiveDecisionControls.style.display = 'none';
+
+            // Populate Forensic Recommendation & Rationale Card for initial review
+            populateRecommendationCard(mode, srcPath);
+
             try {
                 const res = await fetch(`/api/upsample/dest_preview?path=${encodeURIComponent(srcPath)}`);
                 const data = await res.json();
@@ -3230,6 +3493,141 @@ HTML_PAGE = """<!DOCTYPE html>
 
             applyForensicRecommendationPreset();
             modal.style.display = 'flex';
+        }
+
+        function populateRecommendationCard(mode, srcPath) {
+            const trackTitleEl = document.getElementById('promptTrackTitle');
+            const provLabelEl = document.getElementById('promptProvLabel');
+            const formatMetaEl = document.getElementById('promptFormatMeta');
+            const metricsRowEl = document.getElementById('promptMetricsRow');
+            const actionDescEl = document.getElementById('promptActionDesc');
+            const dspFlagEl = document.getElementById('promptDspFlag');
+            const rationaleEl = document.getElementById('promptTechnicalRationale');
+
+            const filename = srcPath.split('/').filter(Boolean).pop() || 'Item';
+            trackTitleEl.textContent = mode === 'track' ? filename : `Album: ${filename}`;
+
+            if (currentAnalysis && currentAnalysis.provenance) {
+                const p = currentAnalysis.provenance;
+                const rec = p.recommendation || {};
+                const prim = p.primary || {};
+                const vis = p.visual_morphology || {};
+                const pk = vis.primary_knee || {};
+                const purity = vis.stopband_purity || {};
+
+                provLabelEl.textContent = prim.label ? `${prim.label.toUpperCase()} [${prim.confidence || 'HIGH'} CONFIDENCE]` : 'STANDARD MASTER';
+                provLabelEl.className = 'provenance-tag ' + (prim.label === 'Native Master' ? 'badge-provenance-native' : prim.label === 'Lowpass Filtered' ? 'badge-provenance-lowpass' : 'badge-provenance-upsampled');
+                
+                const srKhz = currentAnalysis.sr ? (currentAnalysis.sr / 1000).toFixed(1) : '44.1';
+                const ch = currentAnalysis.channels || 2;
+                const bd = currentAnalysis.bit_depth || 24;
+                formatMetaEl.textContent = `Source Format: ${srKhz} kHz • ${ch} Channels • ${bd}-bit PCM`;
+
+                let metricText = '';
+                if (pk && pk.is_brickwall_knee) {
+                    metricText += `📐 Brickwall Knee: ${pk.freq_khz.toFixed(1)} kHz (Slope: ${pk.steepest_slope_db_per_khz.toFixed(1)} dB/kHz, Drop: ${pk.drop_db.toFixed(1)} dB) • `;
+                }
+                if (purity && purity.has_stopband) {
+                    metricText += `📻 Stopband: ${purity.purity_label || 'Clean'} • `;
+                }
+                metricText += `📊 True Peak: ${currentAnalysis.true_peak_db ? currentAnalysis.true_peak_db.toFixed(1) + ' dBTP' : 'Safe'}`;
+                metricsRowEl.textContent = metricText;
+
+                actionDescEl.textContent = rec.action ? `${rec.action}: ${rec.details || ''}` : 'Direct 64-bit polyphase sinc upsampling with Shibata noise shaping.';
+                dspFlagEl.textContent = rec.dsp_params || '--phase min --dither shibata';
+
+                // Detailed "Why" explanation
+                if (rec.details) {
+                    rationaleEl.textContent = rec.details;
+                } else if (prim.label === 'Lowpass Filtered') {
+                    rationaleEl.textContent = 'A steep lowpass reconstruction cutoff was detected. A minimum-phase apodizing sinc filter is recommended to eliminate pre-ringing impulse artefacts and suppress ultrasonic alias imaging without touching audible frequencies.';
+                } else {
+                    rationaleEl.textContent = 'Preserves pristine bit-perfect audio fidelity across audible octaves while providing optimal 64-bit double-precision sinc reconstruction with psychoacoustic 24-bit Shibata noise shaping.';
+                }
+            } else {
+                provLabelEl.textContent = 'ALBUM BATCH AUDIT';
+                provLabelEl.className = 'provenance-tag badge-provenance-native';
+                formatMetaEl.textContent = 'Multi-Track Forensic Upsampling Pipeline';
+                metricsRowEl.textContent = 'Per-track dynamic spectral analysis and intersample headroom protection';
+                actionDescEl.textContent = 'Interactive AcoustiSinc Upsampling';
+                dspFlagEl.textContent = '--phase min --dither shibata';
+                rationaleEl.textContent = 'Audits every track individually during batch execution to recommend optimal minimum-phase or apodizing recipes tailored to each master file.';
+            }
+        }
+
+        function reopenActivePromptModal() {
+            if (currentPromptData) {
+                renderInteractivePromptUI(currentPromptData);
+            }
+            const modal = document.getElementById('upsampleModal');
+            if (modal) modal.style.display = 'flex';
+        }
+
+        function renderInteractivePromptUI(pData) {
+            const scopeBadge = document.getElementById('upsampleModalScopeBadge');
+            const srcInput = document.getElementById('upsampleSrcPath');
+            const initialLaunchControls = document.getElementById('initialLaunchControls');
+            const interactiveDecisionControls = document.getElementById('interactiveDecisionControls');
+
+            if (initialLaunchControls) initialLaunchControls.style.display = 'none';
+            if (interactiveDecisionControls) interactiveDecisionControls.style.display = 'grid';
+
+            scopeBadge.textContent = `TRACK ${pData.track_idx || 1} OF ${pData.total_tracks || 1}`;
+            scopeBadge.style.background = 'rgba(255, 234, 0, 0.15)';
+            scopeBadge.style.borderColor = 'rgba(255, 234, 0, 0.4)';
+            scopeBadge.style.color = 'var(--accent-yellow)';
+
+            srcInput.value = pData.filepath || '';
+
+            // Populate Forensic Audit Card
+            const recInfo = pData.rec_info || {};
+            const recParams = pData.rec_params || {};
+
+            document.getElementById('promptTrackTitle').textContent = `[Track ${pData.track_idx}/${pData.total_tracks}] ${pData.track_file || 'Track'}`;
+            document.getElementById('promptProvLabel').textContent = recInfo.action ? (recInfo.is_potential ? 'POTENTIAL ' : '') + recInfo.action.toUpperCase() : 'STANDARD MASTER';
+            document.getElementById('promptFormatMeta').textContent = `Auditing Master: ${pData.track_file}`;
+            document.getElementById('promptMetricsRow').textContent = recInfo.filter_cutoff_khz ? `📐 Detected Cutoff: ${recInfo.filter_cutoff_khz} kHz` : 'Standard Nyquist Master';
+            document.getElementById('promptActionDesc').textContent = recInfo.action ? `${recInfo.action}` : 'Direct Sinc Upsampling';
+            document.getElementById('promptDspFlag').textContent = recInfo.dsp_params || '--phase min --dither shibata';
+            document.getElementById('promptTechnicalRationale').textContent = recInfo.details || 'Applies strict 64-bit float precision sinc filter tailored to this track.';
+
+            // Populate form overrides from recommended parameters
+            const rateSelect = document.getElementById('upsampleRate');
+            const phaseSelect = document.getElementById('upsamplePhase');
+            const apodizingCheck = document.getElementById('upsampleApodizingEnable');
+            const cutoffInput = document.getElementById('upsampleCutoffHz');
+            const cutoffHint = document.getElementById('cutoffHint');
+            const steepCheck = document.getElementById('upsampleSteep');
+            const ditherSelect = document.getElementById('upsampleDither');
+            const mqaSelect = document.getElementById('upsampleMqa');
+
+            rateSelect.value = '4x';
+            phaseSelect.value = recParams.phase_mode || 'min';
+            ditherSelect.value = recParams.dither_mode || 'shibata';
+            mqaSelect.value = recParams.mqa_mode || 'adaptive';
+            steepCheck.checked = !!recParams.steep;
+
+            if (recParams.cutoff_hz) {
+                apodizingCheck.checked = true;
+                cutoffInput.disabled = false;
+                cutoffInput.value = Math.round(recParams.cutoff_hz);
+                if (cutoffHint) cutoffHint.textContent = `Recommended (${cutoffInput.value} Hz)`;
+            } else if (recParams.apodizing) {
+                apodizingCheck.checked = true;
+                cutoffInput.disabled = false;
+                cutoffInput.value = '22050';
+                if (cutoffHint) cutoffHint.textContent = 'Standard Apodizing (22,050 Hz)';
+            } else {
+                apodizingCheck.checked = false;
+                cutoffInput.disabled = true;
+                cutoffInput.value = '';
+                if (cutoffHint) cutoffHint.textContent = 'Disabled (Full Nyquist)';
+            }
+
+            const btnSummary = document.getElementById('btnPromptViewSummary');
+            if (btnSummary) {
+                btnSummary.style.display = pData.has_summary ? 'flex' : 'none';
+            }
         }
 
         function openUpsampleModalForTrack() {
@@ -3249,12 +3647,16 @@ HTML_PAGE = """<!DOCTYPE html>
             if (modal) modal.style.display = 'none';
         }
 
-        function toggleCutoffInput() {
-            const enableCheck = document.getElementById('upsampleCutoffEnable');
+        function toggleApodizingInput() {
+            const enableCheck = document.getElementById('upsampleApodizingEnable');
             const cutoffInput = document.getElementById('upsampleCutoffHz');
+            const cutoffHint = document.getElementById('cutoffHint');
             cutoffInput.disabled = !enableCheck.checked;
-            if (enableCheck.checked && !cutoffInput.value) {
-                cutoffInput.value = '22050';
+            if (enableCheck.checked) {
+                if (!cutoffInput.value) cutoffInput.value = '22050';
+                if (cutoffHint) cutoffHint.textContent = `Active (${cutoffInput.value} Hz)`;
+            } else {
+                if (cutoffHint) cutoffHint.textContent = 'Disabled (Full Nyquist)';
             }
         }
 
@@ -3262,7 +3664,7 @@ HTML_PAGE = """<!DOCTYPE html>
             setActivePresetPill('presetBtnRecommended');
             const rateSelect = document.getElementById('upsampleRate');
             const phaseSelect = document.getElementById('upsamplePhase');
-            const cutoffCheck = document.getElementById('upsampleCutoffEnable');
+            const apodizingCheck = document.getElementById('upsampleApodizingEnable');
             const cutoffInput = document.getElementById('upsampleCutoffHz');
             const cutoffHint = document.getElementById('cutoffHint');
             const ditherSelect = document.getElementById('upsampleDither');
@@ -3274,10 +3676,10 @@ HTML_PAGE = """<!DOCTYPE html>
             ditherSelect.value = 'shibata';
             mqaSelect.value = 'adaptive';
             steepCheck.checked = false;
-            cutoffCheck.checked = false;
+            apodizingCheck.checked = false;
             cutoffInput.disabled = true;
             cutoffInput.value = '';
-            if (cutoffHint) cutoffHint.textContent = 'Optional';
+            if (cutoffHint) cutoffHint.textContent = 'Disabled (Full Nyquist)';
 
             if (currentAnalysis && currentAnalysis.provenance) {
                 const p = currentAnalysis.provenance;
@@ -3291,13 +3693,13 @@ HTML_PAGE = """<!DOCTYPE html>
                 }
 
                 if (rec.filter_cutoff_khz) {
-                    cutoffCheck.checked = true;
+                    apodizingCheck.checked = true;
                     cutoffInput.disabled = false;
                     const hz = Math.round(rec.filter_cutoff_khz * 1000);
                     cutoffInput.value = hz;
-                    if (cutoffHint) cutoffHint.textContent = `Auto-detected (${rec.filter_cutoff_khz} kHz)`;
+                    if (cutoffHint) cutoffHint.textContent = `Auto-detected (${rec.filter_cutoff_khz} kHz Knee)`;
                 } else if (paramsStr.includes('--cutoff') || paramsStr.includes('--apod')) {
-                    cutoffCheck.checked = true;
+                    apodizingCheck.checked = true;
                     cutoffInput.disabled = false;
                     const m = paramsStr.match(/--cutoff\\s+(\\d+)/);
                     cutoffInput.value = m ? m[1] : '22050';
@@ -3319,8 +3721,9 @@ HTML_PAGE = """<!DOCTYPE html>
         function applyDefaultPreset(type) {
             const rateSelect = document.getElementById('upsampleRate');
             const phaseSelect = document.getElementById('upsamplePhase');
-            const cutoffCheck = document.getElementById('upsampleCutoffEnable');
+            const apodizingCheck = document.getElementById('upsampleApodizingEnable');
             const cutoffInput = document.getElementById('upsampleCutoffHz');
+            const cutoffHint = document.getElementById('cutoffHint');
             const ditherSelect = document.getElementById('upsampleDither');
             const mqaSelect = document.getElementById('upsampleMqa');
             const steepCheck = document.getElementById('upsampleSteep');
@@ -3333,15 +3736,17 @@ HTML_PAGE = """<!DOCTYPE html>
             if (type === '4x') {
                 setActivePresetPill('presetBtnAudiophile4x');
                 phaseSelect.value = 'min';
-                cutoffCheck.checked = false;
+                apodizingCheck.checked = false;
                 cutoffInput.disabled = true;
                 cutoffInput.value = '';
+                if (cutoffHint) cutoffHint.textContent = 'Disabled (Full Nyquist)';
             } else if (type === 'apod') {
                 setActivePresetPill('presetBtnApodizing');
                 phaseSelect.value = 'min';
-                cutoffCheck.checked = true;
+                apodizingCheck.checked = true;
                 cutoffInput.disabled = false;
                 cutoffInput.value = '22050';
+                if (cutoffHint) cutoffHint.textContent = 'Standard Apodizing (22,050 Hz)';
             }
         }
 
@@ -3359,16 +3764,16 @@ HTML_PAGE = """<!DOCTYPE html>
             }
             await openUpsampleModal('track', currentAnalysis.filepath);
             applyForensicRecommendationPreset();
-            startUpsampleJob();
+            startUpsampleJob(true);
         }
 
-        async function startUpsampleJob() {
+        async function startUpsampleJob(interactiveMode = true) {
             const srcPath = document.getElementById('upsampleSrcPath').value.trim();
             const dstDir = document.getElementById('upsampleDstDir').value.trim();
             const rate = document.getElementById('upsampleRate').value;
             const phase = document.getElementById('upsamplePhase').value;
-            const cutoffEnable = document.getElementById('upsampleCutoffEnable').checked;
-            const cutoffHz = cutoffEnable ? document.getElementById('upsampleCutoffHz').value : null;
+            const apodizingEnable = document.getElementById('upsampleApodizingEnable').checked;
+            const cutoffHz = apodizingEnable ? document.getElementById('upsampleCutoffHz').value : null;
             const steep = document.getElementById('upsampleSteep').checked;
             const dither = document.getElementById('upsampleDither').value;
             const mqa = document.getElementById('upsampleMqa').value;
@@ -3385,13 +3790,15 @@ HTML_PAGE = """<!DOCTYPE html>
                 dest_dir: dstDir,
                 rate: rate,
                 phase: phase,
+                apodizing: apodizingEnable,
                 cutoff_hz: cutoffHz,
                 steep: steep,
                 dither: dither,
                 mqa: mqa,
                 overwrite: overwrite,
                 report: report,
-                use_recommended: false
+                interactive: interactiveMode,
+                use_recommended: !interactiveMode
             };
 
             try {
@@ -3409,52 +3816,60 @@ HTML_PAGE = """<!DOCTYPE html>
                 closeUpsampleModal();
                 activeUpsampleJob = data;
                 lastLogIdx = 0;
-                showUpsampleDrawer(data);
+                activePromptTrack = null;
+                updateHeaderUpsampleUI({ status: 'running', stage: 'Scanning Headroom...', progress_percent: 2, current_track: 'Initializing...' });
                 startPollingUpsampleStatus();
             } catch (err) {
                 alert('Error submitting upsampling job: ' + err.message);
             }
         }
 
-        function showUpsampleDrawer(jobData) {
-            const drawer = document.getElementById('upsampleJobDrawer');
-            const title = document.getElementById('drawerTitle');
-            const badge = document.getElementById('drawerStatusBadge');
-            const stageText = document.getElementById('drawerStageText');
-            const fill = document.getElementById('drawerProgressFill');
-            const progressText = document.getElementById('drawerProgressText');
-            const trackText = document.getElementById('drawerTrackText');
-            const elapsedText = document.getElementById('drawerElapsedText');
-            const btnReport = document.getElementById('drawerBtnReport');
-            const btnDest = document.getElementById('drawerBtnDest');
-            const btnCancel = document.getElementById('drawerBtnCancel');
-            const logsContainer = document.getElementById('drawerTerminalLogs');
+        async function sendPromptChoice(choice) {
+            if (choice === 'q') {
+                cancelUpsampleJob();
+                return;
+            }
 
-            if (!drawer) return;
+            const phase = document.getElementById('upsamplePhase').value;
+            const apodizingEnable = document.getElementById('upsampleApodizingEnable').checked;
+            const cutoffHz = apodizingEnable && document.getElementById('upsampleCutoffHz').value ? parseFloat(document.getElementById('upsampleCutoffHz').value) : null;
+            const steep = document.getElementById('upsampleSteep').checked;
+            const dither = document.getElementById('upsampleDither').value;
+            const mqa = document.getElementById('upsampleMqa').value;
 
-            drawer.style.display = 'flex';
-            drawer.classList.remove('minimized');
-            const displayName = jobData.src_path.split('/').filter(Boolean).pop() || 'Item';
-            title.textContent = `⚡ Upsampling: ${displayName}`;
-            badge.textContent = 'RUNNING';
-            badge.style.background = 'rgba(0, 229, 255, 0.15)';
-            badge.style.borderColor = 'rgba(0, 229, 255, 0.4)';
-            badge.style.color = 'var(--accent-cyan)';
-            stageText.textContent = 'Initializing DSP pipeline...';
-            fill.style.width = '3%';
-            fill.className = 'drawer-progress-fill running';
-            progressText.textContent = '0%';
-            trackText.textContent = 'Starting 64-bit GPU polyphase sinc engine...';
-            elapsedText.textContent = '00:00';
-            btnReport.style.display = 'none';
-            btnDest.style.display = 'none';
-            btnCancel.style.display = 'inline-block';
-            if (logsContainer) logsContainer.innerHTML = '';
+            const customParams = {
+                phase_mode: phase,
+                apodizing: apodizingEnable,
+                dither_mode: dither,
+                cutoff_hz: cutoffHz,
+                mqa_mode: mqa,
+                steep: steep
+            };
+
+            // Immediately background modal until next prompt is needed
+            closeUpsampleModal();
+
+            try {
+                const res = await fetch('/api/upsample/respond', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        choice: choice,
+                        custom_params: customParams
+                    })
+                });
+                const data = await res.json();
+                if (data.status !== 'ok') {
+                    alert('Error submitting choice: ' + (data.message || 'Unknown error'));
+                }
+            } catch (err) {
+                alert('Failed to send decision: ' + err.message);
+            }
         }
 
         function startPollingUpsampleStatus() {
             if (upsamplePollTimer) clearInterval(upsamplePollTimer);
-            upsamplePollTimer = setInterval(pollUpsampleStatus, 800);
+            upsamplePollTimer = setInterval(pollUpsampleStatus, 700);
             pollUpsampleStatus();
         }
 
@@ -3463,19 +3878,11 @@ HTML_PAGE = """<!DOCTYPE html>
                 const res = await fetch(`/api/upsample/status?since_log=${lastLogIdx}`);
                 const data = await res.json();
                 if (!data) return;
+                activeUpsampleJob = data;
 
-                const badge = document.getElementById('drawerStatusBadge');
-                const stageText = document.getElementById('drawerStageText');
-                const fill = document.getElementById('drawerProgressFill');
-                const progressText = document.getElementById('drawerProgressText');
-                const trackText = document.getElementById('drawerTrackText');
-                const elapsedText = document.getElementById('drawerElapsedText');
-                const btnReport = document.getElementById('drawerBtnReport');
-                const btnDest = document.getElementById('drawerBtnDest');
-                const btnCancel = document.getElementById('drawerBtnCancel');
-                const logsContainer = document.getElementById('drawerTerminalLogs');
-
+                // Append logs to terminal
                 if (data.logs && data.logs.length > 0) {
+                    const logsContainer = document.getElementById('upsampleTerminalLogs');
                     data.logs.forEach(l => {
                         lastLogIdx = Math.max(lastLogIdx, l.idx);
                         if (logsContainer) {
@@ -3485,65 +3892,263 @@ HTML_PAGE = """<!DOCTYPE html>
                             logsContainer.appendChild(lineEl);
                         }
                     });
-                    const terminal = document.getElementById('drawerTerminal');
+                    const terminal = document.getElementById('upsampleTerminalBox');
                     if (terminal) terminal.scrollTop = terminal.scrollHeight;
                 }
 
-                const elSec = Math.floor(data.elapsed_seconds || 0);
-                const m = Math.floor(elSec / 60);
-                const s = elSec % 60;
-                elapsedText.textContent = `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+                updateHeaderUpsampleUI(data);
 
-                stageText.textContent = data.stage || 'Processing...';
-                const pct = Math.min(100, Math.max(0, data.progress_percent || 0));
-                fill.style.width = `${pct}%`;
-                progressText.textContent = `${pct.toFixed(0)}%`;
-
-                if (data.current_track) {
-                    trackText.textContent = `[${data.track_index || 1}/${data.total_tracks || 1}] ${data.current_track}`;
-                }
-
-                if (data.status === 'completed') {
-                    badge.textContent = 'COMPLETED';
-                    badge.style.background = 'rgba(0, 230, 118, 0.15)';
-                    badge.style.borderColor = 'rgba(0, 230, 118, 0.4)';
-                    badge.style.color = '#00e676';
-                    fill.className = 'drawer-progress-fill';
-                    fill.style.width = '100%';
-                    progressText.textContent = '100%';
-                    btnCancel.style.display = 'none';
-                    if (data.report_url) {
-                        btnReport.style.display = 'inline-block';
-                        btnReport.setAttribute('data-report-url', data.report_url);
-                        btnReport.setAttribute('data-report-path', data.report_path);
+                // Handle interactive decision prompt
+                if (data.status === 'waiting_for_input' && data.prompt_data) {
+                    currentPromptData = data.prompt_data;
+                    const trackFile = data.prompt_data.track_file;
+                    if (activePromptTrack !== trackFile) {
+                        activePromptTrack = trackFile;
+                        renderInteractivePromptUI(data.prompt_data);
+                        const modal = document.getElementById('upsampleModal');
+                        if (modal) modal.style.display = 'flex';
                     }
-                    if (data.dst_dir) {
-                        btnDest.style.display = 'inline-block';
-                        btnDest.setAttribute('data-dest-dir', data.dst_dir);
-                    }
-                    clearInterval(upsamplePollTimer);
-                    upsamplePollTimer = null;
-                } else if (data.status === 'failed') {
-                    badge.textContent = 'FAILED';
-                    badge.style.background = 'rgba(255, 23, 68, 0.15)';
-                    badge.style.borderColor = 'rgba(255, 23, 68, 0.4)';
-                    badge.style.color = '#ff5252';
-                    fill.className = 'drawer-progress-fill';
-                    btnCancel.style.display = 'none';
-                    stageText.textContent = data.error_message || 'Process failed';
-                    clearInterval(upsamplePollTimer);
-                    upsamplePollTimer = null;
-                } else if (data.status === 'cancelled') {
-                    badge.textContent = 'CANCELLED';
-                    badge.style.background = 'rgba(255, 234, 0, 0.15)';
-                    badge.style.borderColor = 'rgba(255, 234, 0, 0.4)';
-                    badge.style.color = 'var(--accent-yellow)';
-                    fill.className = 'drawer-progress-fill';
-                    btnCancel.style.display = 'none';
-                    clearInterval(upsamplePollTimer);
-                    upsamplePollTimer = null;
+                } else if (data.status === 'running') {
+                    currentPromptData = null;
+                } else if (data.status === 'completed') {
+                    currentPromptData = null;
+                    closeUpsampleModal();
+                } else if (data.status === 'failed' || data.status === 'cancelled') {
+                    dismissUpsampleHeaderWidget();
+                    closeUpsampleModal();
                 }
             } catch (err) {}
+        }
+
+        let folderPickerTargetInputId = 'upsampleDstDir';
+        let folderPickerCurrentPath = '/mnt/PrimaryFS/FLAC_music/music';
+
+        async function openFolderPicker(targetInputId) {
+            folderPickerTargetInputId = targetInputId;
+            const currentVal = document.getElementById(targetInputId) ? document.getElementById(targetInputId).value.trim() : '';
+            folderPickerCurrentPath = currentVal || currentPath || '/mnt/PrimaryFS';
+            const modal = document.getElementById('folderPickerModal');
+            if (modal) modal.style.display = 'flex';
+            await loadFolderPickerDirectory(folderPickerCurrentPath);
+        }
+
+        function closeFolderPicker() {
+            const modal = document.getElementById('folderPickerModal');
+            if (modal) modal.style.display = 'none';
+        }
+
+        async function loadFolderPickerDirectory(targetPath) {
+            folderPickerCurrentPath = targetPath;
+            const pathBar = document.getElementById('folderPickerPathBar');
+            const breadcrumbsEl = document.getElementById('folderPickerBreadcrumbs');
+            const listEl = document.getElementById('folderPickerList');
+            if (pathBar) pathBar.value = targetPath;
+            if (listEl) {
+                listEl.innerHTML = '<div style="padding: 28px; text-align: center; color: #8b949e;"><div class="spinner" style="margin: 0 auto 10px;"></div>Loading directory contents...</div>';
+            }
+
+            try {
+                const res = await fetch(`/api/browse?path=${encodeURIComponent(targetPath)}&fresh=0`);
+                const data = await res.json();
+                if (!data || !listEl) return;
+
+                folderPickerCurrentPath = data.current_path || targetPath;
+                if (pathBar) pathBar.value = folderPickerCurrentPath;
+
+                // Render Breadcrumbs
+                if (breadcrumbsEl) {
+                    let bHtml = '<span class="crumb" onclick="loadFolderPickerDirectory(\'/\')">🏠 /</span>';
+                    if (data.breadcrumbs && data.breadcrumbs.length > 0) {
+                        data.breadcrumbs.forEach(b => {
+                            bHtml += ` <span style="color: #484f58;">/</span> <span class="crumb" onclick="loadFolderPickerDirectory('${b.path.replace(/'/g, "\\'")}')">${b.name}</span>`;
+                        });
+                    }
+                    breadcrumbsEl.innerHTML = bHtml;
+                }
+
+                let html = '';
+                if (data.parent_path && data.parent_path !== folderPickerCurrentPath) {
+                    html += `<div class="folder-picker-item" onclick="loadFolderPickerDirectory('${data.parent_path.replace(/'/g, "\\'")}')">
+                        <span style="font-size: 1.15rem;">📁</span>
+                        <span style="font-weight: 600; color: var(--accent-cyan); flex: 1;">.. [Up to Parent Directory]</span>
+                        <span style="font-size: 0.72rem; color: var(--text-muted);">${data.parent_path}</span>
+                    </div>`;
+                }
+
+                const subfolders = data.folders || data.dirs || [];
+                if (subfolders.length > 0) {
+                    subfolders.forEach(d => {
+                        const trackBadge = d.audio_count > 0 ? `<span class="badge-provenance-native" style="font-size: 0.68rem; padding: 1px 6px; margin-right: 8px;">${d.audio_count} track${d.audio_count > 1 ? 's' : ''}</span>` : '';
+                        html += `<div class="folder-picker-item" onclick="loadFolderPickerDirectory('${d.path.replace(/'/g, "\\'")}')">
+                            <span style="font-size: 1.15rem;">📁</span>
+                            <span style="color: var(--text-heading); font-weight: 500; flex: 1;">${d.name}</span>
+                            ${trackBadge}
+                            <button class="btn-bookmark" style="padding: 2px 10px; font-size: 0.72rem; color: #00e676; border-color: rgba(0, 230, 118, 0.45); background: rgba(0, 230, 118, 0.1);" onclick="event.stopPropagation(); selectFolderPickerChoice('${d.path.replace(/'/g, "\\'")}')">Select</button>
+                        </div>`;
+                    });
+                } else {
+                    html += `<div style="padding: 28px; text-align: center; color: var(--text-muted); font-size: 0.85rem;">
+                        <div style="font-size: 1.5rem; margin-bottom: 6px;">📁</div>
+                        No subdirectories in this folder.<br>
+                        <small style="color: #8b949e;">Click "✓ Select Current Folder" below to choose this location.</small>
+                    </div>`;
+                }
+                listEl.innerHTML = html;
+            } catch (err) {
+                if (listEl) listEl.innerHTML = `<div style="padding: 20px; color: #ff5252; text-align: center;">Error loading directory: ${err.message}</div>`;
+            }
+        }
+
+        async function createNewFolderInPicker() {
+            const folderName = prompt('Enter new subfolder name:');
+            if (!folderName || !folderName.trim()) return;
+            const newPath = folderPickerCurrentPath.replace(/\\/+$/, '') + '/' + folderName.trim();
+            try {
+                const res = await fetch('/api/mkdir', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ path: newPath })
+                });
+                const data = await res.json();
+                if (data.status === 'ok') {
+                    await loadFolderPickerDirectory(data.created_path);
+                } else {
+                    alert('Failed to create directory: ' + (data.message || 'Unknown error'));
+                }
+            } catch (err) {
+                alert('Error creating directory: ' + err.message);
+            }
+        }
+
+        function selectFolderPickerChoice(customPath = null) {
+            const pathBar = document.getElementById('folderPickerPathBar');
+            const chosenPath = customPath || (pathBar ? pathBar.value.trim() : '') || folderPickerCurrentPath;
+            const targetInput = document.getElementById(folderPickerTargetInputId);
+            if (targetInput && chosenPath) {
+                targetInput.value = chosenPath;
+            }
+            closeFolderPicker();
+        }
+
+        async function openUpsampleModal(mode = 'album', customSrcPath = null) {
+            upsampleTargetMode = mode;
+            const modal = document.getElementById('upsampleModal');
+            const scopeBadge = document.getElementById('upsampleModalScopeBadge');
+            const srcInput = document.getElementById('upsampleSrcPath');
+            const dstInput = document.getElementById('upsampleDstDir');
+            const initialLaunchControls = document.getElementById('initialLaunchControls');
+            const interactiveDecisionControls = document.getElementById('interactiveDecisionControls');
+
+            if (activeUpsampleJob && activeUpsampleJob.status === 'waiting_for_input' && currentPromptData) {
+                renderInteractivePromptUI(currentPromptData);
+                modal.style.display = 'flex';
+                return;
+            }
+
+            let srcPath = customSrcPath;
+            if (!srcPath) {
+                if (mode === 'track') {
+                    srcPath = currentAnalysis ? currentAnalysis.filepath : (directoryData && directoryData.files && directoryData.files[0] ? directoryData.files[0].path : '');
+                } else {
+                    srcPath = currentPath;
+                }
+            }
+
+            if (!srcPath) {
+                alert('Please select a track or navigate to an album folder first.');
+                return;
+            }
+
+            srcInput.value = srcPath;
+            scopeBadge.textContent = mode === 'track' ? 'SINGLE TRACK' : 'ALBUM BATCH';
+            scopeBadge.style.background = mode === 'track' ? 'rgba(0, 229, 255, 0.15)' : 'rgba(0, 230, 118, 0.15)';
+            scopeBadge.style.borderColor = mode === 'track' ? 'rgba(0, 229, 255, 0.4)' : 'rgba(0, 230, 118, 0.4)';
+            scopeBadge.style.color = mode === 'track' ? 'var(--accent-cyan)' : '#00e676';
+
+            if (initialLaunchControls) initialLaunchControls.style.display = 'grid';
+            if (interactiveDecisionControls) interactiveDecisionControls.style.display = 'none';
+
+            populateRecommendationCard(mode, srcPath);
+
+            try {
+                const res = await fetch(`/api/upsample/dest_preview?path=${encodeURIComponent(srcPath)}`);
+                const data = await res.json();
+                if (data && data.dest_dir) {
+                    dstInput.value = data.dest_dir;
+                }
+            } catch (err) {
+                dstInput.value = '';
+            }
+
+            applyForensicRecommendationPreset();
+            modal.style.display = 'flex';
+        }
+
+        function populateRecommendationCard(mode, srcPath) {
+            const trackTitleEl = document.getElementById('promptTrackTitle');
+            const provLabelEl = document.getElementById('promptProvLabel');
+            const formatMetaEl = document.getElementById('promptFormatMeta');
+            const metricsRowEl = document.getElementById('promptMetricsRow');
+            const actionDescEl = document.getElementById('promptActionDesc');
+            const dspFlagEl = document.getElementById('promptDspFlag');
+            const rationaleEl = document.getElementById('promptTechnicalRationale');
+
+            const filename = srcPath.split('/').filter(Boolean).pop() || 'Item';
+            trackTitleEl.textContent = mode === 'track' ? filename : `Album: ${filename}`;
+
+            if (currentAnalysis && currentAnalysis.provenance) {
+                const p = currentAnalysis.provenance;
+                const rec = p.recommendation || {};
+                const prim = p.primary || {};
+                const vis = p.visual_morphology || {};
+                const pk = vis.primary_knee || {};
+                const purity = vis.stopband_purity || {};
+
+                provLabelEl.textContent = prim.label ? `${prim.label.toUpperCase()} [${prim.confidence || 'HIGH'} CONFIDENCE]` : 'STANDARD MASTER';
+                provLabelEl.className = 'provenance-tag ' + (prim.label === 'Native Master' ? 'badge-provenance-native' : prim.label === 'Lowpass Filtered' ? 'badge-provenance-lowpass' : 'badge-provenance-upsampled');
+                
+                const srKhz = currentAnalysis.sr ? (currentAnalysis.sr / 1000).toFixed(1) : '44.1';
+                const ch = currentAnalysis.channels || 2;
+                const bd = currentAnalysis.bit_depth || 24;
+                formatMetaEl.textContent = `Source Format: ${srKhz} kHz • ${ch} Channels • ${bd}-bit PCM`;
+
+                let metricText = '';
+                if (pk && pk.is_brickwall_knee) {
+                    metricText += `📐 Brickwall Knee: ${pk.freq_khz.toFixed(1)} kHz (Slope: ${pk.steepest_slope_db_per_khz.toFixed(1)} dB/kHz, Drop: ${pk.drop_db.toFixed(1)} dB) • `;
+                }
+                if (purity && purity.has_stopband) {
+                    metricText += `📻 Stopband: ${purity.purity_label || 'Clean'} • `;
+                }
+                metricText += `📊 True Peak: ${currentAnalysis.true_peak_db ? currentAnalysis.true_peak_db.toFixed(1) + ' dBTP' : 'Safe'}`;
+                metricsRowEl.textContent = metricText;
+
+                actionDescEl.textContent = rec.action ? `${rec.action}: ${rec.details || ''}` : 'Direct 64-bit polyphase sinc upsampling with Shibata noise shaping.';
+                dspFlagEl.textContent = rec.dsp_params || '--phase min --dither shibata';
+
+                if (rec.details) {
+                    rationaleEl.textContent = rec.details;
+                } else if (prim.label === 'Lowpass Filtered') {
+                    rationaleEl.textContent = 'A steep lowpass reconstruction cutoff was detected. A minimum-phase apodizing sinc filter is recommended to eliminate pre-ringing impulse artefacts and suppress ultrasonic alias imaging without touching audible frequencies.';
+                } else {
+                    rationaleEl.textContent = 'Preserves pristine bit-perfect audio fidelity across audible octaves while providing optimal 64-bit double-precision sinc reconstruction with psychoacoustic 24-bit Shibata noise shaping.';
+                }
+            } else {
+                provLabelEl.textContent = 'ALBUM BATCH AUDIT';
+                provLabelEl.className = 'provenance-tag badge-provenance-native';
+                formatMetaEl.textContent = 'Multi-Track Forensic Upsampling Pipeline';
+                metricsRowEl.textContent = 'Per-track dynamic spectral analysis and intersample headroom protection';
+                actionDescEl.textContent = 'Interactive AcoustiSinc Upsampling';
+                dspFlagEl.textContent = '--phase min --dither shibata';
+                rationaleEl.textContent = 'Audits every track individually during batch execution to recommend optimal minimum-phase or apodizing recipes tailored to each master file.';
+            }
+        }
+
+        function reopenActivePromptModal() {
+            if (currentPromptData) {
+                renderInteractivePromptUI(currentPromptData);
+            }
+            const modal = document.getElementById('upsampleModal');
+            if (modal) modal.style.display = 'flex';
         }
 
         async function cancelUpsampleJob() {
@@ -3551,59 +4156,35 @@ HTML_PAGE = """<!DOCTYPE html>
             try {
                 const res = await fetch('/api/upsample/cancel', { method: 'POST' });
                 const data = await res.json();
-                if (data.status !== 'ok') {
+                if (data.status !== 'ok' && data.message !== 'No job is currently running.') {
                     alert('Failed to cancel job: ' + (data.message || 'Unknown error'));
                 }
             } catch (err) {
-                alert('Error cancelling job: ' + err.message);
+                console.error('Error cancelling job:', err);
+            } finally {
+                closeUpsampleModal();
+                dismissUpsampleHeaderWidget();
             }
         }
 
-        function toggleUpsampleTerminal() {
-            const terminal = document.getElementById('drawerTerminal');
-            if (!terminal) return;
-            const isShown = terminal.style.display !== 'none';
-            terminal.style.display = isShown ? 'none' : 'flex';
-            if (!isShown) terminal.scrollTop = terminal.scrollHeight;
-        }
-
-        function toggleUpsampleDrawerMinimize() {
-            const drawer = document.getElementById('upsampleJobDrawer');
-            if (drawer) drawer.classList.toggle('minimized');
-        }
-
-        function dismissUpsampleDrawer() {
-            const drawer = document.getElementById('upsampleJobDrawer');
-            if (drawer) drawer.style.display = 'none';
+        function dismissUpsampleHeaderWidget() {
+            const widget = document.getElementById('headerUpsampleWidget');
+            if (widget) widget.style.display = 'none';
+            const btnUpsample = document.getElementById('headerBtnUpsample');
+            if (btnUpsample) {
+                const hasFiles = !directoryData || !directoryData.files || directoryData.files.length > 0;
+                btnUpsample.style.display = hasFiles ? 'inline-block' : 'none';
+            }
+            activeUpsampleJob = null;
+            currentPromptData = null;
+            activePromptTrack = null;
+            const recButtons = document.getElementById('actionRecButtons');
+            if (recButtons) {
+                recButtons.querySelectorAll('button').forEach(b => { b.disabled = false; b.style.opacity = '1'; });
+            }
             if (upsamplePollTimer) {
                 clearInterval(upsamplePollTimer);
                 upsamplePollTimer = null;
-            }
-        }
-
-        function viewGeneratedReport() {
-            const btnReport = document.getElementById('drawerBtnReport');
-            const reportUrl = btnReport ? btnReport.getAttribute('data-report-url') : null;
-            if (reportUrl) {
-                const modal = document.getElementById('albumSummaryModal');
-                const body = document.getElementById('modalSummaryBody');
-                const badge = document.getElementById('modalSummaryBadge');
-                const extBtn = document.getElementById('modalOpenExternalBtn');
-                if (modal && body) {
-                    modal.style.display = 'flex';
-                    badge.textContent = 'ALBUM_REPORT.html (Freshly Mastered)';
-                    extBtn.style.display = 'inline-block';
-                    currentSummaryRawUrl = reportUrl;
-                    body.innerHTML = `<iframe class="modal-iframe" src="${reportUrl}" style="width: 100%; height: 100%; min-height: 72vh; border: none; border-radius: 6px; background: #0d1117;"></iframe>`;
-                }
-            }
-        }
-
-        function jumpToUpsampleDestination() {
-            const btnDest = document.getElementById('drawerBtnDest');
-            const destDir = btnDest ? btnDest.getAttribute('data-dest-dir') : null;
-            if (destDir) {
-                loadDirectory(destDir, true);
             }
         }
 
@@ -3612,6 +4193,8 @@ HTML_PAGE = """<!DOCTYPE html>
             if (e.key === 'Escape') {
                 closeAlbumSummaryModal();
                 closeUpsampleModal();
+                closeUpsampleLogModal();
+                closeFolderPicker();
             }
         });
 
@@ -3619,7 +4202,43 @@ HTML_PAGE = """<!DOCTYPE html>
         loadDirectory(currentPath, true);
     </script>
 
-    <!-- Album Analysis Summary Modal -->
+    <!-- Folder Browser / Directory Picker Modal -->
+    <div id="folderPickerModal" class="modal-backdrop" style="display: none; z-index: 10050;" onclick="if(event.target===this) closeFolderPicker()">
+        <div class="modal-content" style="max-width: 720px; height: 78vh; display: flex; flex-direction: column; border-radius: 12px; border: 1px solid #30363d; box-shadow: 0 20px 50px rgba(0,0,0,0.85); background: #0d1117;">
+            <div class="modal-header" style="padding: 14px 20px; border-bottom: 1px solid #30363d;">
+                <div style="display: flex; align-items: center; gap: 10px; min-width: 0;">
+                    <span style="font-size: 1.1rem; font-weight: 700; color: var(--text-heading);">📁 Select Directory</span>
+                </div>
+                <button class="btn-bookmark" onclick="closeFolderPicker()" style="font-size: 1.2rem; padding: 2px 10px; line-height: 1;">&times;</button>
+            </div>
+            
+            <!-- Breadcrumbs Navigation Bar -->
+            <div style="padding: 8px 16px; background: #161b22; border-bottom: 1px solid #30363d; font-size: 0.80rem; overflow-x: auto; white-space: nowrap;" id="folderPickerBreadcrumbs">
+                <span class="crumb" onclick="loadFolderPickerDirectory('/')">🏠 /</span>
+            </div>
+
+            <!-- Path Bar & Action Buttons -->
+            <div style="padding: 10px 16px; background: #11141a; border-bottom: 1px solid #30363d; display: flex; gap: 8px; align-items: center;">
+                <input type="text" id="folderPickerPathBar" class="form-input" style="font-family: monospace; font-size: 0.82rem; height: 36px;" onkeydown="if(event.key==='Enter') loadFolderPickerDirectory(this.value.trim())" />
+                <button class="btn-bookmark" onclick="loadFolderPickerDirectory(document.getElementById('folderPickerPathBar').value.trim())" style="padding: 0 14px; height: 36px;">Go</button>
+                <button class="btn-bookmark" onclick="createNewFolderInPicker()" style="padding: 0 14px; height: 36px; color: var(--accent-cyan); border-color: rgba(0, 229, 255, 0.4); white-space: nowrap;">+ New Folder</button>
+            </div>
+
+            <!-- Folder Items List -->
+            <div class="modal-body" style="flex: 1; overflow-y: auto; padding: 8px 12px;" id="folderPickerList">
+                <div style="padding: 28px; text-align: center; color: var(--text-muted);">
+                    <div class="spinner" style="margin: 0 auto 10px;"></div>
+                    Loading directory contents...
+                </div>
+            </div>
+
+            <!-- Bottom Action Footer -->
+            <div style="padding: 12px 18px; background: #161b22; border-top: 1px solid #30363d; display: flex; justify-content: space-between; align-items: center; gap: 10px;">
+                <button class="btn-bookmark" onclick="closeFolderPicker()" style="padding: 7px 16px;">Cancel</button>
+                <button class="btn-bookmark" onclick="selectFolderPickerChoice()" style="background: rgba(0, 230, 118, 0.2); border-color: rgba(0, 230, 118, 0.55); color: #00e676; font-weight: 700; padding: 7px 20px; font-size: 0.88rem;">✓ Select Current Folder</button>
+            </div>
+        </div>
+    </div>
     <div id="albumSummaryModal" class="modal-backdrop" style="display: none;" onclick="if(event.target===this) closeAlbumSummaryModal()">
         <div class="modal-content">
             <div class="modal-header">
@@ -3642,147 +4261,272 @@ HTML_PAGE = """<!DOCTYPE html>
         </div>
     </div>
 
-    <!-- Upsample Configuration Modal -->
+    <!-- Upsample Configuration & Interactive Decision Modal -->
     <div id="upsampleModal" class="modal-backdrop" style="display: none;" onclick="if(event.target===this) closeUpsampleModal()">
         <div class="modal-content modal-upsample-dialog">
-            <div class="modal-header">
+            <div class="modal-header" style="padding: 14px 22px; border-bottom: 1px solid #30363d;">
                 <div style="display: flex; align-items: center; gap: 10px; min-width: 0;">
-                    <span style="font-size: 1.1rem; font-weight: 700; color: var(--text-heading); white-space: nowrap;">⚡ AcoustiSinc Upsampling Studio</span>
+                    <span style="font-size: 1.15rem; font-weight: 700; color: var(--text-heading); white-space: nowrap;">⚡ AcoustiSinc Interactive Upsampling Studio</span>
                     <span id="upsampleModalScopeBadge" class="brand-badge" style="background: rgba(0, 230, 118, 0.15); border-color: rgba(0, 230, 118, 0.4); color: #00e676;">ALBUM BATCH</span>
                 </div>
                 <button class="btn-bookmark" onclick="closeUpsampleModal()" style="font-size: 1.2rem; padding: 2px 10px; line-height: 1;">&times;</button>
             </div>
-            <div class="modal-body" style="padding: 16px 20px;">
-                <div class="preset-pill-group">
+            <div class="modal-body" style="padding: 20px 24px; overflow-y: auto;">
+                
+                <!-- 1. Forensic Audit & Recommendation Details Card -->
+                <div id="promptAuditCard" class="prompt-audit-card">
+                    <div style="display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap;">
+                        <span style="font-size: 0.78rem; font-weight: 700; color: var(--accent-cyan); letter-spacing: 0.5px;">🔬 FORENSIC AUDIT & RECIPE RECOMMENDATION</span>
+                        <span id="promptProvLabel" class="provenance-tag badge-provenance-native" style="font-size: 0.72rem; padding: 2px 10px;">RECOMMENDED RECIPE</span>
+                    </div>
+                    <div style="display: flex; justify-content: space-between; align-items: baseline; gap: 8px; flex-wrap: wrap; margin-top: 2px;">
+                        <div id="promptTrackTitle" style="font-weight: 700; font-size: 1.02rem; color: var(--text-heading);">Track Name</div>
+                        <div id="promptFormatMeta" style="font-size: 0.78rem; color: var(--text-muted); font-family: monospace;">44.1 kHz • 2 Channels • 24-bit PCM</div>
+                    </div>
+                    <div id="promptMetricsRow" style="font-size: 0.78rem; color: #8b949e;">Cutoff Knee: -- | Stopband: --</div>
+                    
+                    <div style="background: rgba(0, 229, 255, 0.06); border: 1px solid rgba(0, 229, 255, 0.28); border-radius: 6px; padding: 10px 14px; margin: 4px 0;">
+                        <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 3px;">
+                            <span style="font-size: 0.76rem; font-weight: 700; color: var(--accent-cyan);">Recommended Recipe:</span>
+                            <span id="promptActionDesc" style="font-size: 0.84rem; font-weight: 600; color: var(--text-heading);">Direct Sinc Resampling</span>
+                        </div>
+                        <div style="display: flex; align-items: center; gap: 6px; margin-top: 4px;">
+                            <span style="font-size: 0.74rem; color: var(--text-muted);">DSP CLI Flag:</span>
+                            <code class="action-code" id="promptDspFlag">--phase min --dither shibata</code>
+                        </div>
+                    </div>
+
+                    <div style="font-size: 0.80rem; color: var(--text); line-height: 1.45; background: rgba(0, 0, 0, 0.25); border-radius: 6px; padding: 8px 12px;">
+                        <span style="font-weight: 600; color: var(--accent-yellow);">💡 Technical Rationale: </span>
+                        <span id="promptTechnicalRationale">Applies optimal 64-bit double precision sinc filter.</span>
+                    </div>
+                </div>
+
+                <!-- Presets Pill Bar (for quick configurations) -->
+                <div class="preset-pill-group" id="presetPillGroup" style="margin-bottom: 14px;">
                     <button class="preset-pill active" id="presetBtnRecommended" onclick="applyForensicRecommendationPreset()">✨ Apply Forensic Recommendation</button>
                     <button class="preset-pill" id="presetBtnAudiophile4x" onclick="applyDefaultPreset('4x')">🎧 Standard 4x Audiophile</button>
                     <button class="preset-pill" id="presetBtnApodizing" onclick="applyDefaultPreset('apod')">🛡️ Apodizing Ringing-Filter (22.05k)</button>
                 </div>
 
-                <div class="form-grid">
+                <!-- 2. Master Storage & Target Paths Card -->
+                <div class="modal-section-card">
+                    <div class="modal-section-header">
+                        <span>📁 Audio Master & Target Locations</span>
+                        <span class="form-label-sub">Lossless FLAC Library Storage</span>
+                    </div>
+                    
                     <div class="form-group full-width">
-                        <label class="form-label">Source Input Path</label>
-                        <input type="text" class="form-input" id="upsampleSrcPath" readonly style="color: var(--text-muted); background: #11141a;" />
-                    </div>
-
-                    <div class="form-group full-width">
-                        <label class="form-label">Destination Output Directory</label>
-                        <input type="text" class="form-input" id="upsampleDstDir" placeholder="/mnt/PrimaryFS/1xxK_min/music/..." />
-                    </div>
-
-                    <div class="form-group">
-                        <label class="form-label">Target Sample Rate</label>
-                        <select class="form-select" id="upsampleRate">
-                            <option value="4x" selected>Auto 4x Native (176.4k / 192k)</option>
-                            <option value="192000">192.0 kHz</option>
-                            <option value="176400">176.4 kHz</option>
-                            <option value="384000">384.0 kHz (8x)</option>
-                            <option value="352800">352.8 kHz (8x)</option>
-                        </select>
-                    </div>
-
-                    <div class="form-group">
-                        <label class="form-label">Filter Phase Mode</label>
-                        <select class="form-select" id="upsamplePhase">
-                            <option value="min" selected>Minimum Phase (Apodizing / Anti-Ringing)</option>
-                            <option value="linear">Linear Phase (Symmetric Time Response)</option>
-                        </select>
-                    </div>
-
-                    <div class="form-group">
                         <label class="form-label">
-                            <span>Reconstruction Cutoff</span>
-                            <span id="cutoffHint" style="font-size: 0.70rem; color: var(--text-muted);">Optional</span>
+                            <span>Source Master Location</span>
+                            <span class="form-label-sub">Input File / Folder</span>
                         </label>
-                        <div style="display: flex; gap: 6px; align-items: center;">
-                            <input type="checkbox" id="upsampleCutoffEnable" onchange="toggleCutoffInput()" style="cursor: pointer;" />
-                            <input type="number" class="form-input" id="upsampleCutoffHz" placeholder="22050" min="10000" max="192000" step="50" disabled />
-                            <span style="font-size: 0.75rem; color: var(--text-muted);">Hz</span>
+                        <div class="form-path-row">
+                            <input type="text" class="form-input" id="upsampleSrcPath" readonly />
+                            <button class="btn-browse" onclick="openFolderPicker('upsampleSrcPath')" title="Browse Source Master Folder">📁 Browse...</button>
                         </div>
                     </div>
 
-                    <div class="form-group">
-                        <label class="form-label">Dither & Noise Shaping</label>
-                        <select class="form-select" id="upsampleDither">
-                            <option value="shibata" selected>Shibata (Psychoacoustic High-Order, 24-bit)</option>
-                            <option value="high_rate">High Rate Flat Dither</option>
-                            <option value="none">None (Direct In-Register Float64)</option>
-                        </select>
-                    </div>
-
-                    <div class="form-group">
-                        <label class="form-label">MQA Payload Policy</label>
-                        <select class="form-select" id="upsampleMqa">
-                            <option value="adaptive" selected>adaptive (Subband Unfold + Noise Gate)</option>
-                            <option value="strip">strip (Mask LSB Hash & Re-dither)</option>
-                            <option value="ignore">ignore (Treat as Raw Linear PCM)</option>
-                        </select>
-                    </div>
-
-                    <div class="form-group">
-                        <label class="form-label">File Overwrite Mode</label>
-                        <select class="form-select" id="upsampleOverwrite">
-                            <option value="on" selected>Overwrite Existing Output</option>
-                            <option value="off">Skip Existing Output</option>
-                        </select>
-                    </div>
-
-                    <div class="form-group full-width" style="margin-top: 4px;">
-                        <div style="display: flex; gap: 16px; flex-wrap: wrap;">
-                            <label class="form-checkbox-row">
-                                <input type="checkbox" id="upsampleSteep" />
-                                <span>Sharp 500 Hz Transition Band (Steep)</span>
-                            </label>
-                            <label class="form-checkbox-row">
-                                <input type="checkbox" id="upsampleReport" checked />
-                                <span>Generate Comparative HTML/MD Reports</span>
-                            </label>
+                    <div class="form-group full-width">
+                        <label class="form-label">
+                            <span>Destination Output Directory</span>
+                            <span class="form-label-sub">Target Master Storage Folder</span>
+                        </label>
+                        <div class="form-path-row">
+                            <input type="text" class="form-input" id="upsampleDstDir" placeholder="/mnt/PrimaryFS/1xxK_min/music/..." />
+                            <button class="btn-browse" onclick="openFolderPicker('upsampleDstDir')" title="Browse Target Destination Directory">📁 Browse...</button>
                         </div>
                     </div>
                 </div>
 
-                <div style="display: flex; justify-content: flex-end; gap: 10px; margin-top: 20px; border-top: 1px solid #30363d; padding-top: 14px;">
-                    <button class="btn-bookmark" onclick="closeUpsampleModal()" style="padding: 7px 14px;">Cancel</button>
-                    <button class="btn-bookmark" onclick="startUpsampleJob()" style="background: rgba(0, 230, 118, 0.2); border-color: rgba(0, 230, 118, 0.6); color: #00e676; font-weight: 700; padding: 7px 18px; font-size: 0.88rem;">⚡ Start Upsampling</button>
+                <!-- 3. Filter Phase & Apodizing Reconstruction Card -->
+                <div class="modal-section-card">
+                    <div class="modal-section-header">
+                        <span>⚙️ Filter Phase & Apodizing Reconstruction Architecture</span>
+                        <span class="form-label-sub">Strict 64-Bit Float Precision</span>
+                    </div>
+
+                    <div class="form-grid-2">
+                        <!-- Left Column: Rate & Phase Mode -->
+                        <div style="display: flex; flex-direction: column; gap: 12px;">
+                            <div class="form-group">
+                                <label class="form-label">
+                                    <span>Target Sample Rate</span>
+                                    <span class="form-label-sub">Integral Multiple</span>
+                                </label>
+                                <select class="form-select" id="upsampleRate">
+                                    <option value="4x" selected>Auto 4x Native (176.4k / 192k)</option>
+                                    <option value="192000">192.0 kHz (4x from 48k family)</option>
+                                    <option value="176400">176.4 kHz (4x from 44.1k family)</option>
+                                    <option value="384000">384.0 kHz (8x Ultra)</option>
+                                    <option value="352800">352.8 kHz (8x Ultra)</option>
+                                </select>
+                            </div>
+
+                            <div class="form-group">
+                                <label class="form-label">
+                                    <span>Filter Phase Response Mode</span>
+                                    <span class="form-label-sub">Impulse Symmetry</span>
+                                </label>
+                                <select class="form-select" id="upsamplePhase">
+                                    <option value="min" selected>Minimum Phase (Anti-Ringing / Causal Response)</option>
+                                    <option value="linear">Linear Phase (Symmetric Time Response)</option>
+                                </select>
+                            </div>
+                        </div>
+
+                        <!-- Right Column: Dedicated Apodizing Switch & Cutoff & Steep -->
+                        <div style="display: flex; flex-direction: column; gap: 12px;">
+                            <div class="form-group">
+                                <label class="form-label">
+                                    <span>Apodizing Reconstruction Filter</span>
+                                    <span id="cutoffHint" class="form-label-sub">Disabled (Full Nyquist)</span>
+                                </label>
+                                <div style="display: flex; gap: 8px; align-items: center;">
+                                    <label class="form-checkbox-card" style="flex: 1; margin: 0;">
+                                        <input type="checkbox" id="upsampleApodizingEnable" onchange="toggleApodizingInput()" style="cursor: pointer;" />
+                                        <span style="font-weight: 600; font-size: 0.82rem; color: var(--text-heading);">Enable Apodizing</span>
+                                    </label>
+                                    <div style="display: flex; align-items: center; gap: 4px; width: 130px;">
+                                        <input type="number" class="form-input" id="upsampleCutoffHz" placeholder="22050" min="10000" max="192000" step="50" disabled style="padding: 6px 10px; height: 40px;" />
+                                        <span style="font-size: 0.78rem; color: var(--text-muted);">Hz</span>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div class="form-group">
+                                <label class="form-label">
+                                    <span>Filter Transition Steepness</span>
+                                    <span class="form-label-sub">Brickwall Transition</span>
+                                </label>
+                                <label class="form-checkbox-card" style="margin: 0;">
+                                    <input type="checkbox" id="upsampleSteep" style="cursor: pointer;" />
+                                    <span style="font-size: 0.82rem; color: var(--text-heading);">Sharp 500 Hz Transition Band (--steep)</span>
+                                </label>
+                            </div>
+                        </div>
+                    </div>
                 </div>
+
+                <!-- 4. Dither, MQA & Export Controls Card -->
+                <div class="modal-section-card">
+                    <div class="modal-section-header">
+                        <span>🎛️ Dither, MQA & Quality Controls</span>
+                        <span class="form-label-sub">Noise Shaping & Integrity</span>
+                    </div>
+
+                    <div class="form-grid-3">
+                        <div class="form-group">
+                            <label class="form-label">
+                                <span>Dither & Noise Shaping</span>
+                            </label>
+                            <select class="form-select" id="upsampleDither">
+                                <option value="shibata" selected>Shibata (High-Order 24-bit)</option>
+                                <option value="high_rate">High Rate Flat Dither</option>
+                                <option value="none">None (Float64 Direct)</option>
+                            </select>
+                        </div>
+
+                        <div class="form-group">
+                            <label class="form-label">
+                                <span>MQA Payload Policy</span>
+                            </label>
+                            <select class="form-select" id="upsampleMqa">
+                                <option value="adaptive" selected>adaptive (Subband Unfold)</option>
+                                <option value="strip">strip (Mask LSB & Re-dither)</option>
+                                <option value="ignore">ignore (Treat as Raw PCM)</option>
+                            </select>
+                        </div>
+
+                        <div class="form-group">
+                            <label class="form-label">
+                                <span>File Overwrite Mode</span>
+                            </label>
+                            <select class="form-select" id="upsampleOverwrite">
+                                <option value="on" selected>Overwrite Existing Output</option>
+                                <option value="off">Skip If Output Exists</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <div style="margin-top: 4px;">
+                        <label class="form-checkbox-card" style="margin: 0;">
+                            <input type="checkbox" id="upsampleReport" checked style="cursor: pointer;" />
+                            <span style="font-size: 0.82rem; color: var(--text-heading); font-weight: 500;">Generate Comparative HTML & Markdown Forensic Reports</span>
+                        </label>
+                    </div>
+                </div>
+
+                <!-- Initial Launch Actions (Batch / Album Launching) -->
+                <div id="initialLaunchControls" class="decision-btn-grid" style="border-top: 1px solid #30363d; padding-top: 14px; margin-top: 8px;">
+                    <button class="btn-decision btn-decision-primary" onclick="startUpsampleJob(true)" title="Launch interactive session, auditing and prompting per-track decisions">
+                        <span style="font-size: 0.92rem;">▶️ [Y] Start Interactive Mode</span>
+                        <span class="btn-decision-sub">Prompts per-track recipe & review in modal</span>
+                    </button>
+                    <button class="btn-decision btn-decision-auto" onclick="startUpsampleJob(false)" title="Automatically apply each track's forensic recommendation unattended">
+                        <span style="font-size: 0.92rem;">⚡ [A] Auto-Upsample Album</span>
+                        <span class="btn-decision-sub">Auto-applies recommendations unattended</span>
+                    </button>
+                    <button class="btn-decision btn-decision-lock" onclick="startUpsampleJob(false)" title="Upsample album using the custom parameters configured above">
+                        <span style="font-size: 0.92rem;">❄️ [C] Upsample with Configured Settings</span>
+                        <span class="btn-decision-sub">Applies settings above to all tracks</span>
+                    </button>
+                    <button class="btn-decision btn-decision-abort" onclick="closeUpsampleModal()" title="Cancel and close dialog">
+                        <span style="font-size: 0.92rem;">⏹️ [K] Cancel</span>
+                        <span class="btn-decision-sub">Dismiss this dialog</span>
+                    </button>
+                </div>
+
+                <!-- Interactive Track Decision Actions Grid (Live Subprocess Prompts) -->
+                <div id="interactiveDecisionControls" class="decision-btn-grid" style="display: none; border-top: 1px solid #30363d; padding-top: 14px; margin-top: 8px;">
+                    <button class="btn-decision btn-decision-primary" onclick="sendPromptChoice('y')" title="Accept recipe and process this track">
+                        <span style="font-size: 0.92rem;">▶️ [Y] Process This Track</span>
+                        <span class="btn-decision-sub">Process file, background & prompt next</span>
+                    </button>
+                    <button class="btn-decision btn-decision-lock" onclick="sendPromptChoice('c')" title="Apply this recipe to REST of album directory">
+                        <span style="font-size: 0.92rem;">❄️ [C] Apply to REST of Album</span>
+                        <span class="btn-decision-sub">Freeze recipe for all remaining tracks</span>
+                    </button>
+                    <button class="btn-decision btn-decision-auto" onclick="sendPromptChoice('a')" title="Adopt recommended recipes automatically for ALL remaining tracks">
+                        <span style="font-size: 0.92rem;">⚡ [A] Auto-Apply ALL Remaining</span>
+                        <span class="btn-decision-sub">Adopt recommendations unattended</span>
+                    </button>
+                    <button class="btn-decision btn-decision-skip" onclick="sendPromptChoice('s')" title="Skip this track and proceed to next">
+                        <span style="font-size: 0.92rem;">⏭️ [S] Skip This Track</span>
+                        <span class="btn-decision-sub">Skip file & move to next track</span>
+                    </button>
+                    <button class="btn-decision btn-decision-skip" onclick="sendPromptChoice('k')" title="Skip this track and ALL remaining in this album directory">
+                        <span style="font-size: 0.92rem;">⏹️ [K] Skip REST of Album</span>
+                        <span class="btn-decision-sub">Bypass remainder of album directory</span>
+                    </button>
+                    <button class="btn-decision" id="btnPromptViewSummary" onclick="openAlbumSummary()" style="background: rgba(0, 229, 255, 0.12); border: 1px solid rgba(0, 229, 255, 0.35); color: var(--accent-cyan);" title="View existing Album Analysis Summary">
+                        <span style="font-size: 0.92rem;">📋 [V] View Album Summary</span>
+                        <span class="btn-decision-sub">Read forensic album report</span>
+                    </button>
+                    <button class="btn-decision btn-decision-abort" onclick="sendPromptChoice('q')" style="grid-column: 1 / -1;" title="Abort the entire upsampling session">
+                        <span style="font-size: 0.92rem;">⛔ [Q] Abort Upsampling Session</span>
+                        <span class="btn-decision-sub">Gracefully terminate background process</span>
+                    </button>
+                </div>
+
             </div>
         </div>
     </div>
 
-    <!-- Floating Telemetry & Progress Drawer -->
-    <div id="upsampleJobDrawer" class="upsample-drawer" style="display: none;">
-        <div class="drawer-header">
-            <div style="display: flex; align-items: center; gap: 8px; min-width: 0;">
-                <span style="font-size: 0.95rem;">⚡</span>
-                <span id="drawerTitle" style="font-size: 0.85rem; font-weight: 700; color: var(--text-heading); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">AcoustiSinc DSP Studio</span>
-                <span id="drawerStatusBadge" class="brand-badge" style="background: rgba(0, 229, 255, 0.15); color: var(--accent-cyan);">RUNNING</span>
+    <!-- Live Console Log Viewer Modal -->
+    <div id="upsampleLogModal" class="modal-backdrop" style="display: none;" onclick="if(event.target===this) closeUpsampleLogModal()">
+        <div class="modal-content" style="max-width: 800px; height: 75vh;">
+            <div class="modal-header">
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="font-size: 1rem; font-weight: 700; color: var(--text-heading);">📜 AcoustiSinc DSP Terminal Output</span>
+                </div>
+                <button class="btn-bookmark" onclick="closeUpsampleLogModal()" style="font-size: 1.2rem; padding: 2px 10px; line-height: 1;">&times;</button>
             </div>
-            <div style="display: flex; align-items: center; gap: 6px; flex-shrink: 0;">
-                <button class="btn-bookmark" onclick="toggleUpsampleTerminal()" id="drawerConsoleToggleBtn" title="Toggle Live Console Output" style="padding: 2px 7px; font-size: 0.72rem;">📜 Logs</button>
-                <button class="btn-bookmark" onclick="toggleUpsampleDrawerMinimize()" title="Minimize / Expand" style="padding: 2px 7px; font-size: 0.72rem;">—</button>
-                <button class="btn-bookmark" onclick="dismissUpsampleDrawer()" title="Close Drawer" style="padding: 2px 7px; font-size: 0.72rem;">&times;</button>
+            <div class="modal-body" style="padding: 0; background: #0a0c10; display: flex; flex-direction: column;">
+                <div id="upsampleTerminalBox" style="flex: 1; overflow-y: auto; padding: 14px 18px; font-family: ui-monospace, SFMono-Regular, 'SF Mono', monospace; font-size: 0.74rem; color: #8b949e;">
+                    <div id="upsampleTerminalLogs" style="display: flex; flex-direction: column; gap: 3px;"></div>
+                </div>
             </div>
-        </div>
-        <div class="drawer-body">
-            <div style="display: flex; justify-content: space-between; align-items: center; font-size: 0.78rem;">
-                <span id="drawerStageText" style="color: var(--accent-cyan); font-weight: 600;">Initializing...</span>
-                <span id="drawerProgressText" style="font-weight: 700; color: var(--text-heading);">0%</span>
-            </div>
-            <div class="drawer-progress-track">
-                <div class="drawer-progress-fill running" id="drawerProgressFill"></div>
-            </div>
-            <div style="display: flex; justify-content: space-between; align-items: center; font-size: 0.74rem; color: var(--text-muted);">
-                <div id="drawerTrackText" style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 320px;">Preparing audio stream...</div>
-                <div id="drawerElapsedText">00:00</div>
-            </div>
-            <div style="display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px;">
-                <button class="btn-bookmark" id="drawerBtnReport" onclick="viewGeneratedReport()" style="display: none; background: rgba(0, 229, 255, 0.15); color: var(--accent-cyan); border-color: rgba(0, 229, 255, 0.4); font-size: 0.76rem; font-weight: 600; padding: 4px 10px;">📋 View Album Report</button>
-                <button class="btn-bookmark" id="drawerBtnDest" onclick="jumpToUpsampleDestination()" style="display: none; background: rgba(88, 166, 255, 0.15); color: var(--accent-blue); border-color: rgba(88, 166, 255, 0.4); font-size: 0.76rem; font-weight: 600; padding: 4px 10px;">📂 Open Destination</button>
-                <button class="btn-bookmark" id="drawerBtnCancel" onclick="cancelUpsampleJob()" style="background: rgba(255, 23, 68, 0.15); color: #ff5252; border-color: rgba(255, 23, 68, 0.4); font-size: 0.76rem; font-weight: 600; padding: 4px 10px;">⛔ Abort</button>
-            </div>
-        </div>
-        <div class="drawer-terminal-container" id="drawerTerminal" style="display: none;">
-            <div id="drawerTerminalLogs"></div>
         </div>
     </div>
 </body>
@@ -4026,12 +4770,50 @@ class ForensicWebHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(json.dumps(res).encode("utf-8"))
 
+        elif path == "/api/upsample/respond":
+            content_length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_length).decode('utf-8')
+            try:
+                resp = json.loads(body)
+            except Exception as e:
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"status": "error", "message": f"Invalid JSON body: {e}"}).encode("utf-8"))
+                return
+
+            res = upsample_job_mgr.send_response(resp)
+            self.send_response(200 if res.get("status") == "ok" else 400)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(res).encode("utf-8"))
+
         elif path == "/api/upsample/cancel":
             res = upsample_job_mgr.cancel_job()
             self.send_response(200 if res.get("status") == "ok" else 400)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(json.dumps(res).encode("utf-8"))
+
+        elif path == "/api/mkdir":
+            content_length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_length).decode('utf-8')
+            try:
+                req_data = json.loads(body)
+                dir_path = req_data.get("path", "").strip()
+                if not dir_path:
+                    raise ValueError("Path cannot be empty")
+                dir_path = os.path.abspath(os.path.expanduser(dir_path))
+                os.makedirs(dir_path, exist_ok=True)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"status": "ok", "created_path": dir_path}).encode("utf-8"))
+            except Exception as e:
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"status": "error", "message": str(e)}).encode("utf-8"))
 
         else:
             self.send_response(404)
