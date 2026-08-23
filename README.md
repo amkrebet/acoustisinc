@@ -16,15 +16,16 @@
 * **Dynamic Headroom Auto-Healing**: Pre-flight album headroom scanning with exact overshoot-calculated auto-healing guaranteeing zero intersample clipping.
 * **Forensic Authentication Engine**: Automated analysis identifying upsampled CD masters, brickwall filter cutoffs, zero-stuffing, and ultrasonic noise profiles.
 * **Audiophile Dynamic Range (DR) Scoring**: Official 64-bit Pleasurize Music Foundation (PMF) TT Dynamic Range Meter scoring alongside EBU R128 Loudness Range (LRA) and Integrated LUFS.
-* **Interactive Web Explorer**: A real-time browser application providing dynamic library navigation, live sub-second forensic spectral analysis, interactive spectrogram HUD with exact cursor dB level readouts, and in-browser lossless streaming.
+* **Interactive Web Explorer & Tile Studio**: A real-time browser application providing dynamic library navigation, live sub-second forensic spectral analysis, interactive spectrogram HUD with exact cursor dB level readouts, in-browser lossless streaming, and an interactive **Tile-Oriented DSP Studio** for visual recipe design.
+* **Decoupled Standalone Batch Engine**: Complete independence between the web UI and the high-throughput CLI batch upsampler (`upsampler.py`), allowing headless execution across thousands of albums via cron, systemd, or detached terminal sessions.
 
 ---
 
 ## 🚀 Quickstart Guide
 
-### 1. Launch the Interactive Web Explorer (`server.py`)
+### 1. Launch the Interactive Web Explorer & Tile Studio (`server.py`)
 
-Explore your library, inspect spectral provenance, and test DSP recommendations in real time:
+Explore your library, inspect spectral provenance, and interactively configure DSP upsampling recipes:
 
 ```bash
 # Start browsing from your music collection
@@ -33,31 +34,33 @@ python server.py --root "/Music/Hi-Res" --port 8765
 
 Open **`http://localhost:8765`** in your browser.
 
+* **Tile-Oriented DSP Studio**: Modular tactile cards for Target Rate multiplier, Minimum Phase vs Linear Phase A/B comparison, logarithmic cutoff frequency slider ($15\text{ kHz} \leftrightarrow 48\text{ kHz}$), quick snap chips (`20.7k ADC`, `21.5k Alias`, `22.05k CD Std`, `24k`, `44.1k`), transition steepness, 24-bit Shibata noise shaping, and MQA payload policies.
+* **Instant Recommendation Controls**: Dedicated `✨ [R] Apply Recommended Recipe` banner button and global `[R]` keyboard shortcut.
 * **Live Forensic Badges**: Instantly tags tracks as `Native Hi-Res Master`, `Upsampled from 44.1k`, `Leaky SRC Mirror`, `MQA Studio`, or `Fake 24-bit (Zero-Padded)`.
-* **Interactive FFT Spectrum & Spectrogram**: Pan/zoom with exact frequency and dBFS HUD crosshairs.
-* **Projected DSP Filter Curves**: Displays projected apodizing filter rolloff curves before committing DSP processing.
-* **In-Browser Lossless Streaming**: Stream high-resolution FLAC files directly to your browser or DAC.
+* **Interactive Spectrogram HUD**: Sub-second Blackman-Harris STFT analysis with real-time cursor frequency and dBFS crosshair readouts.
+* **Real-Time Telemetry Streaming**: Live progress percentage, per-track stage indicators, and scrolling console logs.
+* **In-Browser Lossless Streaming**: Stream high-resolution FLAC files directly to your browser or external USB DAC.
 
 ---
 
 ### 2. Run the GPU Sinc Upsampler (`upsampler.py`)
 
-Upsample individual tracks, album folders, or full libraries using manual parameters or automated forensic recipes:
+Upsample individual tracks, album folders, or entire library collections as a **standalone background batch job** or interactive CLI session:
 
 ```bash
-# 1. Automated Forensic Recipe (Silent auto-apply best-practice parameters)
-python upsampler.py "/Music/Hi-Res/Album" --use-recommended=auto
+# 1. Automated Forensic Batch (Audit & auto-apply optimal recipes across all albums, skipping existing)
+python upsampler.py "/Music/Hi-Res" "/Music/Hi-Res_Upsampled" --use-recommended=auto --overwrite=off
 
-# 2. Interactive Forensic Recipe (Audit and prompt before applying)
+# 2. Interactive Forensic Batch (Audit Track 1 and prompt for per-track or album-wide recipes)
 python upsampler.py "/Music/Hi-Res/Album" --use-recommended=ask
 
-# 3. Minimum-Phase Apodizing with Custom Cutoff (e.g. 20.7 kHz legacy ADC cleanup)
+# 3. Minimum-Phase Apodizing with Custom Cutoff (e.g. 20.7 kHz legacy ADC ringing cleanup)
 python upsampler.py "/Music/Hi-Res/Album" --cutoff 20700 --phase min --dither shibata
 
-# 4. Pure Minimum-Phase (Zero pre-ringing, full sinc bandwidth)
+# 4. Pure Minimum-Phase (Zero pre-ringing, full sinc Nyquist bandwidth)
 python upsampler.py "/Music/Hi-Res/Album" --phase min
 
-# 5. Pure Linear-Phase Sinc (Default: symmetric phase, bit-perfect passband up to Nyquist)
+# 5. Pure Linear-Phase Sinc (Default: strict 0° linear phase, bit-perfect passband)
 python upsampler.py "/Music/Hi-Res/Album"
 ```
 
@@ -67,25 +70,25 @@ python upsampler.py "/Music/Hi-Res/Album"
 
 | Parameter | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `source` | **Mandatory** | *(None)* | Path to a single audio track (`.flac`/`.wav`) or root directory containing albums. |
-| `target` *(or `-o`, `--output-dir`)* | *Optional* | `<source>_upsampled_<topology>` | Destination directory. Multi-tier safety guards strictly prevent overwriting originals. |
-| `--use-recommended` | *Optional* | `none` | Audits audio provenance and resolves DSP recipe: `auto` (silent apply) or `ask` (interactive prompt). |
-| `--overwrite` *(or `-f`, `--force`)* | *Optional* | `off` | Target output overwrite policy: `on` (silent overwrite), `off` (skip existing), or `ask` (interactive scoped prompt). |
-| `--cutoff`, `--apodize` | *Optional* | `None` | Sets custom low-pass reconstruction filter cutoff frequency in Hz (e.g. `20700`, `21500`, `22050`). |
-| `--steep` | *Optional* | `False` | Uses a steep transition band (500 Hz) instead of the standard 2 kHz cosine taper. |
-| `--phase` | *Optional* | `linear` | Filter phase mode: `linear` (symmetric) or `min` (causal, zero pre-ringing). |
-| `--apodizing`, `--apod` | *Optional* | `False` | Enables raised-cosine apodizing transition band to attenuate ADC ringing. |
+| `source` | **Mandatory** | *(None)* | Path to a single audio track (`.flac`/`.wav`) or root directory containing album folders. |
+| `target` *(or `-o`, `--output-dir`)* | *Optional* | `<source>_upsampled_<topology>` | Target destination directory. Multi-tier safety guards strictly prevent in-place overwrites. |
+| `--use-recommended`, `--use-rec` | *Optional* | `none` | Audits audio provenance and resolves DSP recipe: `auto` (silent apply), `ask` (interactive prompt), or `none`. |
+| `--overwrite`, `-f`, `--force` | *Optional* | `off` | Target output overwrite policy: `on` (silent overwrite), `off` (skip existing files), or `ask` (interactive prompt). |
+| `--cutoff`, `--apodize` | *Optional* | `None` | Custom low-pass reconstruction filter cutoff frequency in Hz (e.g. `20700`, `21500`, `22050`, `44100`). |
+| `--steep` | *Optional* | `False` | Uses a sharp transition band (500 Hz knee) instead of the standard 2 kHz cosine taper. |
+| `--phase` | *Optional* | `linear` | Filter phase mode: `linear` (symmetric) or `min` (causal, 0.00% pre-ringing). |
+| `--apodizing`, `--apod` | *Optional* | `False` | Enables raised-cosine apodizing transition band to attenuate pre-existing studio ADC ringing. |
 | `--dither` | *Optional* | `shibata` | 24-bit psychoacoustic noise shaping profile: `shibata`, `high_rate`, or `none`. |
-| `--no-dither` | *Optional* | `False` | Disables dither and noise shaping (raw truncation). |
-| `--mqa` | *Optional* | `adaptive` | MQA processing: `adaptive` (companded unfold), `strip` (strip LSB hash), `simple`, `ignore`. |
+| `--no-dither` | *Optional* | `False` | Disables dither and noise shaping (raw 64-bit float truncation). |
+| `--mqa` | *Optional* | `adaptive` | MQA processing: `adaptive` (companded high-fidelity unfold), `strip` (strip LSB hash and re-dither), `simple`, `ignore` (raw PCM). |
 | `--tmp-dir` | *Optional* | `/tmp/upsample_scratch` | Fast NVMe scratch directory for 64-bit memory-mapped buffers. |
 
 ---
 
 ### 📊 Comparative Before & After Reports
 Every upsampling run automatically generates self-contained comparative reports written directly to the target folder:
-* **`UPSAMPLING_REPORT.html`**: Interactive HTML5 report with side-by-side spectrograms, spectral energy distribution curves, and TT Dynamic Range meters.
-* **`UPSAMPLING_REPORT.md`**: Markdown summary table with track-by-track bit-depth, peak levels, and LUFS mastering receipts.
+* **`ALBUM_REPORT.html`** / **`UPSAMPLING_REPORT.html`**: Interactive HTML5 report with side-by-side spectrograms, spectral energy distribution curves, and TT Dynamic Range meters.
+* **`ALBUM_REPORT.md`** / **`UPSAMPLING_REPORT.md`**: Markdown summary table with track-by-track bit-depth, peak levels, and LUFS mastering receipts.
 
 ---
 
