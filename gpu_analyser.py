@@ -12,6 +12,8 @@ import numpy as np
 import scipy.signal as signal
 import librosa
 
+import threading
+
 logger = logging.getLogger("gpu_analyser")
 
 # Attempt PyOpenCL & PyVkFFT imports
@@ -91,6 +93,7 @@ class GPUForensicEngine:
         self.prg = None
         self.kernel = None
         self._cached_apps = {}
+        self._lock = threading.Lock()
 
         if not HAS_OPENCL:
             logger.info("OpenCL not present; initialized in CPU fallback mode.")
@@ -135,11 +138,17 @@ class GPUForensicEngine:
     def compute_stft_and_reductions(self, y: np.ndarray, sr: int, n_fft: int = 16384, hop_length: int = None):
         """
         Executes batched 64-bit STFT and 2D reduction on GPU with CPU fallback.
+        Thread-safe across multiple concurrent background workers.
         """
         if hop_length is None:
             hop_length = max(4096, len(y) // 2048)
 
         if not self.enabled:
+            return self._compute_cpu(y, sr, n_fft, hop_length)
+
+        # Non-blocking lock attempt: if another thread is using the GPU, smoothly compute on CPU
+        acquired = self._lock.acquire(blocking=False)
+        if not acquired:
             return self._compute_cpu(y, sr, n_fft, hop_length)
 
         try:
@@ -181,7 +190,8 @@ class GPUForensicEngine:
             app.fft(d_frames, d_stft)
 
             # 2. GPU Fused Reductions Kernel
-            self.kernel.set_args(
+            kernel = cl.Kernel(self.prg, "compute_spectral_reductions")
+            kernel.set_args(
                 d_stft.data,
                 d_spec_db.data,
                 d_peak_dbfs.data,
@@ -190,7 +200,7 @@ class GPUForensicEngine:
                 np.int32(n_bins),
                 inv_norm_half_s1
             )
-            cl.enqueue_nd_range_kernel(self.queue, self.kernel, (n_bins,), None)
+            cl.enqueue_nd_range_kernel(self.queue, kernel, (n_bins,), None)
             self.queue.finish()
 
             # Retrieve results from GPU
@@ -203,6 +213,8 @@ class GPUForensicEngine:
         except Exception as e:
             logger.warning(f"GPU STFT execution failed: {e}. Falling back to CPU.")
             return self._compute_cpu(y, sr, n_fft, hop_length)
+        finally:
+            self._lock.release()
 
     def _compute_cpu(self, y: np.ndarray, sr: int, n_fft: int = 16384, hop_length: int = None):
         import scipy.fft as sfft
