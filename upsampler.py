@@ -591,8 +591,8 @@ def is_memmap_necessary(orig_samples, scale_factor, num_channels):
     required_bytes = target_samples * num_channels * 8
     if HAS_PSUTIL:
         available_ram = psutil.virtual_memory().available
-        return required_bytes > (available_ram * 0.40)
-    return required_bytes > (4.5 * 1024 * 1024 * 1024)
+        return required_bytes > (available_ram * 0.25)
+    return required_bytes > (2.0 * 1024 * 1024 * 1024)
 
 def get_destination_dir(source_dir, root_source_dir, root_target_dir):
     """

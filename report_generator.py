@@ -15,9 +15,12 @@ import numpy as np
 import soundfile as sf
 from analyser import analyze_audio_forensics, encode_spectrogram_and_lookup, load_audio_resilient
 
+import gc
+
 def audit_track_pair(src_path, dst_path, applied_recipe=None, track_recipe=None):
     """
     Audits a single track before and after upsampling with per-track forensic recipe metadata.
+    Operates with lean memory management (immediate garbage collection between passes).
     """
     filename = os.path.basename(src_path)
     rec = track_recipe or applied_recipe or {}
@@ -37,6 +40,11 @@ def audit_track_pair(src_path, dst_path, applied_recipe=None, track_recipe=None)
     curve_pk_src = peak_src[::step_src].round(1).tolist()
     curve_rms_src = rms_src[::step_src].round(1).tolist()
 
+    src_knee = (prov_src.get("visual_morphology") or {}).get("primary_knee") or {}
+    src_verdict = prov_src.get("label", "Analyzed")
+    del data_src, spec_src
+    gc.collect()
+
     # 2. Analyze Target (After)
     try:
         data_dst, sr_dst = sf.read(dst_path, dtype='float64', always_2d=True)
@@ -52,6 +60,11 @@ def audit_track_pair(src_path, dst_path, applied_recipe=None, track_recipe=None)
     curve_pk_dst = peak_dst[::step_dst].round(1).tolist()
     curve_rms_dst = rms_dst[::step_dst].round(1).tolist()
 
+    dst_knee = (prov_dst.get("visual_morphology") or {}).get("primary_knee") or {}
+    dst_verdict = prov_dst.get("label", "Upsampled Master")
+    del data_dst, spec_dst
+    gc.collect()
+
     # File sizes
     sz_src = os.path.getsize(src_path) if os.path.exists(src_path) else 0
     sz_dst = os.path.getsize(dst_path) if os.path.exists(dst_path) else 0
@@ -60,9 +73,6 @@ def audit_track_pair(src_path, dst_path, applied_recipe=None, track_recipe=None)
     except Exception: src_info = type("Info", (), {"subtype": "PCM_16"})()
     try: dst_info = sf.info(dst_path)
     except Exception: dst_info = type("Info", (), {"subtype": "PCM_24"})()
-
-    src_knee = (prov_src.get("visual_morphology") or {}).get("primary_knee") or {}
-    dst_knee = (prov_dst.get("visual_morphology") or {}).get("primary_knee") or {}
 
     exec_date = rec.get("date", time.strftime('%Y-%m-%d %H:%M:%S'))
 
@@ -96,8 +106,8 @@ def audit_track_pair(src_path, dst_path, applied_recipe=None, track_recipe=None)
         "dst_lra": round(dr_dst.get("lra_lu", 0.0), 1),
         "src_crest": round(dr_src.get("crest_factor_db", 0.0), 1),
         "dst_crest": round(dr_dst.get("crest_factor_db", 0.0), 1),
-        "src_verdict": prov_src.get("label", "Analyzed"),
-        "dst_verdict": prov_dst.get("label", "Upsampled Master"),
+        "src_verdict": src_verdict,
+        "dst_verdict": dst_verdict,
         "src_webp": webp_src,
         "dst_webp": webp_dst,
         "src_curve": {"f": curve_f_src, "pk": curve_pk_src, "rms": curve_rms_src},
@@ -115,7 +125,7 @@ def get_report_audit_pool():
     global _REPORT_AUDIT_POOL
     with _REPORT_AUDIT_LOCK:
         if _REPORT_AUDIT_POOL is None or getattr(_REPORT_AUDIT_POOL, '_shutdown', False):
-            _REPORT_AUDIT_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ReportAuditor")
+            _REPORT_AUDIT_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ReportAuditor")
         return _REPORT_AUDIT_POOL
 
 
