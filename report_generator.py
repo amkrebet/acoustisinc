@@ -105,17 +105,82 @@ def audit_track_pair(src_path, dst_path, applied_recipe=None, track_recipe=None)
     }
 
 
+import threading
+from concurrent.futures import ThreadPoolExecutor
+
+_REPORT_AUDIT_POOL = None
+_REPORT_AUDIT_LOCK = threading.Lock()
+
+def get_report_audit_pool():
+    global _REPORT_AUDIT_POOL
+    with _REPORT_AUDIT_LOCK:
+        if _REPORT_AUDIT_POOL is None or getattr(_REPORT_AUDIT_POOL, '_shutdown', False):
+            _REPORT_AUDIT_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ReportAuditor")
+        return _REPORT_AUDIT_POOL
+
+
+def async_audit_and_write_single_report(src_path, dst_path, track_recipe, output_dir, writer_future=None):
+    """
+    Worker task executed concurrently in background to audit a track pair and write its individual report.
+    """
+    if writer_future is not None:
+        try:
+            writer_future.result()
+        except Exception as e:
+            print(f"   [Async Report Error on {os.path.basename(src_path)}]: {e}")
+            return None
+
+    if not src_path or not dst_path or not os.path.exists(src_path) or not os.path.exists(dst_path):
+        return None
+
+    filename = os.path.basename(src_path)
+    item = audit_track_pair(src_path, dst_path, track_recipe=track_recipe)
+
+    # Generate individual per-track report alongside the audio file
+    track_stem = os.path.splitext(os.path.basename(dst_path))[0]
+    track_html_path = os.path.join(output_dir, f"{track_stem}_report.html")
+    track_md_path = os.path.join(output_dir, f"{track_stem}_report.md")
+
+    write_single_track_html_report(track_html_path, item, track_recipe)
+    write_single_track_markdown_report(track_md_path, item, track_recipe)
+
+    return item
+
+
+def submit_track_report_audit(src_path, dst_path, track_recipe, output_dir, writer_future=None):
+    """
+    Submits a background task to audit a completed track pair and write its individual report.
+    """
+    pool = get_report_audit_pool()
+    return pool.submit(async_audit_and_write_single_report, src_path, dst_path, track_recipe, output_dir, writer_future)
+
+
 def generate_comparative_report(source_target_pairs, album_title, applied_recipe, output_dir):
     """
     Analyzes before and after audio files and writes:
       1. An individual <track_stem>_report.html and <track_stem>_report.md for every track with per-file recipes and source master paths.
       2. If multiple tracks, an aggregate ALBUM_REPORT.html and ALBUM_REPORT.md.
+    Supports both pre-computed audit dictionaries, async Future objects, and raw path pairs.
     """
     os.makedirs(output_dir, exist_ok=True)
     t0 = time.time()
     
     comparisons = []
     for pair in source_target_pairs:
+        # If this is already a completed Future
+        if hasattr(pair, "result"):
+            try:
+                item = pair.result()
+                if item: comparisons.append(item)
+            except Exception as e:
+                print(f"   [Report Warning] Async audit failed: {e}")
+            continue
+
+        if isinstance(pair, dict) and "src_webp" in pair:
+            # Already an audited item dict
+            comparisons.append(pair)
+            continue
+
         if isinstance(pair, dict):
             src_path = pair.get("src_path")
             dst_path = pair.get("dst_path")

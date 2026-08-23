@@ -38,7 +38,7 @@ from mutagen.flac import FLAC, Picture
 from concurrent.futures import ThreadPoolExecutor
 from provenance_engine import load_audio_resilient, probe_audio_info_resilient
 from analyser import analyze_audio_forensics
-from report_generator import generate_comparative_report
+from report_generator import generate_comparative_report, submit_track_report_audit
 
 try:
     import psutil
@@ -953,18 +953,27 @@ def process_album_folder(source_album_dir, dest_album_dir, queue, default_params
     processed_tracks = []
 
     while not album_success and retry_count <= max_retries:
+        pass_futures = []
+        pass_report_futures = []
         clipped_in_pass = False
         max_overshoot_peak = 0.0
-        pass_futures = []
         processed_tracks = []
 
         for idx, f in enumerate(files, 1):
+            if prompt_ctrl and prompt_ctrl.check_cancelled():
+                print("\n[AcoustiSinc] Processing cancelled by user.")
+                return
+
+            # Concurrently pre-audit next track in background while current track is prepared
+            if prompt_ctrl and idx < len(files):
+                prompt_ctrl.pre_audit_track(files[idx])
+
             dest_file = os.path.join(dest_album_dir, os.path.basename(f))
             if os.path.exists(dest_file):
                 if prompt_ctrl is not None and getattr(prompt_ctrl, 'mode', 'none') != 'ask':
                     should_overwrite = prompt_ctrl.resolve_overwrite(dest_file, f, idx, len(files))
                     if not should_overwrite:
-                        print(f"   [Skip] Output exists: {os.path.basename(f)} (use --overwrite to overwrite)")
+                        print(f"   [Skip] Output exists: {os.path.basename(f)} (skipping)")
                         continue
                 elif prompt_ctrl is None:
                     if overwrite_mode != 'on':
@@ -1014,6 +1023,11 @@ def process_album_folder(source_album_dir, dest_album_dir, queue, default_params
                 "dst_path": dest_file,
                 "recipe": t_recipe
             })
+
+            # Submit concurrent background report audit to overlap with subsequent tracks
+            rep_fut = submit_track_report_audit(f, dest_file, t_recipe, dest_album_dir, writer_future=fut)
+            pass_report_futures.append(rep_fut)
+
             if clipped:
                 clipped_in_pass = True
                 max_overshoot_peak = out_peak
@@ -1087,7 +1101,8 @@ def process_album_folder(source_album_dir, dest_album_dir, queue, default_params
             try:
                 if prompt_ctrl:
                     prompt_ctrl.on_stage_change("Generating Comparative Reports", alb_name, len(files), len(files), 92.0)
-                html_rep, md_rep = generate_comparative_report(valid_items, alb_name, applied_recipe, dest_album_dir)
+                report_inputs = pass_report_futures if pass_report_futures else valid_items
+                html_rep, md_rep = generate_comparative_report(report_inputs, alb_name, applied_recipe, dest_album_dir)
                 if html_rep:
                     report_file = html_rep
                     print(f"\n   📊 [Comparative Upsampling Report Generated]")
@@ -1123,6 +1138,8 @@ class BasePromptController:
         self.current_album_dir = None
         self.track_decisions = {}
         self.overwrite_decisions = {}
+        self.precomputed_audits = {}
+        self._pre_audit_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="PreAuditor")
 
     def log(self, text):
         print(text)
@@ -1132,6 +1149,53 @@ class BasePromptController:
 
     def check_cancelled(self):
         return False
+
+    def pre_audit_track(self, filepath):
+        """
+        Pre-audits the next track concurrently in the background so its recipe is ready before upsampling begins.
+        """
+        if not filepath or filepath in self.precomputed_audits or not os.path.exists(filepath):
+            return
+        def _task():
+            try:
+                res = self._audit_track(filepath, print_card=False)
+                self.precomputed_audits[filepath] = res
+            except Exception:
+                pass
+        self._pre_audit_executor.submit(_task)
+
+    def get_audited_track_info(self, filepath, print_card=False, track_idx=None, total_tracks=None):
+        """
+        Retrieves precomputed forensic audit if available, or computes on demand.
+        """
+        if filepath in self.precomputed_audits:
+            rec_params, rec_info, prov_info, sr = self.precomputed_audits[filepath]
+            if print_card:
+                self._print_audit_card(filepath, rec_info, prov_info, sr, track_idx, total_tracks)
+            return rec_params, rec_info, prov_info, sr
+        return self._audit_track(filepath, print_card=print_card, track_idx=track_idx, total_tracks=total_tracks)
+
+    def _print_audit_card(self, filepath, rec, prov_info, sr, track_idx=None, total_tracks=None):
+        primary = prov_info.get("primary", {})
+        label = primary.get("label", "Standard Master")
+        vis = prov_info.get("visual_morphology", {})
+        pk = vis.get("primary_knee", {})
+        purity = vis.get("stopband_purity", {})
+        track_str = f" [Track {track_idx}/{total_tracks}]" if track_idx and total_tracks else ""
+        self.log(f"\n================================================================================")
+        self.log(f"🔬 FORENSIC AUDIT{track_str}: {os.path.basename(filepath)}")
+        self.log(f"================================================================================")
+        self.log(f"   Source Format   : {sr/1000.0:.1f} kHz (2 ch)")
+        self.log(f"   Provenance      : {label} [{primary.get('confidence', 'High')} Confidence]")
+        if pk and pk.get("is_brickwall_knee"):
+            self.log(f"   Primary Knee    : {pk.get('freq_khz', 0):.1f} kHz (Slope: {pk.get('steepest_slope_db_per_khz', 0):.1f} dB/kHz | Drop: {pk.get('drop_db', 0):.1f} dB)")
+        if purity and purity.get("has_stopband"):
+            self.log(f"   Stopband State  : {purity.get('purity_label', 'Clean')} ({purity.get('description', '')})")
+        if rec:
+            self.log(f"   Recommended Action: {rec.get('action', 'Direct Sinc Upsampling')}")
+            self.log(f"   Recommended DSP   : {rec.get('dsp_params', '--phase min --dither shibata')}")
+            if rec.get('details'):
+                self.log(f"   Technical Rationale: {rec.get('details')}")
 
     def set_album_context(self, album_dir):
         """
@@ -1330,7 +1394,7 @@ class TerminalPromptController(BasePromptController):
             return base_params, False
 
         if self.mode == 'auto':
-            rec_params, rec_info, _, _ = self._audit_track(filepath, print_card=False)
+            rec_params, rec_info, _, _ = self.get_audited_track_info(filepath, print_card=False)
             dsp_str = rec_info.get("dsp_params", "--phase min --dither shibata")
             print(f">>> [Auto-Recommended] {os.path.basename(filepath)} -> {dsp_str}")
             self.track_decisions[filepath] = rec_params
@@ -1339,7 +1403,7 @@ class TerminalPromptController(BasePromptController):
         if self.skip_album:
             return None, 'album'
 
-        rec_params, rec_info, prov_info, sr = self._audit_track(filepath, print_card=True, track_idx=track_idx, total_tracks=total_tracks)
+        rec_params, rec_info, prov_info, sr = self.get_audited_track_info(filepath, print_card=True, track_idx=track_idx, total_tracks=total_tracks)
         dsp_str = rec_info.get("dsp_params", "--phase min --dither shibata")
 
         album_dir = self.current_album_dir or os.path.dirname(filepath)
@@ -1502,7 +1566,7 @@ class WebPromptController(BasePromptController):
             return base_params, False
 
         if self.mode == 'auto':
-            rec_params, rec_info, _, _ = self._audit_track(filepath, print_card=False)
+            rec_params, rec_info, _, _ = self.get_audited_track_info(filepath, print_card=False)
             dsp_str = rec_info.get("dsp_params", "--phase min --dither shibata")
             self.log(f">>> [Auto-Recommended] {os.path.basename(filepath)} -> {dsp_str}")
             self.track_decisions[filepath] = rec_params
@@ -1513,7 +1577,7 @@ class WebPromptController(BasePromptController):
 
         # Mode 'ask': Audit and present interactive modal to the Web UI
         self.on_stage_change(f"Auditing [{track_idx}/{total_tracks}]", os.path.basename(filepath), track_idx, total_tracks, 5.0 + (track_idx / max(1, total_tracks)) * 80.0)
-        rec_params, rec_info, prov_info, sr = self._audit_track(filepath, print_card=True, track_idx=track_idx, total_tracks=total_tracks)
+        rec_params, rec_info, prov_info, sr = self.get_audited_track_info(filepath, print_card=True, track_idx=track_idx, total_tracks=total_tracks)
         dsp_str = rec_info.get("dsp_params", "--phase min --dither shibata")
 
         album_dir = self.current_album_dir or os.path.dirname(filepath)
