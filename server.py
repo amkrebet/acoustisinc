@@ -38,6 +38,7 @@ import numpy as np
 from analyser import analyze_audio_forensics, encode_spectrogram_and_lookup
 from provenance_engine import load_audio_resilient, probe_audio_info_resilient
 from gpu_analyser import gpu_engine, analyze_audio_forensics_accelerated
+from upsampler import run_upsample_job, WebPromptController
 
 
 # Default root directory for initial browsing
@@ -344,12 +345,12 @@ def derive_default_destination_dir(source_path):
 
 class UpsampleJobManager:
     """
-    Manages asynchronous background upsampling subprocess jobs with real-time log streaming,
-    progress parsing, stage tracking, and safe process group cancellation.
+    Manages in-process asynchronous background upsampling sessions using shared
+    AcoustiSinc DSP and reporting libraries with real-time stage tracking and direct thread synchronization.
     """
     def __init__(self):
         self.lock = threading.Lock()
-        self.status = "idle"  # idle, running, completed, failed, cancelled
+        self.status = "idle"  # idle, running, waiting_for_input, completed, failed, cancelled
         self.job_id = None
         self.mode = "album"  # track, album
         self.src_path = None
@@ -362,15 +363,53 @@ class UpsampleJobManager:
         self.log_lines = []  # list of dict: {"time": "HH:MM:SS", "text": "...", "idx": n}
         self.error_message = ""
         self.report_path = None
-        self.proc = None
         self.prompt_data = None
         self.start_time = 0
         self.end_time = 0
+        self.controller = None
+        self.thread = None
+        self._line_counter = 0
+
+    def append_log(self, text):
+        with self.lock:
+            self._line_counter += 1
+            t_str = time.strftime("%H:%M:%S")
+            self.log_lines.append({"time": t_str, "text": text, "idx": self._line_counter})
+            if len(self.log_lines) > 2500:
+                self.log_lines.pop(0)
+
+    def set_stage(self, stage, track_name="", track_idx=0, total_tracks=0, progress_pct=0.0):
+        with self.lock:
+            self.stage = stage
+            if track_name:
+                self.current_track = track_name
+            if track_idx > 0:
+                self.track_index = track_idx
+            if total_tracks > 0:
+                self.total_tracks = total_tracks
+            if progress_pct > 0:
+                self.progress_percent = round(progress_pct, 1)
+
+    def set_waiting_prompt(self, prompt_data):
+        with self.lock:
+            self.status = "waiting_for_input"
+            self.prompt_data = prompt_data
+            self.current_track = prompt_data.get("track_file", self.current_track)
+            self.track_index = prompt_data.get("track_idx", self.track_index)
+            self.total_tracks = prompt_data.get("total_tracks", self.total_tracks)
+            self.stage = f"Awaiting Input [{self.track_index}/{self.total_tracks}]"
+
+    def is_cancelled(self):
+        with self.lock:
+            return self.status == "cancelled"
 
     def start_job(self, config):
         with self.lock:
             if self.status in ["running", "waiting_for_input"]:
-                return {"status": "error", "message": "An upsampling job is already running."}
+                if self.thread and self.thread.is_alive():
+                    return {"status": "error", "message": "An upsampling job is already in progress. Please wait for it to finish or click Abort."}
+                else:
+                    self.status = "idle"
 
             src_path = config.get("source_path", "").strip()
             if not src_path or not os.path.exists(src_path):
@@ -384,60 +423,46 @@ class UpsampleJobManager:
             if not dst_dir:
                 dst_dir = derive_default_destination_dir(self.src_path)
             self.dst_dir = os.path.abspath(dst_dir)
+
             try:
                 os.makedirs(self.dst_dir, exist_ok=True)
             except Exception as e:
                 return {"status": "error", "message": f"Failed to create target directory: {e}"}
 
-            cmd = [
-                sys.executable, "-u", "/home/amkrebet/upsample/upsampler.py",
-                self.src_path,
-                "-o", self.dst_dir
-            ]
-
-            rate = config.get("rate")
-            if rate and str(rate).lower() not in ["4x", "auto", "default"]:
-                cmd.extend(["-r", str(rate)])
-
             phase = config.get("phase", "min")
-            if phase in ["min", "linear"]:
-                cmd.extend(["--phase", phase])
+            if phase not in ["min", "linear"]: phase = "min"
 
             cutoff = config.get("cutoff_hz")
+            cutoff_val = None
             if cutoff:
                 try:
                     c_val = float(cutoff)
-                    if c_val > 0:
-                        cmd.extend(["--cutoff", str(int(c_val))])
+                    if c_val > 0: cutoff_val = c_val
                 except (ValueError, TypeError):
                     pass
-            elif config.get("apodizing"):
-                cmd.append("--apodizing")
-
-            if config.get("steep"):
-                cmd.append("--steep")
 
             dither = config.get("dither", "shibata")
-            if dither == "none":
-                cmd.append("--no-dither")
-            elif dither in ["shibata", "high_rate"]:
-                cmd.extend(["--dither", dither])
+            if dither not in ["shibata", "high_rate", "none"]: dither = "shibata"
 
             mqa = config.get("mqa", "adaptive")
-            if mqa in ["adaptive", "simple", "strip", "ignore"]:
-                cmd.extend(["--mqa", mqa])
+            if mqa not in ["adaptive", "simple", "strip", "ignore"]: mqa = "adaptive"
 
-            overwrite = config.get("overwrite", "on")
-            cmd.extend(["--overwrite", "on" if str(overwrite).lower() in ["on", "true", "1"] else "off"])
+            overwrite_str = str(config.get("overwrite", "on")).lower()
+            overwrite_mode = "on" if overwrite_str in ["on", "true", "1"] else "off"
 
-            # Interactive mode by default so user can review/edit/skip per batch upsampler
             interactive = config.get("interactive", True)
-            if interactive:
-                cmd.extend(["--use-recommended", "ask"])
-            elif config.get("use_recommended"):
-                cmd.extend(["--use-recommended", "auto"])
+            controller_mode = "ask" if interactive else ("auto" if config.get("use_recommended") else "none")
 
-            # Count total tracks if album
+            default_params = {
+                "phase_mode": phase,
+                "dither_mode": dither,
+                "apodizing": bool(config.get("apodizing") or cutoff_val),
+                "mqa_mode": mqa,
+                "cutoff_hz": cutoff_val,
+                "steep": bool(config.get("steep")),
+                "overwrite_mode": overwrite_mode
+            }
+
             if is_file:
                 total_t = 1
             else:
@@ -448,35 +473,27 @@ class UpsampleJobManager:
 
             self.status = "running"
             self.job_id = f"job_{int(time.time())}"
-            self.current_track = os.path.basename(self.src_path) if is_file else "Scanning Album..."
+            self.current_track = os.path.basename(self.src_path) if is_file else "Preparing Album Scan..."
             self.track_index = 0
             self.total_tracks = max(1, total_t)
             self.progress_percent = 2.0
             self.stage = "Initializing"
             self.log_lines = []
+            self._line_counter = 0
             self.error_message = ""
             self.report_path = None
             self.prompt_data = None
             self.start_time = time.time()
             self.end_time = 0
 
-            try:
-                self.proc = subprocess.Popen(
-                    cmd,
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    bufsize=1,
-                    preexec_fn=os.setsid
-                )
-            except Exception as e:
-                self.status = "failed"
-                self.error_message = f"Failed to spawn upsampler: {e}"
-                return {"status": "error", "message": self.error_message}
+            self.controller = WebPromptController(self, mode=controller_mode, overwrite_mode=overwrite_mode, default_params=default_params)
 
-            t = threading.Thread(target=self._worker_reader, args=(self.proc, self.job_id), daemon=True)
-            t.start()
+            self.thread = threading.Thread(
+                target=self._run_job_thread,
+                args=(self.src_path, self.dst_dir, default_params, overwrite_mode, self.controller, self.job_id),
+                daemon=True
+            )
+            self.thread.start()
 
             return {
                 "status": "ok",
@@ -484,141 +501,66 @@ class UpsampleJobManager:
                 "mode": self.mode,
                 "src_path": self.src_path,
                 "dst_dir": self.dst_dir,
-                "total_tracks": self.total_tracks,
-                "cmd": " ".join(cmd)
+                "total_tracks": self.total_tracks
             }
 
-    def _worker_reader(self, proc, job_id):
-        import re
-        line_idx = 0
-        while True:
-            line = proc.stdout.readline()
-            if not line:
-                if proc.poll() is not None:
-                    break
-                time.sleep(0.02)
-                continue
-
-            clean_line = line.rstrip("\r\n")
-            t_str = time.strftime("%H:%M:%S")
-            line_idx += 1
-
+    def _run_job_thread(self, src_path, dst_dir, default_params, overwrite_mode, controller, job_id):
+        try:
+            res = run_upsample_job(
+                source_path=src_path,
+                target_dir=dst_dir,
+                default_params=default_params,
+                overwrite_mode=overwrite_mode,
+                prompt_ctrl=controller
+            )
             with self.lock:
                 if self.job_id != job_id:
-                    break
-
-                self.log_lines.append({"time": t_str, "text": clean_line, "idx": line_idx})
-                if len(self.log_lines) > 2000:
-                    self.log_lines.pop(0)
-
-                # Check for interactive prompt from upsampler
-                if clean_line.startswith("__PROMPT_JSON__:"):
-                    try:
-                        p_data = json.loads(clean_line[len("__PROMPT_JSON__:"):])
-                        self.status = "waiting_for_input"
-                        self.prompt_data = p_data
-                        self.current_track = p_data.get("track_file", self.current_track)
-                        self.track_index = p_data.get("track_idx", self.track_index)
-                        self.total_tracks = p_data.get("total_tracks", self.total_tracks)
-                        self.stage = f"Awaiting Input [{self.track_index}/{self.total_tracks}]"
-                    except Exception:
-                        pass
-
-                # Parse status indicators
-                if "Scanning" in clean_line and "headroom" in clean_line.lower():
-                    self.stage = "Analyzing Headroom"
-                    self.progress_percent = max(self.progress_percent, 5.0)
-
-                m_trk = re.search(r'\[(\d+)/(\d+)\]\s+(?:Processing track:\s+)?(.+)', clean_line)
-                if m_trk:
-                    cur_idx = int(m_trk.group(1))
-                    tot_idx = int(m_trk.group(2))
-                    trk_name = os.path.basename(m_trk.group(3).strip())
-                    self.track_index = cur_idx
-                    self.total_tracks = tot_idx
-                    self.current_track = trk_name
-                    self.stage = f"Resampling [{cur_idx}/{tot_idx}] (64-bit Sinc)"
-                    pct = 10.0 + ((cur_idx - 1) / max(1, tot_idx)) * 75.0
-                    self.progress_percent = max(self.progress_percent, round(pct, 1))
-
-                if "Tagging" in clean_line or "ReplayGain" in clean_line:
-                    self.stage = "Tagging & ReplayGain"
-                    self.progress_percent = max(self.progress_percent, 85.0)
-
-                if "[Report Analysis]" in clean_line or "Auditing Before/After" in clean_line:
-                    self.stage = "Auditing Spectrograms & Reports"
-                    self.progress_percent = max(self.progress_percent, 90.0)
-
-                m_rep = re.search(r'HTML:\s*([^\s)]+)', clean_line)
-                if m_rep:
-                    rep_candidate = m_rep.group(1).strip()
-                    if os.path.exists(rep_candidate):
-                        self.report_path = rep_candidate
-
-                if "Completed" in clean_line and "ALBUM_REPORT.html" in clean_line:
-                    self.stage = "Finalizing Reports"
-                    self.progress_percent = 98.0
-
-        return_code = proc.wait()
-        with self.lock:
-            if self.job_id != job_id:
-                return
-
-            self.end_time = time.time()
-            self.prompt_data = None
-            if self.status == "cancelled":
-                self.stage = "Cancelled"
-            elif return_code == 0:
-                self.status = "completed"
-                self.progress_percent = 100.0
-                self.stage = "Finished Successfully"
-                # Discover report path if not parsed
-                if not self.report_path:
-                    alb_rep = os.path.join(self.dst_dir, "ALBUM_REPORT.html")
-                    if os.path.exists(alb_rep):
-                        self.report_path = alb_rep
-                    elif self.mode == "track":
-                        stem = os.path.splitext(os.path.basename(self.src_path))[0]
-                        trk_rep = os.path.join(self.dst_dir, f"{stem}_report.html")
-                        if os.path.exists(trk_rep):
-                            self.report_path = trk_rep
-            else:
-                self.status = "failed"
-                self.stage = "Failed"
-                self.error_message = f"Process exited with non-zero status code {return_code}"
+                    return
+                self.end_time = time.time()
+                self.prompt_data = None
+                if self.status == "cancelled":
+                    self.stage = "Cancelled"
+                elif res.get("status") == "error":
+                    self.status = "failed"
+                    self.stage = "Failed"
+                    self.error_message = res.get("message", "Processing error")
+                else:
+                    self.status = "completed"
+                    self.progress_percent = 100.0
+                    self.stage = "Finished Successfully"
+                    if res.get("report_path"):
+                        self.report_path = res["report_path"]
+                    else:
+                        alb_rep = os.path.join(self.dst_dir, "ALBUM_REPORT.html")
+                        if os.path.exists(alb_rep):
+                            self.report_path = alb_rep
+        except Exception as e:
+            with self.lock:
+                if self.job_id == job_id:
+                    self.status = "failed"
+                    self.stage = "Failed"
+                    self.error_message = str(e)
+                    self.end_time = time.time()
+                    self.append_log(f"[Fatal Exception]: {e}")
 
     def send_response(self, resp_dict):
         with self.lock:
-            if self.status != "waiting_for_input" or not self.proc or not self.proc.stdin:
+            if self.status != "waiting_for_input" or not self.controller:
                 return {"status": "error", "message": "No job is currently waiting for input."}
-            try:
-                line = f"__RESP_JSON__:{json.dumps(resp_dict)}\n"
-                self.proc.stdin.write(line)
-                self.proc.stdin.flush()
-                self.status = "running"
-                self.prompt_data = None
-                self.stage = f"Resampling [{self.track_index}/{self.total_tracks}] (64-bit Sinc)"
-                return {"status": "ok"}
-            except Exception as e:
-                return {"status": "error", "message": f"Failed to send response to upsampler: {e}"}
+            self.status = "running"
+            self.prompt_data = None
+            self.stage = f"Resampling [{self.track_index}/{self.total_tracks}] (64-bit Sinc)"
+            self.controller.receive_web_response(resp_dict)
+            return {"status": "ok"}
 
     def cancel_job(self):
         with self.lock:
-            if self.proc is not None:
-                try:
-                    os.killpg(os.getpgid(self.proc.pid), signal.SIGTERM)
-                except Exception:
-                    pass
-                try:
-                    self.proc.terminate()
-                except Exception:
-                    pass
-            self.status = "idle"
-            self.proc = None
-            self.stage = "Idle"
-            self.prompt_data = None
+            self.status = "cancelled"
+            self.stage = "Cancelling..."
+            if self.controller:
+                self.controller.receive_web_response({"choice": "q"})
             self.end_time = time.time()
-            return {"status": "ok", "message": "Job aborted successfully."}
+            return {"status": "ok", "message": "Job cancellation requested."}
 
     def get_status(self, since_idx=0):
         with self.lock:
@@ -825,12 +767,18 @@ def analyze_file_on_demand(filepath, rules_path=None, force_fresh=True):
             if line.startswith("NOISE PROFILE:"):
                 noise_profile = line.replace("NOISE PROFILE:", "").strip().strip("[]")
 
+        # Normalised reference frequency limit for aligned visual scaling across 44.1k/48k originals and upsampled 176.4k/192k
+        base_family = 44100 if (sr % 44100 == 0 or (sr % 11025 == 0 and sr % 48000 != 0)) else 48000
+        target_4x_nyquist_khz = (base_family * 4.0 / 2.0) / 1000.0  # 88.2 kHz for 44.1k family, 96.0 kHz for 48k family
+        normalised_max_khz = max(nyquist / 1000.0, target_4x_nyquist_khz)
+
         result = {
             "status": "ok",
             "filename": os.path.basename(filepath),
             "filepath": filepath,
             "sr": sr,
             "nyquist_khz": nyquist / 1000.0,
+            "normalised_max_khz": normalised_max_khz,
             "duration_s": duration_s,
             "verdict": verdict,
             "provenance": provenance_info,
@@ -1515,6 +1463,9 @@ HTML_PAGE = """<!DOCTYPE html>
             border: 1px solid #30363d;
         }
         .markdown-rendered li {
+            margin-bottom: 4px;
+        }
+
         /* Upsample Studio Modal & Spacious Form Styles */
         .modal-upsample-dialog {
             max-width: 900px;
@@ -1676,11 +1627,217 @@ HTML_PAGE = """<!DOCTYPE html>
             color: var(--accent-cyan);
             font-weight: 600;
         }
+        .cutoff-chip-group {
+            display: flex;
+            gap: 5px;
+            flex-wrap: wrap;
+            margin-top: 4px;
+        }
+        .cutoff-chip {
+            background: #161b22;
+            border: 1px solid #30363d;
+            color: var(--text-muted);
+            padding: 3px 8px;
+            font-size: 0.72rem;
+            font-weight: 500;
+            border-radius: 5px;
+            cursor: pointer;
+            transition: all 0.15s ease;
+            user-select: none;
+        }
+        .cutoff-chip:hover {
+            border-color: var(--accent-cyan);
+            color: var(--accent-cyan);
+            background: rgba(0, 229, 255, 0.08);
+        }
+        .cutoff-chip.active {
+            background: rgba(0, 229, 255, 0.15);
+            border-color: var(--accent-cyan);
+            color: var(--accent-cyan);
+            font-weight: 600;
+        }
+
+        /* Tile-Oriented DSP Studio Grid & Control Styles */
+        .dsp-tile-card {
+            background: #1c2128;
+            border: 1px solid #373e47;
+            border-radius: 10px;
+            padding: 14px 16px;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            box-shadow: 0 4px 16px rgba(0, 0, 0, 0.45);
+            transition: all 0.2s ease;
+        }
+        .dsp-tile-card:hover {
+            border-color: rgba(0, 229, 255, 0.45);
+            box-shadow: 0 6px 22px rgba(0, 0, 0, 0.6), 0 0 1px rgba(0, 229, 255, 0.25);
+        }
+        .dsp-tile-header {
+            font-size: 0.76rem;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.6px;
+            color: var(--accent-cyan);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            border-bottom: 1px solid rgba(48, 54, 61, 0.6);
+            padding-bottom: 6px;
+        }
+        .tile-segmented-grid {
+            display: grid;
+            gap: 6px;
+        }
+        .tile-segmented-grid.cols-2 {
+            grid-template-columns: 1fr 1fr;
+        }
+        .tile-segmented-grid.cols-3 {
+            grid-template-columns: 1fr 1fr 1fr;
+        }
+        .tile-segmented-grid.cols-4 {
+            grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+        }
+        .tile-option-btn {
+            background: #11161f;
+            border: 1px solid #333a45;
+            border-radius: 6px;
+            padding: 8px 10px;
+            cursor: pointer;
+            display: flex;
+            flex-direction: column;
+            gap: 3px;
+            transition: all 0.15s ease;
+            user-select: none;
+            text-align: left;
+            position: relative;
+        }
+        .tile-option-btn:hover {
+            border-color: rgba(0, 229, 255, 0.6);
+            background: rgba(0, 229, 255, 0.07);
+        }
+        .tile-option-btn.active {
+            border-color: var(--accent-cyan);
+            background: rgba(0, 229, 255, 0.15);
+            box-shadow: 0 0 10px rgba(0, 229, 255, 0.25), inset 0 0 0 1px var(--accent-cyan);
+        }
+        .tile-option-btn.active::after {
+            content: "✓";
+            position: absolute;
+            top: 6px;
+            right: 8px;
+            font-size: 0.72rem;
+            color: var(--accent-cyan);
+            font-weight: 900;
+        }
+        .tile-option-title {
+            font-size: 0.80rem;
+            font-weight: 700;
+            color: var(--text-heading);
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .tile-option-btn.active .tile-option-title {
+            color: var(--accent-cyan);
+        }
+        .tile-option-sub {
+            font-size: 0.68rem;
+            color: var(--text-muted);
+            line-height: 1.25;
+        }
+        .phase-ab-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 8px;
+        }
+        .phase-card-option {
+            background: #11161f;
+            border: 1px solid #333a45;
+            border-radius: 6px;
+            padding: 8px 10px;
+            cursor: pointer;
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+            transition: all 0.15s ease;
+            user-select: none;
+            position: relative;
+        }
+        .phase-card-option:hover {
+            border-color: var(--accent-cyan);
+            background: rgba(0, 229, 255, 0.07);
+        }
+        .phase-card-option.active {
+            border-color: var(--accent-cyan);
+            background: rgba(0, 229, 255, 0.15);
+            box-shadow: 0 0 10px rgba(0, 229, 255, 0.25), inset 0 0 0 1px var(--accent-cyan);
+        }
+        .phase-card-option.active::after {
+            content: "✓";
+            position: absolute;
+            top: 6px;
+            right: 8px;
+            font-size: 0.72rem;
+            color: var(--accent-cyan);
+            font-weight: 900;
+        }
+        .phase-card-title {
+            font-size: 0.80rem;
+            font-weight: 700;
+            color: var(--text-heading);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+        .phase-card-sub {
+            font-size: 0.68rem;
+            color: var(--text-muted);
+            line-height: 1.3;
+        }
+        .cutoff-slider-row {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            margin-top: 2px;
+        }
+        .cutoff-slider {
+            flex: 1;
+            -webkit-appearance: none;
+            appearance: none;
+            height: 6px;
+            border-radius: 3px;
+            background: #21262d;
+            outline: none;
+            cursor: pointer;
+        }
+        .cutoff-slider::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            appearance: none;
+            width: 18px;
+            height: 18px;
+            border-radius: 50%;
+            background: var(--accent-cyan);
+            cursor: pointer;
+            box-shadow: 0 0 8px rgba(0, 229, 255, 0.6);
+            transition: transform 0.1s ease;
+        }
+        .cutoff-slider::-webkit-slider-thumb:hover {
+            transform: scale(1.2);
+        }
+        .cutoff-slider::-moz-range-thumb {
+            width: 18px;
+            height: 18px;
+            border-radius: 50%;
+            background: var(--accent-cyan);
+            cursor: pointer;
+            box-shadow: 0 0 8px rgba(0, 229, 255, 0.6);
+        }
 
         /* Interactive Decision Prompt & UI Styles */
         .prompt-audit-card {
-            background: rgba(22, 27, 34, 0.98);
-            border: 1px solid #30363d;
+            background: #1c2128;
+            border: 1px solid #373e47;
             border-left: 5px solid var(--accent-cyan);
             border-radius: 8px;
             padding: 14px 18px;
@@ -1757,6 +1914,42 @@ HTML_PAGE = """<!DOCTYPE html>
         .btn-decision-abort:hover {
             background: rgba(255, 23, 68, 0.28);
         }
+        .zoom-btn-group {
+            display: inline-flex;
+            align-items: center;
+            background: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 6px;
+            overflow: hidden;
+        }
+        .zoom-axis-label {
+            font-size: 0.70rem;
+            font-weight: 700;
+            color: var(--text-muted);
+            padding: 3px 6px;
+            background: rgba(255, 255, 255, 0.03);
+            border-right: 1px solid #30363d;
+            text-transform: uppercase;
+            letter-spacing: 0.3px;
+        }
+        .btn-zoom {
+            background: transparent;
+            border: none;
+            color: var(--text);
+            padding: 3px 8px;
+            font-size: 0.85rem;
+            font-weight: 700;
+            cursor: pointer;
+            line-height: 1;
+            transition: all 0.12s;
+        }
+        .btn-zoom:hover {
+            background: rgba(0, 229, 255, 0.2);
+            color: var(--accent-cyan);
+        }
+        .btn-zoom:active {
+            background: rgba(0, 229, 255, 0.4);
+        }
         .folder-picker-item {
             display: flex;
             align-items: center;
@@ -1788,6 +1981,258 @@ HTML_PAGE = """<!DOCTYPE html>
             color: #ff5252;
             font-weight: 600;
         }
+
+        /* AcoustiSinc Header Status & Hover Dropdown Telemetry */
+        .header-upsample-container {
+            position: relative;
+            display: inline-flex;
+            align-items: center;
+        }
+        .header-upsample-widget {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            background: #11141a;
+            border: 1px solid rgba(0, 229, 255, 0.35);
+            border-radius: 6px;
+            padding: 3px 10px;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            user-select: none;
+        }
+        .header-upsample-widget:hover,
+        .header-upsample-container:hover .header-upsample-widget,
+        .header-upsample-container.is-open .header-upsample-widget {
+            border-color: var(--accent-cyan);
+            background: #161b22;
+            box-shadow: 0 0 12px rgba(0, 229, 255, 0.25);
+        }
+        .upsample-status-dot {
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--accent-cyan);
+            box-shadow: 0 0 8px var(--accent-cyan);
+            flex-shrink: 0;
+        }
+        .upsample-status-title {
+            font-size: 0.76rem;
+            font-weight: 600;
+            color: var(--text-heading);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            line-height: 1.2;
+        }
+        .upsample-mini-bar {
+            width: 50px;
+            height: 5px;
+            background: #0d1117;
+            border-radius: 3px;
+            overflow: hidden;
+            border: 1px solid #30363d;
+            flex-shrink: 0;
+        }
+        .upsample-mini-fill {
+            height: 100%;
+            width: 0%;
+            background: linear-gradient(90deg, #00e5ff, #00e676);
+            transition: width 0.3s ease;
+        }
+        .upsample-popover-card {
+            position: absolute;
+            top: calc(100% + 6px);
+            right: 0;
+            width: 380px;
+            max-width: 90vw;
+            background: rgba(13, 17, 23, 0.97);
+            backdrop-filter: blur(16px);
+            -webkit-backdrop-filter: blur(16px);
+            border: 1px solid rgba(0, 229, 255, 0.35);
+            border-radius: 8px;
+            box-shadow: 0 16px 40px rgba(0, 0, 0, 0.85), 0 0 1px rgba(0, 229, 255, 0.5);
+            z-index: 10000;
+            display: none;
+            flex-direction: column;
+            overflow: hidden;
+            animation: popover-fade 0.18s ease-out;
+        }
+        @keyframes popover-fade {
+            from { opacity: 0; transform: translateY(-4px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        .header-upsample-container:hover .upsample-popover-card,
+        .header-upsample-container.is-open .upsample-popover-card {
+            display: flex;
+        }
+        .popover-header {
+            padding: 10px 14px;
+            background: #161b22;
+            border-bottom: 1px solid #30363d;
+        }
+        .popover-progress-row {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-top: 6px;
+        }
+        .popover-progress-bar {
+            flex: 1;
+            height: 6px;
+            background: #0d1117;
+            border-radius: 3px;
+            overflow: hidden;
+            border: 1px solid #30363d;
+        }
+        .popover-progress-fill {
+            height: 100%;
+            width: 0%;
+            background: linear-gradient(90deg, #00e5ff, #00e676);
+            transition: width 0.3s ease;
+        }
+        .popover-body {
+            padding: 8px 12px;
+            max-height: 240px;
+            overflow-y: auto;
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+            background: #0a0c10;
+        }
+        .popover-stream-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-size: 0.70rem;
+            font-weight: 700;
+            color: var(--text-muted);
+            letter-spacing: 0.5px;
+            padding: 2px 2px 4px 2px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+            margin-bottom: 4px;
+        }
+        .popover-events-list {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+        .telemetry-event {
+            display: flex;
+            align-items: flex-start;
+            gap: 8px;
+            padding: 5px 8px;
+            border-radius: 4px;
+            background: rgba(22, 27, 34, 0.6);
+            border: 1px solid rgba(255, 255, 255, 0.04);
+            font-size: 0.74rem;
+            line-height: 1.35;
+        }
+        .telemetry-event.event-gpu {
+            border-left: 3px solid var(--accent-cyan);
+            background: rgba(0, 229, 255, 0.04);
+        }
+        .telemetry-event.event-dither {
+            border-left: 3px solid #ce93d8;
+            background: rgba(206, 147, 216, 0.04);
+        }
+        .telemetry-event.event-io {
+            border-left: 3px solid #80cbc4;
+            background: rgba(128, 203, 196, 0.04);
+        }
+        .telemetry-event.event-headroom {
+            border-left: 3px solid var(--accent-yellow);
+            background: rgba(255, 234, 0, 0.04);
+        }
+        .telemetry-event.event-report {
+            border-left: 3px solid #00e676;
+            background: rgba(0, 230, 118, 0.04);
+        }
+        .telemetry-event.event-error {
+            border-left: 3px solid #ff5252;
+            background: rgba(255, 82, 82, 0.08);
+        }
+        .telemetry-time {
+            font-family: ui-monospace, SFMono-Regular, monospace;
+            font-size: 0.68rem;
+            color: var(--text-muted);
+            flex-shrink: 0;
+            margin-top: 1px;
+        }
+        .telemetry-tag {
+            font-size: 0.65rem;
+            font-weight: 700;
+            padding: 1px 5px;
+            border-radius: 3px;
+            background: rgba(255, 255, 255, 0.08);
+            color: var(--text-heading);
+            flex-shrink: 0;
+        }
+        .telemetry-text {
+            color: #c9d1d9;
+            word-break: break-word;
+            flex: 1;
+        }
+        .telemetry-empty {
+            text-align: center;
+            color: var(--text-muted);
+            font-size: 0.74rem;
+            padding: 20px 10px;
+        }
+        .popover-footer {
+            padding: 8px 12px;
+            background: #161b22;
+            border-top: 1px solid #30363d;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 6px;
+        }
+        .btn-popover {
+            padding: 4px 10px;
+            font-size: 0.72rem;
+            font-weight: 600;
+            border-radius: 4px;
+            cursor: pointer;
+            border: 1px solid var(--border);
+            background: #21262d;
+            color: var(--text);
+            transition: all 0.15s;
+        }
+        .btn-popover-review {
+            background: rgba(255, 234, 0, 0.2);
+            color: var(--accent-yellow);
+            border-color: var(--accent-yellow);
+            font-weight: 700;
+        }
+        .btn-popover-report {
+            background: rgba(0, 229, 255, 0.2);
+            color: var(--accent-cyan);
+            border-color: var(--accent-cyan);
+            font-weight: 700;
+        }
+        .btn-popover-abort {
+            background: rgba(255, 23, 68, 0.15);
+            color: #ff5252;
+            border-color: rgba(255, 23, 68, 0.4);
+        }
+        .btn-popover-dismiss {
+            background: rgba(0, 230, 118, 0.15);
+            color: #00e676;
+            border-color: rgba(0, 230, 118, 0.4);
+        }
+        .btn-popover-link {
+            background: none;
+            border: none;
+            color: var(--text-muted);
+            font-size: 0.68rem;
+            cursor: pointer;
+            text-decoration: underline;
+            padding: 2px 4px;
+        }
+        .btn-popover-link:hover {
+            color: var(--accent-cyan);
+        }
     </style>
 </head>
 <body>
@@ -1800,24 +2245,78 @@ HTML_PAGE = """<!DOCTYPE html>
         <div class="bookmarks">
             <button id="headerBtnUpsample" class="btn-bookmark" style="display: none; background: rgba(0, 230, 118, 0.15); border-color: rgba(0, 230, 118, 0.45); color: #00e676; font-weight: 600;" onclick="openUpsampleModalForCurrentFolder()" title="Launch AcoustiSinc Upsampling Studio for this folder">⚡ Upsample Album</button>
 
-            <!-- Active Header Status Widget (Replaces button during active upsampling to avoid overlap) -->
-            <div id="headerUpsampleWidget" style="display: none; align-items: center; gap: 8px; background: #11141a; border: 1px solid rgba(0, 229, 255, 0.4); border-radius: 6px; padding: 2px 8px;">
-                <span id="headerUpsampleDot" style="display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--accent-cyan); box-shadow: 0 0 8px var(--accent-cyan);"></span>
-                <span id="headerUpsampleTitle" style="font-size: 0.78rem; font-weight: 600; color: var(--text-heading); max-width: 220px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">⚡ Upsampling...</span>
-                <span id="headerUpsampleBadge" class="brand-badge" style="font-size: 0.68rem; padding: 1px 5px;">0%</span>
-                <div style="width: 60px; height: 6px; background: #0d1117; border-radius: 3px; overflow: hidden; border: 1px solid #30363d;">
-                    <div id="headerUpsampleFill" style="height: 100%; width: 0%; background: linear-gradient(90deg, #00e5ff, #00e676); transition: width 0.3s;"></div>
+            <!-- Active Header Status Widget with UI-Native Telemetry Dropdown -->
+            <div id="headerUpsampleContainer" class="header-upsample-container" style="display: none;">
+                <div id="headerUpsampleWidget" class="header-upsample-widget" onclick="toggleUpsampleDropdown(event)" title="Click or hover to view real-time DSP telemetry stream">
+                    <span id="headerUpsampleDot" class="upsample-status-dot"></span>
+                    <div style="display: flex; flex-direction: column; min-width: 0; max-width: 220px;">
+                        <span id="headerUpsampleTitle" class="upsample-status-title">⚡ Upsampling...</span>
+                        <span id="headerUpsampleSub" style="font-size: 0.65rem; color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">Initializing</span>
+                    </div>
+                    <span id="headerUpsampleBadge" class="brand-badge" style="font-size: 0.68rem; padding: 1px 5px;">0%</span>
+                    <div class="upsample-mini-bar">
+                        <div id="headerUpsampleFill" class="upsample-mini-fill"></div>
+                    </div>
+                    <span id="headerUpsampleArrow" style="font-size: 0.65rem; color: var(--text-muted); margin-left: 2px;">▼</span>
                 </div>
-                <button class="btn-bookmark" id="headerUpsamplePromptBtn" onclick="reopenActivePromptModal()" title="Review Pending Decision" style="display: none; background: rgba(255, 234, 0, 0.2); color: var(--accent-yellow); border-color: var(--accent-yellow); padding: 1px 6px; font-size: 0.70rem; font-weight: 700;">⚠️ Review Decision</button>
-                <button class="btn-bookmark" id="headerUpsampleReportBtn" onclick="viewGeneratedReport()" title="View Album Report" style="display: none; background: rgba(0, 229, 255, 0.2); color: var(--accent-cyan); border-color: var(--accent-cyan); padding: 1px 6px; font-size: 0.70rem; font-weight: 600;">📋 Report</button>
-                <button class="btn-bookmark" id="headerUpsampleLogsBtn" onclick="toggleUpsampleLogModal()" title="View Processing Logs" style="padding: 1px 6px; font-size: 0.70rem;">📜 Logs</button>
-                <button class="btn-bookmark" id="headerUpsampleAbortBtn" onclick="cancelUpsampleJob()" title="Abort Upsampling" style="background: rgba(255, 23, 68, 0.15); color: #ff5252; border-color: rgba(255, 23, 68, 0.4); padding: 1px 6px; font-size: 0.70rem;">⛔ Abort</button>
-                <button class="btn-bookmark" id="headerUpsampleDismissBtn" onclick="dismissUpsampleHeaderWidget()" title="Dismiss" style="display: none; padding: 1px 6px; font-size: 0.70rem;">&times;</button>
+
+                <!-- Dropdown Popover Card (Revealed on Hover / Click) -->
+                <div id="headerUpsampleDropdown" class="upsample-popover-card" onclick="event.stopPropagation()">
+                    <div class="popover-header">
+                        <div style="display: flex; align-items: center; justify-content: space-between; gap: 8px;">
+                            <div style="display: flex; align-items: center; gap: 6px; min-width: 0;">
+                                <span style="font-size: 0.85rem;">⚡</span>
+                                <span id="popoverHeaderTitle" style="font-weight: 700; font-size: 0.82rem; color: var(--text-heading); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">AcoustiSinc Studio</span>
+                            </div>
+                            <span id="popoverTimeElapsed" style="font-size: 0.70rem; color: var(--text-muted); font-family: monospace; flex-shrink: 0;">0:00 elapsed</span>
+                        </div>
+                        <div id="popoverCurrentTrack" style="font-size: 0.76rem; color: var(--accent-cyan); font-weight: 600; margin-top: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">
+                            Preparing album scan...
+                        </div>
+                        <div class="popover-progress-row">
+                            <div class="popover-progress-bar">
+                                <div id="popoverProgressFill" class="popover-progress-fill"></div>
+                            </div>
+                            <span id="popoverProgressPct" style="font-size: 0.72rem; font-weight: 700; color: var(--text-heading); min-width: 32px; text-align: right;">0%</span>
+                        </div>
+                    </div>
+
+                    <!-- UI Native Telemetry Stream -->
+                    <div class="popover-body">
+                        <div class="popover-stream-header">
+                            <span>📡 Real-Time DSP Telemetry</span>
+                            <span id="popoverEventCount" style="font-size: 0.68rem; color: var(--text-muted);">0 events</span>
+                        </div>
+                        <div id="popoverEventStream" class="popover-events-list">
+                            <div class="telemetry-empty">Waiting for telemetry stream...</div>
+                        </div>
+                    </div>
+
+                    <!-- Popover Actions Footer -->
+                    <div class="popover-footer">
+                        <div style="display: flex; align-items: center; gap: 6px;">
+                            <button class="btn-popover btn-popover-review" id="popoverReviewBtn" onclick="reopenActivePromptModal()" style="display: none;">
+                                ⚠️ Review
+                            </button>
+                            <button class="btn-popover btn-popover-report" id="popoverReportBtn" onclick="viewGeneratedReport()" style="display: none;">
+                                📊 Report
+                            </button>
+                            <button class="btn-popover btn-popover-abort" id="popoverAbortBtn" onclick="cancelUpsampleJob()">
+                                ⛔ Abort
+                            </button>
+                            <button class="btn-popover btn-popover-dismiss" id="popoverDismissBtn" onclick="dismissUpsampleHeaderWidget()" style="display: none;">
+                                ✓ Dismiss
+                            </button>
+                        </div>
+                        <button class="btn-popover-link" onclick="toggleUpsampleLogModal()" title="View Raw Terminal Logs">
+                            📜 Raw Logs
+                        </button>
+                    </div>
+                </div>
             </div>
 
             <button id="headerBtnSummary" class="btn-bookmark" style="display: none; background: rgba(0, 229, 255, 0.15); border-color: rgba(0, 229, 255, 0.45); color: var(--accent-cyan); font-weight: 600;" onclick="openAlbumSummary()" title="View Album Analysis Summary">📋 Album Summary</button>
             <button class="btn-bookmark" onclick="loadDirectory('/mnt/PrimaryFS/FLAC_music/music', true)">📁 Music Library</button>
-            <button class="btn-bookmark" onclick="loadDirectory('/mnt/PrimaryFS/FLAC_music/music/Qobuz Downloads', true)">🎧 Qobuz Releases</button>
             <button class="btn-bookmark" onclick="loadDirectory('/mnt/PrimaryFS/1xxK_min/music', true)">⚡ Upsampled Output</button>
             <button class="btn-bookmark" onclick="reloadCurrentDirectory(true)" title="Force fresh re-analysis on current folder">🔄 Re-Analyze Folder</button>
         </div>
@@ -1833,7 +2332,10 @@ HTML_PAGE = """<!DOCTYPE html>
                     </div>
                     <button class="btn-bookmark" style="padding: 2px 6px; font-size: 0.72rem;" onclick="reloadCurrentDirectory(true)" title="Re-Analyze Folder">🔄 Refresh</button>
                 </div>
-                <input type="text" class="search-box" id="pathBar" placeholder="Path..." value="" onchange="navigateToPathBar()" />
+                <div style="display: flex; gap: 6px; align-items: center; margin-bottom: 8px;">
+                    <input type="text" class="search-box" id="pathBar" placeholder="Path..." value="" style="margin-bottom: 0; flex: 1;" onkeydown="if(event.key==='Enter') navigateToPathBar()" onchange="navigateToPathBar()" />
+                    <button class="btn-bookmark" onclick="openFolderPickerForMainPath()" title="Browse Directory" style="padding: 5px 9px; font-size: 0.78rem; white-space: nowrap; height: 32px; display: flex; align-items: center; gap: 4px;">📁 Browse</button>
+                </div>
                 <input type="text" class="search-box" id="searchBox" placeholder="Filter albums & tracks..." />
                 <div id="albumSummaryBanner" style="display: none; padding: 6px 10px; background: rgba(0, 229, 255, 0.08); border: 1px solid rgba(0, 229, 255, 0.3); border-radius: 5px; justify-content: space-between; align-items: center; gap: 8px;">
                     <div style="display: flex; align-items: center; gap: 6px; overflow: hidden; min-width: 0;">
@@ -1931,8 +2433,19 @@ HTML_PAGE = """<!DOCTYPE html>
                             <span class="card-title">Interactive Spectrogram (16,384-point Blackman-Harris STFT)</span>
                             <div style="font-size: 0.75rem; color: var(--text-muted); margin-top: 2px;" id="trackMeta">-- Hz | -- kHz Nyquist</div>
                         </div>
-                        <div style="display: flex; gap: 8px;">
-                            <button class="btn-bookmark" onclick="resetSpecZoom()">Reset View</button>
+                        <div style="display: flex; gap: 6px; align-items: center; flex-wrap: wrap;">
+                            <div class="zoom-btn-group" title="Time (X-Axis) Zoom: Shift + Wheel or Click">
+                                <span class="zoom-axis-label">X: Time</span>
+                                <button class="btn-zoom" onclick="zoomSpecX(1.0/1.3)" title="Zoom Out Time (X)">−</button>
+                                <button class="btn-zoom" onclick="zoomSpecX(1.3)" title="Zoom In Time (X)">+</button>
+                            </div>
+                            <div class="zoom-btn-group" title="Frequency (Y-Axis) Zoom: Ctrl + Wheel or Click">
+                                <span class="zoom-axis-label">Y: Freq</span>
+                                <button class="btn-zoom" onclick="zoomSpecY(1.0/1.3)" title="Zoom Out Frequency (Y)">−</button>
+                                <button class="btn-zoom" onclick="zoomSpecY(1.3)" title="Zoom In Frequency (Y)">+</button>
+                            </div>
+                            <button class="btn-bookmark" onclick="setSpecPreset('native')" title="Fit to Native Container Bandwidth">Native Nyquist</button>
+                            <button class="btn-bookmark" onclick="resetSpecZoom()" title="Reset to Full Normalised Bandwidth">Full Band</button>
                         </div>
                     </div>
                     <div class="canvas-container" id="specContainer">
@@ -1957,7 +2470,17 @@ HTML_PAGE = """<!DOCTYPE html>
                                 <span id="legendProjectedCutoff" style="color: #00e676; font-weight: 600; display: none;">-- 🎯 Projected Filter</span>
                             </div>
                         </div>
-                        <div style="display: flex; gap: 8px;">
+                        <div style="display: flex; gap: 6px; align-items: center; flex-wrap: wrap;">
+                            <div class="zoom-btn-group" title="Frequency (X-Axis) Zoom: Shift + Wheel or Click">
+                                <span class="zoom-axis-label">X: Freq</span>
+                                <button class="btn-zoom" onclick="zoomCurveX(1.0/1.3)" title="Zoom Out Frequency (X)">−</button>
+                                <button class="btn-zoom" onclick="zoomCurveX(1.3)" title="Zoom In Frequency (X)">+</button>
+                            </div>
+                            <div class="zoom-btn-group" title="Amplitude (Y-Axis) Zoom: Ctrl + Wheel or Click">
+                                <span class="zoom-axis-label">Y: dBFS</span>
+                                <button class="btn-zoom" onclick="zoomCurveY(1.0/1.3)" title="Zoom Out dB Level (Y)">−</button>
+                                <button class="btn-zoom" onclick="zoomCurveY(1.3)" title="Zoom In dB Level (Y)">+</button>
+                            </div>
                             <button class="btn-bookmark" onclick="setCurvePreset('audible')">0–20 kHz</button>
                             <button class="btn-bookmark" onclick="setCurvePreset('cutoff')">15–25 kHz</button>
                             <button class="btn-bookmark" onclick="setCurvePreset('ultrasonic')">Ultrasonic</button>
@@ -1985,6 +2508,437 @@ HTML_PAGE = """<!DOCTYPE html>
                 </div>
             </div>
         </main>
+    </div>
+
+
+    <!-- Folder Browser / Directory Picker Modal -->
+    <div id="folderPickerModal" class="modal-backdrop" style="display: none; z-index: 10050;" onclick="if(event.target===this) closeFolderPicker()">
+        <div class="modal-content" style="max-width: 720px; height: 78vh; display: flex; flex-direction: column; border-radius: 12px; border: 1px solid #30363d; box-shadow: 0 20px 50px rgba(0,0,0,0.85); background: #0d1117;">
+            <div class="modal-header" style="padding: 14px 20px; border-bottom: 1px solid #30363d;">
+                <div style="display: flex; align-items: center; gap: 10px; min-width: 0;">
+                    <span style="font-size: 1.1rem; font-weight: 700; color: var(--text-heading);">📁 Select Directory</span>
+                </div>
+                <button class="btn-bookmark" onclick="closeFolderPicker()" style="font-size: 1.2rem; padding: 2px 10px; line-height: 1;">&times;</button>
+            </div>
+            
+            <!-- Breadcrumbs Navigation Bar -->
+            <div style="padding: 8px 16px; background: #161b22; border-bottom: 1px solid #30363d; font-size: 0.80rem; overflow-x: auto; white-space: nowrap;" id="folderPickerBreadcrumbs">
+                <span class="crumb" onclick="loadFolderPickerDirectory('/')">🏠 /</span>
+            </div>
+
+            <!-- Path Bar & Action Buttons -->
+            <div style="padding: 10px 16px; background: #11141a; border-bottom: 1px solid #30363d; display: flex; gap: 8px; align-items: center;">
+                <input type="text" id="folderPickerPathBar" class="form-input" style="font-family: monospace; font-size: 0.82rem; height: 36px;" onkeydown="if(event.key==='Enter') loadFolderPickerDirectory(this.value.trim())" />
+                <button class="btn-bookmark" onclick="loadFolderPickerDirectory(document.getElementById('folderPickerPathBar').value.trim())" style="padding: 0 14px; height: 36px;">Go</button>
+                <button class="btn-bookmark" onclick="createNewFolderInPicker()" style="padding: 0 14px; height: 36px; color: var(--accent-cyan); border-color: rgba(0, 229, 255, 0.4); white-space: nowrap;">+ New Folder</button>
+            </div>
+
+            <!-- Folder Items List -->
+            <div class="modal-body" style="flex: 1; overflow-y: auto; padding: 8px 12px;" id="folderPickerList">
+                <div style="padding: 28px; text-align: center; color: var(--text-muted);">
+                    <div class="spinner" style="margin: 0 auto 10px;"></div>
+                    Loading directory contents...
+                </div>
+            </div>
+
+            <!-- Bottom Action Footer -->
+            <div style="padding: 12px 18px; background: #161b22; border-top: 1px solid #30363d; display: flex; justify-content: space-between; align-items: center; gap: 10px;">
+                <button class="btn-bookmark" onclick="closeFolderPicker()" style="padding: 7px 16px;">Cancel</button>
+                <button class="btn-bookmark" onclick="selectFolderPickerChoice()" style="background: rgba(0, 230, 118, 0.2); border-color: rgba(0, 230, 118, 0.55); color: #00e676; font-weight: 700; padding: 7px 20px; font-size: 0.88rem;">✓ Select Current Folder</button>
+            </div>
+        </div>
+    </div>
+    <div id="albumSummaryModal" class="modal-backdrop" style="display: none;" onclick="if(event.target===this) closeAlbumSummaryModal()">
+        <div class="modal-content">
+            <div class="modal-header">
+                <div style="display: flex; align-items: center; gap: 10px; min-width: 0;">
+                    <span style="font-size: 1.05rem; font-weight: 700; color: var(--text-heading); white-space: nowrap;">📋 Album Analysis Summary</span>
+                    <span id="modalSummaryBadge" class="brand-badge" style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">ALBUM_REPORT</span>
+                </div>
+                <div style="display: flex; align-items: center; gap: 8px; flex-shrink: 0;">
+                    <button class="btn-bookmark" id="btnCopySummary" onclick="copyAlbumSummaryText()">📋 Copy</button>
+                    <button class="btn-bookmark" id="modalOpenExternalBtn" onclick="openAlbumSummaryExternal()" style="display: none;">↗️ Open Tab</button>
+                    <button class="btn-bookmark" onclick="closeAlbumSummaryModal()" style="font-size: 1.2rem; padding: 2px 10px; line-height: 1;">&times;</button>
+                </div>
+            </div>
+            <div class="modal-body" id="modalSummaryBody">
+                <div style="text-align: center; padding: 40px; color: var(--text-muted);">
+                    <div class="spinner" style="margin: 0 auto 10px;"></div>
+                    Loading album analysis summary...
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Upsample Configuration & Interactive Decision Modal -->
+    <div id="upsampleModal" class="modal-backdrop" style="display: none;" onclick="if(event.target===this) closeUpsampleModal()">
+        <div class="modal-content modal-upsample-dialog">
+            <div class="modal-header" style="padding: 14px 22px; border-bottom: 1px solid #30363d;">
+                <div style="display: flex; align-items: center; gap: 10px; min-width: 0;">
+                    <span style="font-size: 1.15rem; font-weight: 700; color: var(--text-heading); white-space: nowrap;">⚡ AcoustiSinc Interactive Upsampling Studio</span>
+                    <span id="upsampleModalScopeBadge" class="brand-badge" style="background: rgba(0, 230, 118, 0.15); border-color: rgba(0, 230, 118, 0.4); color: #00e676;">ALBUM BATCH</span>
+                </div>
+                <button class="btn-bookmark" onclick="closeUpsampleModal()" style="font-size: 1.2rem; padding: 2px 10px; line-height: 1;">&times;</button>
+            </div>
+            <div class="modal-body" style="padding: 20px 24px; overflow-y: auto;">
+                
+                <!-- Preparing & Headroom Scan View (Shown while Track 1 is being audited) -->
+                <div id="upsampleModalPreparingView" style="display: none; padding: 40px 20px; text-align: center;">
+                    <div class="spinner" style="width: 52px; height: 52px; border-width: 4px; margin: 0 auto 20px; border-top-color: var(--accent-cyan);"></div>
+                    <h3 id="preparingModalTitle" style="color: var(--text-heading); font-size: 1.2rem; margin-bottom: 10px; font-weight: 700;">🔬 Auditing Audio Master & Scanning Headroom...</h3>
+                    <p id="preparingModalDesc" style="color: var(--text-muted); font-size: 0.88rem; max-width: 520px; margin: 0 auto 24px; line-height: 1.55;">
+                        Performing 64-bit double-precision FFT frequency analysis, detecting brickwall reconstruction knee frequencies, and formulating optimal DSP upsampling recipe...
+                    </p>
+                    <div style="display: inline-flex; align-items: center; gap: 10px; background: #161b22; padding: 8px 18px; border-radius: 20px; border: 1px solid #30363d; font-size: 0.82rem; color: var(--accent-yellow);">
+                        <span style="display: inline-block; width: 9px; height: 9px; border-radius: 50%; background: var(--accent-yellow); box-shadow: 0 0 8px var(--accent-yellow); animation: pulse-glow 1s infinite;"></span>
+                        <span id="preparingModalStatusText">Auditing Track 1 Spectrum & Inter-Sample Headroom</span>
+                    </div>
+                    <div style="margin-top: 32px;">
+                        <button class="btn-decision btn-decision-abort" onclick="cancelUpsampleJob()" style="max-width: 220px; margin: 0 auto; padding: 10px 18px; display: inline-flex;">
+                            <span style="font-size: 0.90rem;">⛔ [Q] Abort Upsampling</span>
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Interactive Recipe Recommendation & Decision Controls View -->
+                <div id="upsampleModalInteractiveView">
+                    <!-- 1. Forensic Audit & Recommendation Details Card -->
+                    <div id="promptAuditCard" class="prompt-audit-card">
+                        <div style="display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap;">
+                            <span style="font-size: 0.78rem; font-weight: 700; color: var(--accent-cyan); letter-spacing: 0.5px;">🔬 FORENSIC AUDIT & RECIPE RECOMMENDATION</span>
+                            <span id="promptProvLabel" class="provenance-tag badge-provenance-native" style="font-size: 0.72rem; padding: 2px 10px;">RECOMMENDED RECIPE</span>
+                        </div>
+                        <div style="display: flex; justify-content: space-between; align-items: baseline; gap: 8px; flex-wrap: wrap; margin-top: 2px;">
+                            <div id="promptTrackTitle" style="font-weight: 700; font-size: 1.05rem; color: var(--text-heading);">Track Name</div>
+                            <div id="promptFormatMeta" style="font-size: 0.78rem; color: var(--text-muted); font-family: monospace;">44.1 kHz • 2 Channels • 24-bit PCM</div>
+                        </div>
+                        <div id="promptMetricsRow" style="font-size: 0.78rem; color: #8b949e;">Cutoff Knee: -- | Stopband: --</div>
+                        
+                        <div style="background: rgba(0, 229, 255, 0.06); border: 1px solid rgba(0, 229, 255, 0.35); border-radius: 6px; padding: 10px 14px; margin: 4px 0; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px;">
+                            <div style="flex: 1; min-width: 240px;">
+                                <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 3px;">
+                                    <span style="font-size: 0.76rem; font-weight: 700; color: var(--accent-cyan);">Audited Recipe:</span>
+                                    <span id="promptActionDesc" style="font-size: 0.84rem; font-weight: 600; color: var(--text-heading);">Direct Sinc Resampling</span>
+                                </div>
+                                <div style="display: flex; align-items: center; gap: 6px; margin-top: 4px;">
+                                    <span style="font-size: 0.74rem; color: var(--text-muted);">DSP CLI Flag:</span>
+                                    <code class="action-code" id="promptDspFlag">--phase min --dither shibata</code>
+                                </div>
+                            </div>
+                            <button type="button" class="btn-bookmark" id="btnDirectApplyRec" onclick="applyForensicRecommendationPreset()" style="background: rgba(0, 229, 255, 0.22); border: 1px solid var(--accent-cyan); color: var(--accent-cyan); font-weight: 700; font-size: 0.82rem; padding: 7px 16px; border-radius: 6px; cursor: pointer; display: flex; align-items: center; gap: 6px; box-shadow: 0 0 12px rgba(0, 229, 255, 0.25);" title="Apply audited recipe to all tiles [R]">
+                                ✨ [R] Apply Recommended Recipe
+                            </button>
+                        </div>
+
+                        <div style="font-size: 0.80rem; color: var(--text); line-height: 1.45; background: rgba(0, 0, 0, 0.25); border-radius: 6px; padding: 8px 12px;">
+                            <span style="font-weight: 600; color: var(--accent-yellow);">💡 Technical Rationale: </span>
+                            <span id="promptTechnicalRationale">Applies optimal 64-bit double precision sinc filter.</span>
+                        </div>
+                    </div>
+
+                    <!-- Presets Pill Bar (for quick configurations) -->
+                    <div class="preset-pill-group" id="presetPillGroup" style="margin-bottom: 12px;">
+                        <button class="preset-pill active" id="presetBtnRecommended" onclick="applyForensicRecommendationPreset()">✨ [R] Forensic Recommendation</button>
+                        <button class="preset-pill" id="presetBtnAudiophile4x" onclick="applyDefaultPreset('4x')">🎧 Standard 4x Audiophile</button>
+                        <button class="preset-pill" id="presetBtnApodizing" onclick="applyDefaultPreset('apod')">🛡️ Apodizing Ringing-Filter (22.05k)</button>
+                    </div>
+
+                    <!-- DSP PIPELINE TILES GRID -->
+                    
+                    <!-- Row 1: Target Sample Rate (Tile 1) & Impulse Phase Topology (Tile 2) -->
+                    <div class="form-grid-2" style="margin-bottom: 12px;">
+                        <!-- Tile 1: Target Rate (2x2 Segmented Tile Grid) -->
+                        <div class="dsp-tile-card">
+                            <div class="dsp-tile-header">
+                                <span>⚡ Target Sample Rate</span>
+                                <span class="form-label-sub">Integral Sinc Multiplier</span>
+                            </div>
+                            <input type="hidden" id="upsampleRate" value="4x" />
+                            <div class="tile-segmented-grid cols-2" id="tileRateGrid">
+                                <div class="tile-option-btn active" data-val="4x" onclick="selectRateTile('4x')">
+                                    <div class="tile-option-title">⚡ Auto 4x Native</div>
+                                    <div class="tile-option-sub">176.4k / 192k (Auto Family)</div>
+                                </div>
+                                <div class="tile-option-btn" data-val="192000" onclick="selectRateTile('192000')">
+                                    <div class="tile-option-title">192.0 kHz</div>
+                                    <div class="tile-option-sub">4x from 48k Master Family</div>
+                                </div>
+                                <div class="tile-option-btn" data-val="176400" onclick="selectRateTile('176400')">
+                                    <div class="tile-option-title">176.4 kHz</div>
+                                    <div class="tile-option-sub">4x from 44.1k CD Family</div>
+                                </div>
+                                <div class="tile-option-btn" data-val="384000" onclick="selectRateTile('384000')">
+                                    <div class="tile-option-title">🔥 8x Ultra Sinc</div>
+                                    <div class="tile-option-sub">352.8k / 384k Bandwidth</div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Tile 2: Phase Response Mode (A/B Visual Cards) -->
+                        <div class="dsp-tile-card">
+                            <div class="dsp-tile-header">
+                                <span>Impulse Phase Topology</span>
+                                <span class="form-label-sub">Time Symmetry</span>
+                            </div>
+                            <input type="hidden" id="upsamplePhase" value="min" />
+                            <div class="phase-ab-grid">
+                                <div class="phase-card-option active" id="phaseCardMin" onclick="selectPhaseMode('min')">
+                                    <div class="phase-card-title">
+                                        <span>Minimum Phase</span>
+                                        <span style="font-size: 0.70rem; color: var(--accent-cyan); font-weight: 700;">Analog</span>
+                                    </div>
+                                    <div class="phase-card-sub">
+                                        ⚡ <b>0.00% Pre-Ringing</b>. Natural causal decay. Eliminates studio ADC ringing.
+                                    </div>
+                                </div>
+                                <div class="phase-card-option" id="phaseCardLinear" onclick="selectPhaseMode('linear')">
+                                    <div class="phase-card-title">
+                                        <span>Linear Phase</span>
+                                        <span style="font-size: 0.70rem; color: var(--accent-pink); font-weight: 700;">0° Shift</span>
+                                    </div>
+                                    <div class="phase-card-sub">
+                                        ⚖️ <b>Strict 0° Linear Phase</b>. Symmetric time impulse. Pristine acoustic coherence.
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Row 2: Reconstruction Cutoff & Apodizing Filter (Tile 3 - Full Width) -->
+                    <div class="dsp-tile-card" style="margin-bottom: 12px;">
+                        <div class="dsp-tile-header">
+                            <span>🎯 Reconstruction Cutoff & Apodizing Filter</span>
+                            <span id="cutoffHint" class="brand-badge" style="font-size: 0.70rem; padding: 2px 8px; text-transform: none;">Disabled (Full Nyquist)</span>
+                        </div>
+                        
+                        <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
+                            <div class="tile-option-btn" id="btnTileApodToggle" onclick="toggleApodizingTile()" style="min-width: 170px; padding: 7px 12px; cursor: pointer;">
+                                <div class="tile-option-title">
+                                    <span id="apodToggleIcon">🛡️</span>
+                                    <span id="apodToggleText">Apodizing Filter</span>
+                                </div>
+                                <div class="tile-option-sub" id="apodToggleSub">Click to enable/disable</div>
+                            </div>
+                            <input type="checkbox" id="upsampleApodizingEnable" style="display: none;" onchange="syncApodizingTileUI()" />
+                            
+                            <div style="display: flex; align-items: center; gap: 6px; width: 145px; background: #090d13; border: 1px solid #30363d; border-radius: 6px; padding: 2px 8px;">
+                                <input type="number" class="form-input" id="upsampleCutoffHz" placeholder="e.g. 20700" min="5000" max="384000" step="1" oninput="onCutoffInputChange()" onchange="onCutoffInputChange()" style="border: none; background: transparent; padding: 4px 0; height: 32px; font-weight: 700; font-size: 0.95rem; color: var(--accent-cyan); width: 100px;" />
+                                <span style="font-size: 0.78rem; color: var(--text-muted); font-weight: 700;">Hz</span>
+                            </div>
+
+                            <!-- Interactive Frequency Range Slider -->
+                            <div class="cutoff-slider-row" style="flex: 1; min-width: 200px;">
+                                <input type="range" class="cutoff-slider" id="upsampleCutoffSlider" min="15000" max="48000" step="50" value="22050" oninput="onCutoffSliderChange(this.value)" />
+                            </div>
+                        </div>
+
+                        <!-- Quick Frequency Snap Chips -->
+                        <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 6px; margin-top: 2px;">
+                            <div class="cutoff-chip-group" id="cutoffChipGroup" style="margin: 0;">
+                                <button type="button" class="cutoff-chip active" data-hz="" onclick="setCutoffPreset('')" title="Full Nyquist Bandwidth (No Lowpass Cutoff)">Nyquist (Off)</button>
+                                <button type="button" class="cutoff-chip" data-hz="20700" onclick="setCutoffPreset(20700)" title="20.7 kHz Cutoff: Clean up legacy studio ADC ringing">20.7k (ADC)</button>
+                                <button type="button" class="cutoff-chip" data-hz="21500" onclick="setCutoffPreset(21500)" title="21.5 kHz Cutoff: Purge ultrasonic alias mirrors">21.5k (Alias)</button>
+                                <button type="button" class="cutoff-chip" data-hz="22050" onclick="setCutoffPreset(22050)" title="22.05 kHz Cutoff: Standard CD / 44.1k Master Apodizing">22.05k (CD Std)</button>
+                                <button type="button" class="cutoff-chip" data-hz="24000" onclick="setCutoffPreset(24000)" title="24.0 kHz Cutoff: Standard 48k Master Apodizing">24.0k (48k Std)</button>
+                                <button type="button" class="cutoff-chip" data-hz="44100" onclick="setCutoffPreset(44100)" title="44.1 kHz Cutoff: 88.2k/96k/176.4k Master Cutoff">44.1k (88/96k)</button>
+                            </div>
+                            <div id="cutoffRolloffDesc" style="font-size: 0.72rem; color: #8b949e; font-family: monospace;">
+                                Passband: Flat to Nyquist • 64-Bit Sinc
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Row 3: Transition Steepness, Dither, MQA Engine (3 Columns) -->
+                    <div class="form-grid-3" style="margin-bottom: 12px;">
+                        <!-- Tile 4: Transition Steepness -->
+                        <div class="dsp-tile-card">
+                            <div class="dsp-tile-header">
+                                <span>Filter Steepness</span>
+                                <span class="form-label-sub">Transition Band</span>
+                            </div>
+                            <input type="checkbox" id="upsampleSteep" style="display: none;" onchange="syncSteepTileUI()" />
+                            <div class="tile-segmented-grid cols-2" id="tileSteepGrid">
+                                <div class="tile-option-btn active" data-val="standard" onclick="selectSteepTile(false)">
+                                    <div class="tile-option-title">Standard</div>
+                                    <div class="tile-option-sub">2.0 kHz taper</div>
+                                </div>
+                                <div class="tile-option-btn" data-val="sharp" onclick="selectSteepTile(true)">
+                                    <div class="tile-option-title">Brickwall</div>
+                                    <div class="tile-option-sub">500 Hz knee</div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Tile 5: Dither & Noise Shaping -->
+                        <div class="dsp-tile-card">
+                            <div class="dsp-tile-header">
+                                <span>Noise Shaping & Dither</span>
+                                <span class="form-label-sub">24-Bit Depth</span>
+                            </div>
+                            <input type="hidden" id="upsampleDither" value="shibata" />
+                            <div class="tile-segmented-grid cols-3" id="tileDitherGrid">
+                                <div class="tile-option-btn active" data-val="shibata" onclick="selectDitherTile('shibata')">
+                                    <div class="tile-option-title" style="font-size: 0.76rem;">Shibata</div>
+                                    <div class="tile-option-sub">>30k shift</div>
+                                </div>
+                                <div class="tile-option-btn" data-val="high_rate" onclick="selectDitherTile('high_rate')">
+                                    <div class="tile-option-title" style="font-size: 0.76rem;">TPDF Flat</div>
+                                    <div class="tile-option-sub">High rate</div>
+                                </div>
+                                <div class="tile-option-btn" data-val="none" onclick="selectDitherTile('none')">
+                                    <div class="tile-option-title" style="font-size: 0.76rem;">None</div>
+                                    <div class="tile-option-sub">Float64</div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Tile 6: MQA Payload Engine -->
+                        <div class="dsp-tile-card">
+                            <div class="dsp-tile-header">
+                                <span>MQA Payload Engine</span>
+                                <span class="form-label-sub">Origami Policy</span>
+                            </div>
+                            <input type="hidden" id="upsampleMqa" value="adaptive" />
+                            <div class="tile-segmented-grid cols-3" id="tileMqaGrid">
+                                <div class="tile-option-btn active" data-val="adaptive" onclick="selectMqaTile('adaptive')">
+                                    <div class="tile-option-title" style="font-size: 0.76rem;">Adaptive</div>
+                                    <div class="tile-option-sub">Subband</div>
+                                </div>
+                                <div class="tile-option-btn" data-val="strip" onclick="selectMqaTile('strip')">
+                                    <div class="tile-option-title" style="font-size: 0.76rem;">Strip</div>
+                                    <div class="tile-option-sub">Clean LSB</div>
+                                </div>
+                                <div class="tile-option-btn" data-val="ignore" onclick="selectMqaTile('ignore')">
+                                    <div class="tile-option-title" style="font-size: 0.76rem;">Ignore</div>
+                                    <div class="tile-option-sub">Raw PCM</div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Row 4: Master Storage & Target Locations (Tile 7) -->
+                    <div class="dsp-tile-card" style="margin-bottom: 8px;">
+                        <div class="dsp-tile-header">
+                            <span>📁 Audio Master & Target Directory</span>
+                            <span class="form-label-sub">Lossless FLAC Library Storage</span>
+                        </div>
+                        
+                        <div class="form-grid-2" style="gap: 10px;">
+                            <div class="form-group">
+                                <label class="form-label">
+                                    <span>Source Master Location</span>
+                                </label>
+                                <div class="form-path-row">
+                                    <input type="text" class="form-input" id="upsampleSrcPath" readonly style="height: 36px;" />
+                                    <button class="btn-browse" onclick="openFolderPicker('upsampleSrcPath')" title="Browse Source Master Folder" style="height: 36px;">📁 Browse...</button>
+                                </div>
+                            </div>
+
+                            <div class="form-group">
+                                <label class="form-label">
+                                    <span>Destination Output Directory</span>
+                                </label>
+                                <div class="form-path-row">
+                                    <input type="text" class="form-input" id="upsampleDstDir" placeholder="/mnt/PrimaryFS/1xxK_min/music/..." style="height: 36px;" />
+                                    <button class="btn-browse" onclick="openFolderPicker('upsampleDstDir')" title="Browse Target Destination Directory" style="height: 36px;">📁 Browse...</button>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div style="display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-top: 4px; flex-wrap: wrap;">
+                            <div style="display: flex; align-items: center; gap: 8px;">
+                                <span style="font-size: 0.76rem; color: var(--text-muted); font-weight: 600;">File Overwrite:</span>
+                                <input type="hidden" id="upsampleOverwrite" value="on" />
+                                <div class="tile-segmented-grid cols-2" id="tileOverwriteGrid" style="width: 220px;">
+                                    <div class="tile-option-btn active" data-val="on" onclick="selectOverwriteTile('on')" style="padding: 4px 8px;">
+                                        <div class="tile-option-title" style="font-size: 0.74rem;">Overwrite</div>
+                                    </div>
+                                    <div class="tile-option-btn" data-val="off" onclick="selectOverwriteTile('off')" style="padding: 4px 8px;">
+                                        <div class="tile-option-title" style="font-size: 0.74rem;">Skip Existing</div>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="tile-option-btn active" id="btnTileReportToggle" onclick="toggleReportTile()" style="padding: 5px 12px; cursor: pointer;">
+                                <div class="tile-option-title" style="font-size: 0.76rem;">
+                                    <span>📊 Comparative HTML & Markdown Reports</span>
+                                </div>
+                                <input type="checkbox" id="upsampleReport" checked style="display: none;" />
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Initial Launch Actions (Batch / Album Launching) -->
+                    <div id="initialLaunchControls" class="decision-btn-grid" style="border-top: 1px solid #30363d; padding-top: 14px; margin-top: 8px;">
+                        <button class="btn-decision btn-decision-primary" onclick="startUpsampleJob(true)" title="Launch interactive session, auditing and prompting per-track decisions">
+                            <span style="font-size: 0.92rem;">▶️ [Y] Start Interactive Mode</span>
+                            <span class="btn-decision-sub">Prompts per-track recipe & review in modal</span>
+                        </button>
+                        <button class="btn-decision btn-decision-auto" onclick="startUpsampleJob(false)" title="Automatically apply each track's forensic recommendation unattended">
+                            <span style="font-size: 0.92rem;">⚡ [A] Auto-Upsample Album</span>
+                            <span class="btn-decision-sub">Auto-applies recommendations unattended</span>
+                        </button>
+                        <button class="btn-decision btn-decision-lock" onclick="startUpsampleJob(false)" title="Upsample album using the custom parameters configured above">
+                            <span style="font-size: 0.92rem;">❄️ [C] Upsample with Configured Settings</span>
+                            <span class="btn-decision-sub">Applies settings above to all tracks</span>
+                        </button>
+                        <button class="btn-decision btn-decision-abort" onclick="closeUpsampleModal()" title="Cancel and close dialog">
+                            <span style="font-size: 0.92rem;">⏹️ [K] Cancel</span>
+                            <span class="btn-decision-sub">Dismiss this dialog</span>
+                        </button>
+                    </div>
+
+                    <!-- Interactive Track Decision Actions Grid (Live Subprocess Prompts) -->
+                    <div id="interactiveDecisionControls" class="decision-btn-grid" style="display: none; border-top: 1px solid #30363d; padding-top: 14px; margin-top: 8px;">
+                        <button class="btn-decision btn-decision-primary" onclick="sendPromptChoice('y')" title="Accept recipe and process this track">
+                            <span style="font-size: 0.92rem;">▶️ [Y] Process This Track</span>
+                            <span class="btn-decision-sub">Process file, background & prompt next</span>
+                        </button>
+                        <button class="btn-decision btn-decision-lock" onclick="sendPromptChoice('c')" title="Apply this recipe to REST of album directory">
+                            <span style="font-size: 0.92rem;">❄️ [C] Apply to REST of Album</span>
+                            <span class="btn-decision-sub">Freeze recipe for all remaining tracks</span>
+                        </button>
+                        <button class="btn-decision btn-decision-auto" onclick="sendPromptChoice('a')" title="Adopt recommended recipes automatically for ALL remaining tracks">
+                            <span style="font-size: 0.92rem;">⚡ [A] Auto-Apply ALL Remaining</span>
+                            <span class="btn-decision-sub">Adopt recommendations unattended</span>
+                        </button>
+                        <button class="btn-decision btn-decision-skip" onclick="sendPromptChoice('s')" title="Skip this track and proceed to next">
+                            <span style="font-size: 0.92rem;">⏭️ [S] Skip This Track</span>
+                            <span class="btn-decision-sub">Skip file & move to next track</span>
+                        </button>
+                        <button class="btn-decision btn-decision-skip" onclick="sendPromptChoice('k')" title="Skip this track and ALL remaining in this album directory">
+                            <span style="font-size: 0.92rem;">⏹️ [K] Skip REST of Album</span>
+                            <span class="btn-decision-sub">Bypass remainder of album directory</span>
+                        </button>
+                        <button class="btn-decision" id="btnPromptViewSummary" onclick="openAlbumSummary()" style="background: rgba(0, 229, 255, 0.12); border: 1px solid rgba(0, 229, 255, 0.35); color: var(--accent-cyan);" title="View existing Album Analysis Summary">
+                            <span style="font-size: 0.92rem;">📋 [V] View Album Summary</span>
+                            <span class="btn-decision-sub">Read forensic album report</span>
+                        </button>
+                        <button class="btn-decision btn-decision-abort" onclick="sendPromptChoice('q')" style="grid-column: 1 / -1;" title="Abort the entire upsampling session">
+                            <span style="font-size: 0.92rem;">⛔ [Q] Abort Upsampling Session</span>
+                            <span class="btn-decision-sub">Gracefully terminate background process</span>
+                        </button>
+                    </div>
+                </div>
+
+            </div>
+        </div>
+    </div>
+
+    <!-- Live Console Log Viewer Modal -->
+    <div id="upsampleLogModal" class="modal-backdrop" style="display: none;" onclick="if(event.target===this) closeUpsampleLogModal()">
+        <div class="modal-content" style="max-width: 800px; height: 75vh;">
+            <div class="modal-header">
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="font-size: 1rem; font-weight: 700; color: var(--text-heading);">📜 AcoustiSinc DSP Terminal Output</span>
+                </div>
+                <button class="btn-bookmark" onclick="closeUpsampleLogModal()" style="font-size: 1.2rem; padding: 2px 10px; line-height: 1;">&times;</button>
+            </div>
+            <div class="modal-body" style="padding: 0; background: #0a0c10; display: flex; flex-direction: column;">
+                <div id="upsampleTerminalBox" style="flex: 1; overflow-y: auto; padding: 14px 18px; font-family: ui-monospace, SFMono-Regular, 'SF Mono', monospace; font-size: 0.74rem; color: #8b949e;">
+                    <div id="upsampleTerminalLogs" style="display: flex; flex-direction: column; gap: 3px;"></div>
+                </div>
+            </div>
+        </div>
     </div>
 
     <script>
@@ -2507,7 +3461,56 @@ HTML_PAGE = """<!DOCTYPE html>
         }
 
         // ==========================================
-        // SPECTROGRAM CANVAS WITH ZOOM, PAN & HUD
+        // SHARED CANVAS HATCH PATTERN (OUT-OF-CONTAINER REGIONS)
+        // ==========================================
+        function drawHatchPattern(ctx, x, y, width, height, labelText = null) {
+            if (width <= 0 || height <= 0) return;
+            ctx.save();
+            ctx.beginPath();
+            ctx.rect(x, y, width, height);
+            ctx.clip();
+
+            // 1. Dark tinted background
+            ctx.fillStyle = "rgba(10, 14, 20, 0.88)";
+            ctx.fillRect(x, y, width, height);
+
+            // 2. Diagonal stripes
+            ctx.strokeStyle = "rgba(255, 171, 0, 0.08)";
+            ctx.lineWidth = 1.5;
+            const step = 14;
+            for (let pos = x - height; pos < x + width + height; pos += step) {
+                ctx.beginPath();
+                ctx.moveTo(pos, y + height);
+                ctx.lineTo(pos + height, y);
+                ctx.stroke();
+            }
+
+            // 3. Centered subtle label / watermark
+            if (labelText) {
+                ctx.fillStyle = "rgba(255, 171, 0, 0.55)";
+                ctx.font = "bold 9px monospace";
+                ctx.textAlign = "center";
+                ctx.textBaseline = "middle";
+                ctx.fillText(labelText, x + width / 2, y + height / 2);
+            }
+            ctx.restore();
+        }
+
+        function getNormalisedMaxF(data) {
+            if (!data) return 88.2;
+            if (data.normalised_max_khz) return data.normalised_max_khz;
+            const nyq = data.nyquist_khz || 22.05;
+            if (nyq <= 22.05) return 88.2;
+            if (nyq <= 24.0) return 96.0;
+            if (nyq <= 44.1) return 88.2;
+            if (nyq <= 48.0) return 96.0;
+            if (nyq <= 88.2) return 88.2;
+            if (nyq <= 96.0) return 96.0;
+            return nyq * 1.04;
+        }
+
+        // ==========================================
+        // SPECTROGRAM CANVAS WITH DUAL-AXIS ZOOM & NORMALISED SCALE
         // ==========================================
         let specImg = null;
         let specLookup = null;
@@ -2526,8 +3529,11 @@ HTML_PAGE = """<!DOCTYPE html>
         const specHudDb = document.getElementById('specHudDb');
 
         function initSpectrogram(data) {
-            specTMin = 0.0; specTMax = data.duration_s;
-            specFMin = 0.0; specFMax = data.nyquist_khz;
+            specTMin = 0.0;
+            specTMax = data.duration_s || 30.0;
+            const normMax = getNormalisedMaxF(data);
+            specFMin = 0.0;
+            specFMax = normMax;
             lookupW = data.lookup_w || 256;
             lookupH = data.lookup_h || 128;
 
@@ -2560,28 +3566,51 @@ HTML_PAGE = """<!DOCTYPE html>
 
         function resetSpecZoom() {
             if (!currentAnalysis) return;
+            const normMax = getNormalisedMaxF(currentAnalysis);
             specTMin = 0.0; specTMax = currentAnalysis.duration_s;
-            specFMin = 0.0; specFMax = currentAnalysis.nyquist_khz;
+            specFMin = 0.0; specFMax = normMax;
             drawSpectrogram(specCanvas.getBoundingClientRect().width, specCanvas.getBoundingClientRect().height);
         }
 
-        function zoomSpec(factor, centerTRatio = 0.5, centerFRatio = 0.5) {
+        function setSpecPreset(type) {
+            if (!currentAnalysis) return;
+            if (type === 'native') {
+                specFMin = 0.0;
+                specFMax = currentAnalysis.nyquist_khz;
+            } else {
+                const normMax = getNormalisedMaxF(currentAnalysis);
+                specFMin = 0.0;
+                specFMax = normMax;
+            }
+            drawSpectrogram(specCanvas.getBoundingClientRect().width, specCanvas.getBoundingClientRect().height);
+        }
+
+        function zoomSpecX(factor, centerTRatio = 0.5) {
             if (!currentAnalysis) return;
             const curTW = specTMax - specTMin;
-            const newTW = Math.max(0.5, Math.min(currentAnalysis.duration_s, curTW / factor));
+            const newTW = Math.max(0.2, Math.min(currentAnalysis.duration_s, curTW / factor));
             const centerT = specTMin + curTW * centerTRatio;
             specTMin = Math.max(0, centerT - newTW * centerTRatio);
             specTMax = Math.min(currentAnalysis.duration_s, specTMin + newTW);
             if (specTMax - specTMin < newTW) specTMin = Math.max(0, specTMax - newTW);
+            drawSpectrogram(specCanvas.getBoundingClientRect().width, specCanvas.getBoundingClientRect().height);
+        }
 
+        function zoomSpecY(factor, centerFRatio = 0.5) {
+            if (!currentAnalysis) return;
+            const normMax = getNormalisedMaxF(currentAnalysis);
             const curFW = specFMax - specFMin;
-            const newFW = Math.max(1.0, Math.min(currentAnalysis.nyquist_khz, curFW / factor));
+            const newFW = Math.max(1.0, Math.min(normMax, curFW / factor));
             const centerF = specFMin + curFW * centerFRatio;
             specFMin = Math.max(0, centerF - newFW * centerFRatio);
-            specFMax = Math.min(currentAnalysis.nyquist_khz, specFMin + newFW);
+            specFMax = Math.min(normMax, specFMin + newFW);
             if (specFMax - specFMin < newFW) specFMin = Math.max(0, specFMax - newFW);
-
             drawSpectrogram(specCanvas.getBoundingClientRect().width, specCanvas.getBoundingClientRect().height);
+        }
+
+        function zoomSpec(factor, centerTRatio = 0.5, centerFRatio = 0.5) {
+            zoomSpecX(factor, centerTRatio);
+            zoomSpecY(factor, centerFRatio);
         }
 
         function resizeSpecCanvas() {
@@ -2600,21 +3629,62 @@ HTML_PAGE = """<!DOCTYPE html>
             const padL = 55, padR = 70, padT = 15, padB = 35;
             const plotW = w - padL - padR;
             const plotH = h - padT - padB;
-
             if (plotW <= 0 || plotH <= 0) return;
+
+            const nyqF = currentAnalysis.nyquist_khz;
+            const normMax = getNormalisedMaxF(currentAnalysis);
 
             sCtx.save();
             sCtx.beginPath();
             sCtx.rect(padL, padT, plotW, plotH);
             sCtx.clip();
 
-            const sx = (specTMin / currentAnalysis.duration_s) * specImg.naturalWidth;
-            const sw = ((specTMax - specTMin) / currentAnalysis.duration_s) * specImg.naturalWidth;
-            const sy = (1.0 - (specFMax / currentAnalysis.nyquist_khz)) * specImg.naturalHeight;
-            const sh = ((specFMax - specFMin) / currentAnalysis.nyquist_khz) * specImg.naturalHeight;
+            // 1. Audio data range [0, nyqF] within currently visible window [specFMin, specFMax]
+            const visibleAudioFMin = Math.max(specFMin, 0.0);
+            const visibleAudioFMax = Math.min(specFMax, nyqF);
 
-            sCtx.imageSmoothingEnabled = true;
-            sCtx.drawImage(specImg, sx, sy, sw, sh, padL, padT, plotW, plotH);
+            if (visibleAudioFMax > visibleAudioFMin) {
+                const destYTop = padT + (1.0 - (visibleAudioFMax - specFMin) / (specFMax - specFMin)) * plotH;
+                const destYBottom = padT + (1.0 - (visibleAudioFMin - specFMin) / (specFMax - specFMin)) * plotH;
+                const destH = destYBottom - destYTop;
+
+                const sx = (specTMin / currentAnalysis.duration_s) * specImg.naturalWidth;
+                const sw = ((specTMax - specTMin) / currentAnalysis.duration_s) * specImg.naturalWidth;
+                const sy = (1.0 - (visibleAudioFMax / nyqF)) * specImg.naturalHeight;
+                const sh = ((visibleAudioFMax - visibleAudioFMin) / nyqF) * specImg.naturalHeight;
+
+                sCtx.imageSmoothingEnabled = true;
+                sCtx.drawImage(specImg, sx, sy, sw, sh, padL, destYTop, plotW, destH);
+            }
+
+            // 2. Out-of-container range [nyqF, specFMax] (Diagonal hatch pattern)
+            if (specFMax > nyqF) {
+                const outFMin = Math.max(specFMin, nyqF);
+                const outYTop = padT + (1.0 - (specFMax - specFMin) / (specFMax - specFMin)) * plotH;
+                const outYBottom = padT + (1.0 - (outFMin - specFMin) / (specFMax - specFMin)) * plotH;
+                const outH = outYBottom - outYTop;
+
+                if (outH > 0) {
+                    drawHatchPattern(sCtx, padL, outYTop, plotW, outH, `🔒 Out of Container Bandwidth (>${nyqF.toFixed(1)} kHz)`);
+                }
+
+                // Draw Container Nyquist separator line
+                const yNyq = padT + (1.0 - (nyqF - specFMin) / (specFMax - specFMin)) * plotH;
+                if (yNyq >= padT && yNyq <= padT + plotH) {
+                    sCtx.strokeStyle = "rgba(255, 171, 0, 0.95)";
+                    sCtx.lineWidth = 1.5;
+                    sCtx.setLineDash([5, 3]);
+                    sCtx.beginPath();
+                    sCtx.moveTo(padL, yNyq);
+                    sCtx.lineTo(padL + plotW, yNyq);
+                    sCtx.stroke();
+                    sCtx.setLineDash([]);
+                    sCtx.fillStyle = "#ffab00";
+                    sCtx.font = "bold 9px monospace";
+                    sCtx.textAlign = "right";
+                    sCtx.fillText(`${nyqF.toFixed(1)}k Container Nyquist`, padL + plotW - 6, yNyq - 4);
+                }
+            }
 
             // Interactive Crosshair & HUD on hover
             if (specMouseX >= padL && specMouseX <= padL + plotW && specMouseY >= padT && specMouseY <= padT + plotH) {
@@ -2631,11 +3701,17 @@ HTML_PAGE = """<!DOCTYPE html>
 
                 const curT = specTMin + ((specMouseX - padL) / plotW) * (specTMax - specTMin);
                 const curF = specFMin + (1.0 - (specMouseY - padT) / plotH) * (specFMax - specFMin);
-                const curDb = getSpectrogramDb(curT, curF);
 
                 specHudTime.textContent = curT.toFixed(2) + " s";
                 specHudFreq.textContent = curF.toFixed(2) + " kHz (" + (curF * 1000).toFixed(0) + " Hz)";
-                specHudDb.textContent = curDb.toFixed(1) + " dBFS";
+                if (curF > nyqF) {
+                    specHudDb.textContent = "N/A (Out of Range)";
+                    specHudDb.style.color = "var(--accent-yellow)";
+                } else {
+                    const curDb = getSpectrogramDb(curT, curF);
+                    specHudDb.textContent = curDb.toFixed(1) + " dBFS";
+                    specHudDb.style.color = "";
+                }
             }
 
             sCtx.restore();
@@ -2645,17 +3721,26 @@ HTML_PAGE = """<!DOCTYPE html>
             sCtx.lineWidth = 1;
             sCtx.strokeRect(padL, padT, plotW, plotH);
 
-            sCtx.fillStyle = '#8b949e';
             sCtx.font = '10px monospace';
             sCtx.textAlign = 'right';
             sCtx.textBaseline = 'middle';
 
-            const fStep = (specFMax - specFMin) > 40 ? 20 : (specFMax - specFMin) > 15 ? 5 : 2;
+            const fRange = specFMax - specFMin;
+            let fStep = 20;
+            if (fRange <= 10) fStep = 2;
+            else if (fRange <= 25) fStep = 5;
+            else if (fRange <= 50) fStep = 10;
+            else if (fRange <= 100) fStep = 20;
+            else fStep = 40;
+
             for (let f = Math.ceil(specFMin / fStep) * fStep; f <= specFMax; f += fStep) {
                 const y = padT + (1.0 - (f - specFMin) / (specFMax - specFMin)) * plotH;
-                sCtx.fillText(`${f}k`, padL - 6, y);
-                sCtx.strokeStyle = 'rgba(255,255,255,0.06)';
-                sCtx.beginPath(); sCtx.moveTo(padL, y); sCtx.lineTo(padL + plotW, y); sCtx.stroke();
+                if (y >= padT - 2 && y <= padT + plotH + 2) {
+                    sCtx.fillStyle = (f === nyqF || f === 20 || f === 88.2 || f === 96) ? '#00e5ff' : '#8b949e';
+                    sCtx.fillText(`${f}k`, padL - 6, y);
+                    sCtx.strokeStyle = 'rgba(255,255,255,0.06)';
+                    sCtx.beginPath(); sCtx.moveTo(padL, y); sCtx.lineTo(padL + plotW, y); sCtx.stroke();
+                }
             }
 
             sCtx.textAlign = 'center';
@@ -2682,6 +3767,7 @@ HTML_PAGE = """<!DOCTYPE html>
                 } else {
                     label = `${t.toFixed(1)}s`;
                 }
+                sCtx.fillStyle = '#8b949e';
                 sCtx.fillText(label, x, padT + plotH + 6);
                 sCtx.strokeStyle = 'rgba(255,255,255,0.06)';
                 sCtx.beginPath(); sCtx.moveTo(x, padT); sCtx.lineTo(x, padT + plotH); sCtx.stroke();
@@ -2736,6 +3822,7 @@ HTML_PAGE = """<!DOCTYPE html>
 
                 const curTW = specInitTMax - specInitTMin;
                 const curFW = specInitFMax - specInitFMin;
+                const normMax = getNormalisedMaxF(currentAnalysis);
 
                 const dt = -(dx / plotW) * curTW;
                 const df = (dy / plotH) * curFW;
@@ -2743,7 +3830,7 @@ HTML_PAGE = """<!DOCTYPE html>
                 specTMin = Math.max(0, Math.min(currentAnalysis.duration_s - curTW, specInitTMin + dt));
                 specTMax = specTMin + curTW;
 
-                specFMin = Math.max(0, Math.min(currentAnalysis.nyquist_khz - curFW, specInitFMin + df));
+                specFMin = Math.max(0, Math.min(normMax - curFW, specInitFMin + df));
                 specFMax = specFMin + curFW;
             }
 
@@ -2763,7 +3850,14 @@ HTML_PAGE = """<!DOCTYPE html>
                 const tRatio = (mX - padL) / plotW;
                 const fRatio = 1.0 - (mY - padT) / plotH;
                 const factor = e.deltaY < 0 ? 1.25 : (1.0 / 1.25);
-                zoomSpec(factor, tRatio, fRatio);
+
+                if (e.shiftKey || mY > padT + plotH * 0.75) {
+                    zoomSpecX(factor, tRatio);
+                } else if (e.ctrlKey || e.altKey || mX < padL + plotW * 0.25) {
+                    zoomSpecY(factor, fRatio);
+                } else {
+                    zoomSpec(factor, tRatio, fRatio);
+                }
             }
         }, { passive: false });
 
@@ -2778,7 +3872,7 @@ HTML_PAGE = """<!DOCTYPE html>
 
 
         // ==========================================
-        // SPECTRUM CURVE CANVAS WITH ZOOM, PAN & HUD
+        // SPECTRUM CURVE CANVAS WITH DUAL-AXIS ZOOM & NORMALISED SCALE
         // ==========================================
         let curveFMin = 0.0, curveFMax = 88.2;
         let curveDbMin = -175.0, curveDbMax = 0.0;
@@ -2793,50 +3887,62 @@ HTML_PAGE = """<!DOCTYPE html>
         let curveMouseX = -1;
 
         function initSpectrumCurve(data) {
-            curveFMin = 0.0; curveFMax = data.nyquist_khz * 1.04;
+            const normMax = getNormalisedMaxF(data);
+            curveFMin = 0.0; curveFMax = normMax;
             curveDbMin = -175.0; curveDbMax = 0.0;
             resizeCurveCanvas();
         }
 
         function resetCurveZoom() {
             if (!currentAnalysis) return;
-            curveFMin = 0.0; curveFMax = currentAnalysis.nyquist_khz * 1.04;
+            const normMax = getNormalisedMaxF(currentAnalysis);
+            curveFMin = 0.0; curveFMax = normMax;
             curveDbMin = -175.0; curveDbMax = 0.0;
             drawCurve(curveCanvas.getBoundingClientRect().width, curveCanvas.getBoundingClientRect().height);
         }
 
         function setCurvePreset(type) {
             if (!currentAnalysis) return;
+            const normMax = getNormalisedMaxF(currentAnalysis);
             if (type === 'audible') {
-                curveFMin = 0.0; curveFMax = Math.min(20.0, currentAnalysis.nyquist_khz);
+                curveFMin = 0.0; curveFMax = 20.0;
                 curveDbMin = -120.0; curveDbMax = 0.0;
             } else if (type === 'cutoff') {
-                curveFMin = 15.0; curveFMax = Math.min(25.0, currentAnalysis.nyquist_khz);
+                curveFMin = 15.0; curveFMax = Math.min(30.0, normMax);
                 curveDbMin = -175.0; curveDbMax = -40.0;
             } else if (type === 'ultrasonic') {
-                curveFMin = Math.min(20.0, currentAnalysis.nyquist_khz); curveFMax = currentAnalysis.nyquist_khz * 1.04;
-                curveDbMin = -175.0; curveDbMax = -120.0;
+                curveFMin = 20.0; curveFMax = normMax;
+                curveDbMin = -175.0; curveDbMax = -80.0;
             }
             drawCurve(curveCanvas.getBoundingClientRect().width, curveCanvas.getBoundingClientRect().height);
         }
 
-        function zoomCurve(factor, centerFRatio = 0.5, centerDbRatio = 0.5) {
+        function zoomCurveX(factor, centerFRatio = 0.5) {
             if (!currentAnalysis) return;
+            const normMax = getNormalisedMaxF(currentAnalysis);
             const curFW = curveFMax - curveFMin;
-            const newFW = Math.max(1.0, Math.min(currentAnalysis.nyquist_khz * 1.04, curFW / factor));
+            const newFW = Math.max(1.0, Math.min(normMax, curFW / factor));
             const centerF = curveFMin + curFW * centerFRatio;
             curveFMin = Math.max(0, centerF - newFW * centerFRatio);
-            curveFMax = Math.min(currentAnalysis.nyquist_khz * 1.04, curveFMin + newFW);
+            curveFMax = Math.min(normMax, curveFMin + newFW);
             if (curveFMax - curveFMin < newFW) curveFMin = Math.max(0, curveFMax - newFW);
+            drawCurve(curveCanvas.getBoundingClientRect().width, curveCanvas.getBoundingClientRect().height);
+        }
 
+        function zoomCurveY(factor, centerDbRatio = 0.5) {
+            if (!currentAnalysis) return;
             const curDbW = curveDbMax - curveDbMin;
             const newDbW = Math.max(10.0, Math.min(175.0, curDbW / factor));
             const centerDb = curveDbMin + curDbW * centerDbRatio;
             curveDbMin = Math.max(-175.0, centerDb - newDbW * centerDbRatio);
             curveDbMax = Math.min(0.0, curveDbMin + newDbW);
             if (curveDbMax - curveDbMin < newDbW) curveDbMin = Math.max(-175.0, curveDbMax - newDbW);
-
             drawCurve(curveCanvas.getBoundingClientRect().width, curveCanvas.getBoundingClientRect().height);
+        }
+
+        function zoomCurve(factor, centerFRatio = 0.5, centerDbRatio = 0.5) {
+            zoomCurveX(factor, centerFRatio);
+            zoomCurveY(factor, centerDbRatio);
         }
 
         function resizeCurveCanvas() {
@@ -2874,14 +3980,23 @@ HTML_PAGE = """<!DOCTYPE html>
             const freqs = currentAnalysis.curve_freqs_khz;
             const peaks = currentAnalysis.curve_peaks;
             const rms = currentAnalysis.curve_rms;
+            const nyqF = currentAnalysis.nyquist_khz;
 
             cCtx.save();
             cCtx.beginPath();
             cCtx.rect(padL, padT, plotW, plotH);
             cCtx.clip();
 
-            // 1. File Container Nyquist Limit
-            const nyqF = currentAnalysis.nyquist_khz;
+            // 1. Out-of-container Nyquist Hatch Pattern
+            if (curveFMax > nyqF) {
+                const xNyq = freqToX(Math.max(curveFMin, nyqF), w, padL, padR);
+                const hatchW = (padL + plotW) - xNyq;
+                if (hatchW > 0) {
+                    drawHatchPattern(cCtx, xNyq, padT, hatchW, plotH, `🔒 Out of Container Bandwidth (>${nyqF.toFixed(1)} kHz)`);
+                }
+            }
+
+            // 2. File Container Nyquist Limit Line
             if (curveFMin <= nyqF && curveFMax >= nyqF) {
                 const xNyq = freqToX(nyqF, w, padL, padR);
                 cCtx.strokeStyle = "rgba(255, 171, 0, 0.95)";
@@ -2895,7 +4010,7 @@ HTML_PAGE = """<!DOCTYPE html>
                 cCtx.fillText(`${nyqF.toFixed(1)}k Nyquist`, Math.min(xNyq - 4, padL + plotW - 4), padT + 8);
             }
 
-            // 2. 20 kHz Audible Hearing Limit (shown only when container Nyquist > 20 kHz)
+            // 3. 20 kHz Audible Hearing Limit (shown only when container Nyquist > 20 kHz)
             if (currentAnalysis.nyquist_khz > 20.0 && curveFMin <= 20.0 && curveFMax >= 20.0) {
                 const x20 = freqToX(20.0, w, padL, padR);
                 cCtx.strokeStyle = "rgba(255, 23, 68, 0.85)";
@@ -2909,7 +4024,7 @@ HTML_PAGE = """<!DOCTYPE html>
                 cCtx.fillText("20k Hearing", x20, padT + 8);
             }
 
-            // 3. Suspected Native Lineage Nyquist (shown ONLY if estimated source differs from container)
+            // 4. Suspected Native Lineage Nyquist
             const prov = currentAnalysis.provenance || {};
             if (prov.suspected_nyquist_hz && prov.suspected_nyquist_hz < (currentAnalysis.sr / 2.0) - 200) {
                 const sNyqF = prov.suspected_nyquist_hz / 1000.0;
@@ -2928,13 +4043,13 @@ HTML_PAGE = """<!DOCTYPE html>
                 }
             }
 
-            // Peak curve (Cyan)
+            // Peak curve (Cyan) - drawn strictly up to container Nyquist
             cCtx.strokeStyle = "rgba(0, 229, 255, 0.9)";
             cCtx.lineWidth = 1.5;
             cCtx.beginPath();
             let first = true;
             for (let i = 0; i < freqs.length; i++) {
-                if (freqs[i] < curveFMin || freqs[i] > curveFMax) continue;
+                if (freqs[i] < curveFMin || freqs[i] > curveFMax || freqs[i] > nyqF) continue;
                 const x = freqToX(freqs[i], w, padL, padR);
                 const y = dbToY(peaks[i], h, padT, padB);
                 if (first) { cCtx.moveTo(x, y); first = false; }
@@ -2942,13 +4057,13 @@ HTML_PAGE = """<!DOCTYPE html>
             }
             cCtx.stroke();
 
-            // RMS curve (Magenta)
+            // RMS curve (Magenta) - drawn strictly up to container Nyquist
             cCtx.strokeStyle = "rgba(255, 0, 127, 0.9)";
             cCtx.lineWidth = 1.5;
             cCtx.beginPath();
             first = true;
             for (let i = 0; i < freqs.length; i++) {
-                if (freqs[i] < curveFMin || freqs[i] > curveFMax) continue;
+                if (freqs[i] < curveFMin || freqs[i] > curveFMax || freqs[i] > nyqF) continue;
                 const x = freqToX(freqs[i], w, padL, padR);
                 const y = dbToY(rms[i], h, padT, padB);
                 if (first) { cCtx.moveTo(x, y); first = false; }
@@ -2956,7 +4071,7 @@ HTML_PAGE = """<!DOCTYPE html>
             }
             cCtx.stroke();
 
-            // 4. Projected Filter Cutoff Response (Dashed Neon Green - plotted ONLY between Cutoff Start and Container Nyquist)
+            // Projected Filter Cutoff Response
             let recCutoffKhz = null;
             const rec = currentAnalysis.provenance ? currentAnalysis.provenance.recommendation : null;
             if (rec) {
@@ -2990,7 +4105,6 @@ HTML_PAGE = """<!DOCTYPE html>
                     legProj.textContent = `-- 🎯 Projected Filter (@ ${cutoffLabel})`;
                 }
 
-                // Vertical Cutoff Marker Line
                 if (curveFMin <= recCutoffKhz && curveFMax >= recCutoffKhz) {
                     const xCut = freqToX(recCutoffKhz, w, padL, padR);
                     cCtx.strokeStyle = "rgba(0, 230, 118, 0.85)";
@@ -3004,7 +4118,6 @@ HTML_PAGE = """<!DOCTYPE html>
                     cCtx.fillText(`Cutoff @ ${cutoffLabel}`, xCut + 4, padT + plotH - 8);
                 }
 
-                // Projected Filter Rolloff Curve (ONLY from Cutoff to Nyquist, applied to ACTUAL measured signal)
                 cCtx.strokeStyle = "#00e676";
                 cCtx.lineWidth = 2.0;
                 cCtx.setLineDash([5, 3]);
@@ -3032,70 +4145,83 @@ HTML_PAGE = """<!DOCTYPE html>
             if (curveMouseX >= padL && curveMouseX <= padL + plotW) {
                 const ratio = (curveMouseX - padL) / plotW;
                 const targetFreq = curveFMin + ratio * (curveFMax - curveFMin);
-                let closestIdx = 0, minDiff = Infinity;
-                for (let i = 0; i < freqs.length; i++) {
-                    const d = Math.abs(freqs[i] - targetFreq);
-                    if (d < minDiff) { minDiff = d; closestIdx = i; }
-                }
 
-                const curX = freqToX(freqs[closestIdx], w, padL, padR);
-                const curYPeak = dbToY(peaks[closestIdx], h, padT, padB);
-                const curYRMS = dbToY(rms[closestIdx], h, padT, padB);
-
-                cCtx.strokeStyle = "rgba(255, 255, 255, 0.45)";
-                cCtx.lineWidth = 1;
-                cCtx.setLineDash([2, 2]);
-                cCtx.beginPath();
-                cCtx.moveTo(curX, padT);
-                cCtx.lineTo(curX, padT + plotH);
-                cCtx.stroke();
-                cCtx.setLineDash([]);
-
-                // Peak point indicator (Cyan)
-                cCtx.fillStyle = "#00e5ff";
-                cCtx.beginPath();
-                cCtx.arc(curX, curYPeak, 4, 0, Math.PI * 2);
-                cCtx.fill();
-                cCtx.strokeStyle = "#fff";
-                cCtx.lineWidth = 1;
-                cCtx.stroke();
-
-                // RMS point indicator (Pink)
-                cCtx.fillStyle = "#ff007f";
-                cCtx.beginPath();
-                cCtx.arc(curX, curYRMS, 4, 0, Math.PI * 2);
-                cCtx.fill();
-                cCtx.strokeStyle = "#fff";
-                cCtx.lineWidth = 1;
-                cCtx.stroke();
-
-                // Projected point indicator (Neon Green) if active in cutoff zone
-                const hudProjItem = document.getElementById('hudProjItem');
-                const hudProj = document.getElementById('hudProj');
-                if (recCutoffKhz && freqs[closestIdx] >= recCutoffKhz && freqs[closestIdx] <= currentAnalysis.nyquist_khz) {
-                    const projDb = calcProjectedLevel(freqs[closestIdx], rms[closestIdx], recCutoffKhz);
-                    
-                    if (hudProjItem && hudProj) {
-                        hudProjItem.style.display = 'block';
-                        hudProj.textContent = `${projDb.toFixed(1)} dBFS`;
+                if (targetFreq > nyqF) {
+                    hudFreq.textContent = `${targetFreq.toFixed(2)} kHz (${(targetFreq * 1000).toFixed(0)} Hz)`;
+                    hudPeak.textContent = "N/A (Out of Range)";
+                    hudPeak.style.color = "var(--accent-yellow)";
+                    hudRMS.textContent = "N/A (Out of Range)";
+                    hudRMS.style.color = "var(--accent-yellow)";
+                    const hudProjItem = document.getElementById('hudProjItem');
+                    if (hudProjItem) hudProjItem.style.display = 'none';
+                } else {
+                    hudPeak.style.color = "";
+                    hudRMS.style.color = "";
+                    let closestIdx = 0, minDiff = Infinity;
+                    for (let i = 0; i < freqs.length; i++) {
+                        const d = Math.abs(freqs[i] - targetFreq);
+                        if (d < minDiff) { minDiff = d; closestIdx = i; }
                     }
 
-                    const curYProj = dbToY(projDb, h, padT, padB);
-                    cCtx.fillStyle = "#00e676";
+                    const curX = freqToX(freqs[closestIdx], w, padL, padR);
+                    const curYPeak = dbToY(peaks[closestIdx], h, padT, padB);
+                    const curYRMS = dbToY(rms[closestIdx], h, padT, padB);
+
+                    cCtx.strokeStyle = "rgba(255, 255, 255, 0.45)";
+                    cCtx.lineWidth = 1;
+                    cCtx.setLineDash([2, 2]);
                     cCtx.beginPath();
-                    cCtx.arc(curX, curYProj, 4, 0, Math.PI * 2);
+                    cCtx.moveTo(curX, padT);
+                    cCtx.lineTo(curX, padT + plotH);
+                    cCtx.stroke();
+                    cCtx.setLineDash([]);
+
+                    // Peak point indicator (Cyan)
+                    cCtx.fillStyle = "#00e5ff";
+                    cCtx.beginPath();
+                    cCtx.arc(curX, curYPeak, 4, 0, Math.PI * 2);
                     cCtx.fill();
                     cCtx.strokeStyle = "#fff";
                     cCtx.lineWidth = 1;
                     cCtx.stroke();
-                } else {
-                    if (hudProjItem) hudProjItem.style.display = 'none';
-                }
 
-                // Update HUD Text
-                hudFreq.textContent = `${freqs[closestIdx].toFixed(2)} kHz (${(freqs[closestIdx] * 1000).toFixed(0)} Hz)`;
-                hudPeak.textContent = `${peaks[closestIdx].toFixed(1)} dBFS`;
-                hudRMS.textContent = `${rms[closestIdx].toFixed(1)} dBFS`;
+                    // RMS point indicator (Pink)
+                    cCtx.fillStyle = "#ff007f";
+                    cCtx.beginPath();
+                    cCtx.arc(curX, curYRMS, 4, 0, Math.PI * 2);
+                    cCtx.fill();
+                    cCtx.strokeStyle = "#fff";
+                    cCtx.lineWidth = 1;
+                    cCtx.stroke();
+
+                    // Projected point indicator (Neon Green) if active in cutoff zone
+                    const hudProjItem = document.getElementById('hudProjItem');
+                    const hudProj = document.getElementById('hudProj');
+                    if (recCutoffKhz && freqs[closestIdx] >= recCutoffKhz && freqs[closestIdx] <= currentAnalysis.nyquist_khz) {
+                        const projDb = calcProjectedLevel(freqs[closestIdx], rms[closestIdx], recCutoffKhz);
+                        
+                        if (hudProjItem && hudProj) {
+                            hudProjItem.style.display = 'block';
+                            hudProj.textContent = `${projDb.toFixed(1)} dBFS`;
+                        }
+
+                        const curYProj = dbToY(projDb, h, padT, padB);
+                        cCtx.fillStyle = "#00e676";
+                        cCtx.beginPath();
+                        cCtx.arc(curX, curYProj, 4, 0, Math.PI * 2);
+                        cCtx.fill();
+                        cCtx.strokeStyle = "#fff";
+                        cCtx.lineWidth = 1;
+                        cCtx.stroke();
+                    } else {
+                        if (hudProjItem) hudProjItem.style.display = 'none';
+                    }
+
+                    // Update HUD Text
+                    hudFreq.textContent = `${freqs[closestIdx].toFixed(2)} kHz (${(freqs[closestIdx] * 1000).toFixed(0)} Hz)`;
+                    hudPeak.textContent = `${peaks[closestIdx].toFixed(1)} dBFS`;
+                    hudRMS.textContent = `${rms[closestIdx].toFixed(1)} dBFS`;
+                }
             } else {
                 const hudProjItem = document.getElementById('hudProjItem');
                 if (hudProjItem) hudProjItem.style.display = 'none';
@@ -3123,12 +4249,22 @@ HTML_PAGE = """<!DOCTYPE html>
 
             cCtx.textAlign = 'center';
             cCtx.textBaseline = 'top';
-            const fStep = (curveFMax - curveFMin) > 40 ? 20 : (curveFMax - curveFMin) > 15 ? 5 : 2;
+            const fRange = curveFMax - curveFMin;
+            let fStep = 20;
+            if (fRange <= 10) fStep = 2;
+            else if (fRange <= 25) fStep = 5;
+            else if (fRange <= 50) fStep = 10;
+            else if (fRange <= 100) fStep = 20;
+            else fStep = 40;
+
             for (let f = Math.ceil(curveFMin / fStep) * fStep; f <= curveFMax; f += fStep) {
                 const x = freqToX(f, w, padL, padR);
-                cCtx.fillText(`${f}k`, x, padT + plotH + 6);
-                cCtx.strokeStyle = 'rgba(255,255,255,0.06)';
-                cCtx.beginPath(); cCtx.moveTo(x, padT); cCtx.lineTo(x, padT + plotH); cCtx.stroke();
+                if (x >= padL - 2 && x <= padL + plotW + 2) {
+                    cCtx.fillStyle = (f === nyqF || f === 20 || f === 88.2 || f === 96) ? '#00e5ff' : '#8b949e';
+                    cCtx.fillText(`${f}k`, x, padT + plotH + 6);
+                    cCtx.strokeStyle = 'rgba(255,255,255,0.06)';
+                    cCtx.beginPath(); cCtx.moveTo(x, padT); cCtx.lineTo(x, padT + plotH); cCtx.stroke();
+                }
             }
         }
 
@@ -3155,11 +4291,12 @@ HTML_PAGE = """<!DOCTYPE html>
 
                 const curFW = curveInitFMax - curveInitFMin;
                 const curDbW = curveInitDbMax - curveInitDbMin;
+                const normMax = getNormalisedMaxF(currentAnalysis);
 
                 const df = -(dx / plotW) * curFW;
                 const dDb = (dy / plotH) * curDbW;
 
-                curveFMin = Math.max(0, Math.min(currentAnalysis.nyquist_khz * 1.04 - curFW, curveInitFMin + df));
+                curveFMin = Math.max(0, Math.min(normMax - curFW, curveInitFMin + df));
                 curveFMax = curveFMin + curFW;
 
                 curveDbMin = Math.max(-175.0, Math.min(0.0 - curDbW, curveInitDbMin + dDb));
@@ -3182,7 +4319,14 @@ HTML_PAGE = """<!DOCTYPE html>
                 const fRatio = (mX - padL) / plotW;
                 const dbRatio = 1.0 - (mY - padT) / plotH;
                 const factor = e.deltaY < 0 ? 1.25 : (1.0 / 1.25);
-                zoomCurve(factor, fRatio, dbRatio);
+
+                if (e.shiftKey || mY > padT + plotH * 0.75) {
+                    zoomCurveX(factor, fRatio);
+                } else if (e.ctrlKey || e.altKey || mX < padL + plotW * 0.25) {
+                    zoomCurveY(factor, dbRatio);
+                } else {
+                    zoomCurve(factor, fRatio, dbRatio);
+                }
             }
         }, { passive: false });
 
@@ -3382,662 +4526,8 @@ HTML_PAGE = """<!DOCTYPE html>
             await loadFolderPickerDirectory(folderPickerCurrentPath);
         }
 
-        function closeFolderPicker() {
-            const modal = document.getElementById('folderPickerModal');
-            if (modal) modal.style.display = 'none';
-        }
-
-        async function loadFolderPickerDirectory(targetPath) {
-            folderPickerCurrentPath = targetPath;
-            const pathBar = document.getElementById('folderPickerPathBar');
-            const listEl = document.getElementById('folderPickerList');
-            if (pathBar) pathBar.value = targetPath;
-            if (listEl) {
-                listEl.innerHTML = '<div style="padding: 24px; text-align: center; color: #8b949e;"><div class="spinner" style="margin: 0 auto 10px;"></div>Loading folders...</div>';
-            }
-
-            try {
-                const res = await fetch(`/api/browse?path=${encodeURIComponent(targetPath)}`);
-                const data = await res.json();
-                if (!data || !listEl) return;
-
-                folderPickerCurrentPath = data.current_path;
-                if (pathBar) pathBar.value = data.current_path;
-
-                let html = '';
-                if (data.parent_path && data.parent_path !== data.current_path) {
-                    html += `<div class="folder-picker-item" onclick="loadFolderPickerDirectory('${data.parent_path.replace(/'/g, "\\'")}')">
-                        <span style="font-size: 1.1rem;">📁</span>
-                        <span style="font-weight: 600; color: var(--accent-cyan);">.. [Up to Parent Folder]</span>
-                    </div>`;
-                }
-
-                if (data.dirs && data.dirs.length > 0) {
-                    data.dirs.forEach(d => {
-                        html += `<div class="folder-picker-item" onclick="loadFolderPickerDirectory('${d.path.replace(/'/g, "\\'")}')">
-                            <span style="font-size: 1.1rem;">📁</span>
-                            <span style="color: var(--text-heading); font-weight: 500;">${d.name}</span>
-                        </div>`;
-                    });
-                } else {
-                    html += `<div style="padding: 16px; color: var(--text-muted); font-size: 0.82rem;">No subdirectories found in this folder.</div>`;
-                }
-                listEl.innerHTML = html;
-            } catch (err) {
-                if (listEl) listEl.innerHTML = `<div style="padding: 16px; color: #ff5252;">Error loading directory: ${err.message}</div>`;
-            }
-        }
-
-        function selectFolderPickerChoice() {
-            const pathBar = document.getElementById('folderPickerPathBar');
-            const chosenPath = pathBar ? pathBar.value.trim() : folderPickerCurrentPath;
-            const targetInput = document.getElementById(folderPickerTargetInputId);
-            if (targetInput) {
-                targetInput.value = chosenPath;
-            }
-            closeFolderPicker();
-        }
-
-        async function openUpsampleModal(mode = 'album', customSrcPath = null) {
-            upsampleTargetMode = mode;
-            const modal = document.getElementById('upsampleModal');
-            const scopeBadge = document.getElementById('upsampleModalScopeBadge');
-            const srcInput = document.getElementById('upsampleSrcPath');
-            const dstInput = document.getElementById('upsampleDstDir');
-            const initialLaunchControls = document.getElementById('initialLaunchControls');
-            const interactiveDecisionControls = document.getElementById('interactiveDecisionControls');
-
-            // If an active job is currently waiting for input, show the prompt UI
-            if (activeUpsampleJob && activeUpsampleJob.status === 'waiting_for_input' && currentPromptData) {
-                renderInteractivePromptUI(currentPromptData);
-                modal.style.display = 'flex';
-                return;
-            }
-
-            // Normal initial launcher setup
-            let srcPath = customSrcPath;
-            if (!srcPath) {
-                if (mode === 'track') {
-                    srcPath = currentAnalysis ? currentAnalysis.filepath : (directoryData && directoryData.files && directoryData.files[0] ? directoryData.files[0].path : '');
-                } else {
-                    srcPath = currentPath;
-                }
-            }
-
-            if (!srcPath) {
-                alert('Please select a track or navigate to an album folder first.');
-                return;
-            }
-
-            srcInput.value = srcPath;
-            scopeBadge.textContent = mode === 'track' ? 'SINGLE TRACK' : 'ALBUM BATCH';
-            scopeBadge.style.background = mode === 'track' ? 'rgba(0, 229, 255, 0.15)' : 'rgba(0, 230, 118, 0.15)';
-            scopeBadge.style.borderColor = mode === 'track' ? 'rgba(0, 229, 255, 0.4)' : 'rgba(0, 230, 118, 0.4)';
-            scopeBadge.style.color = mode === 'track' ? 'var(--accent-cyan)' : '#00e676';
-
-            if (initialLaunchControls) initialLaunchControls.style.display = 'grid';
-            if (interactiveDecisionControls) interactiveDecisionControls.style.display = 'none';
-
-            // Populate Forensic Recommendation & Rationale Card for initial review
-            populateRecommendationCard(mode, srcPath);
-
-            try {
-                const res = await fetch(`/api/upsample/dest_preview?path=${encodeURIComponent(srcPath)}`);
-                const data = await res.json();
-                if (data && data.dest_dir) {
-                    dstInput.value = data.dest_dir;
-                }
-            } catch (err) {
-                dstInput.value = '';
-            }
-
-            applyForensicRecommendationPreset();
-            modal.style.display = 'flex';
-        }
-
-        function populateRecommendationCard(mode, srcPath) {
-            const trackTitleEl = document.getElementById('promptTrackTitle');
-            const provLabelEl = document.getElementById('promptProvLabel');
-            const formatMetaEl = document.getElementById('promptFormatMeta');
-            const metricsRowEl = document.getElementById('promptMetricsRow');
-            const actionDescEl = document.getElementById('promptActionDesc');
-            const dspFlagEl = document.getElementById('promptDspFlag');
-            const rationaleEl = document.getElementById('promptTechnicalRationale');
-
-            const filename = srcPath.split('/').filter(Boolean).pop() || 'Item';
-            trackTitleEl.textContent = mode === 'track' ? filename : `Album: ${filename}`;
-
-            if (currentAnalysis && currentAnalysis.provenance) {
-                const p = currentAnalysis.provenance;
-                const rec = p.recommendation || {};
-                const prim = p.primary || {};
-                const vis = p.visual_morphology || {};
-                const pk = vis.primary_knee || {};
-                const purity = vis.stopband_purity || {};
-
-                provLabelEl.textContent = prim.label ? `${prim.label.toUpperCase()} [${prim.confidence || 'HIGH'} CONFIDENCE]` : 'STANDARD MASTER';
-                provLabelEl.className = 'provenance-tag ' + (prim.label === 'Native Master' ? 'badge-provenance-native' : prim.label === 'Lowpass Filtered' ? 'badge-provenance-lowpass' : 'badge-provenance-upsampled');
-                
-                const srKhz = currentAnalysis.sr ? (currentAnalysis.sr / 1000).toFixed(1) : '44.1';
-                const ch = currentAnalysis.channels || 2;
-                const bd = currentAnalysis.bit_depth || 24;
-                formatMetaEl.textContent = `Source Format: ${srKhz} kHz • ${ch} Channels • ${bd}-bit PCM`;
-
-                let metricText = '';
-                if (pk && pk.is_brickwall_knee) {
-                    metricText += `📐 Brickwall Knee: ${pk.freq_khz.toFixed(1)} kHz (Slope: ${pk.steepest_slope_db_per_khz.toFixed(1)} dB/kHz, Drop: ${pk.drop_db.toFixed(1)} dB) • `;
-                }
-                if (purity && purity.has_stopband) {
-                    metricText += `📻 Stopband: ${purity.purity_label || 'Clean'} • `;
-                }
-                metricText += `📊 True Peak: ${currentAnalysis.true_peak_db ? currentAnalysis.true_peak_db.toFixed(1) + ' dBTP' : 'Safe'}`;
-                metricsRowEl.textContent = metricText;
-
-                actionDescEl.textContent = rec.action ? `${rec.action}: ${rec.details || ''}` : 'Direct 64-bit polyphase sinc upsampling with Shibata noise shaping.';
-                dspFlagEl.textContent = rec.dsp_params || '--phase min --dither shibata';
-
-                // Detailed "Why" explanation
-                if (rec.details) {
-                    rationaleEl.textContent = rec.details;
-                } else if (prim.label === 'Lowpass Filtered') {
-                    rationaleEl.textContent = 'A steep lowpass reconstruction cutoff was detected. A minimum-phase apodizing sinc filter is recommended to eliminate pre-ringing impulse artefacts and suppress ultrasonic alias imaging without touching audible frequencies.';
-                } else {
-                    rationaleEl.textContent = 'Preserves pristine bit-perfect audio fidelity across audible octaves while providing optimal 64-bit double-precision sinc reconstruction with psychoacoustic 24-bit Shibata noise shaping.';
-                }
-            } else {
-                provLabelEl.textContent = 'ALBUM BATCH AUDIT';
-                provLabelEl.className = 'provenance-tag badge-provenance-native';
-                formatMetaEl.textContent = 'Multi-Track Forensic Upsampling Pipeline';
-                metricsRowEl.textContent = 'Per-track dynamic spectral analysis and intersample headroom protection';
-                actionDescEl.textContent = 'Interactive AcoustiSinc Upsampling';
-                dspFlagEl.textContent = '--phase min --dither shibata';
-                rationaleEl.textContent = 'Audits every track individually during batch execution to recommend optimal minimum-phase or apodizing recipes tailored to each master file.';
-            }
-        }
-
-        function reopenActivePromptModal() {
-            if (currentPromptData) {
-                renderInteractivePromptUI(currentPromptData);
-            }
-            const modal = document.getElementById('upsampleModal');
-            if (modal) modal.style.display = 'flex';
-        }
-
-        function renderInteractivePromptUI(pData) {
-            const scopeBadge = document.getElementById('upsampleModalScopeBadge');
-            const srcInput = document.getElementById('upsampleSrcPath');
-            const dstInput = document.getElementById('upsampleDstDir');
-            const initialLaunchControls = document.getElementById('initialLaunchControls');
-            const interactiveDecisionControls = document.getElementById('interactiveDecisionControls');
-
-            if (initialLaunchControls) initialLaunchControls.style.display = 'none';
-            if (interactiveDecisionControls) interactiveDecisionControls.style.display = 'grid';
-
-            scopeBadge.textContent = `TRACK ${pData.track_idx || 1} OF ${pData.total_tracks || 1}`;
-            scopeBadge.style.background = 'rgba(255, 234, 0, 0.15)';
-            scopeBadge.style.borderColor = 'rgba(255, 234, 0, 0.4)';
-            scopeBadge.style.color = 'var(--accent-yellow)';
-
-            srcInput.value = pData.filepath || '';
-            if (pData.album_dir && (!dstInput.value || dstInput.value.trim() === '')) {
-                fetch(`/api/upsample/dest_preview?path=${encodeURIComponent(pData.album_dir)}`)
-                    .then(r => r.json())
-                    .then(d => { if (d && d.dest_dir) dstInput.value = d.dest_dir; })
-                    .catch(() => {});
-            }
-
-            // Populate Forensic Audit Card
-            const recInfo = pData.rec_info || {};
-            const recParams = pData.rec_params || {};
-            const provInfo = pData.prov_info || {};
-            const primary = provInfo.primary || {};
-            const vis = provInfo.visual_morphology || {};
-            const pk = vis.primary_knee || {};
-            const purity = vis.stopband_purity || {};
-            const srKhz = pData.sr ? (pData.sr / 1000).toFixed(1) : '44.1';
-
-            document.getElementById('promptTrackTitle').textContent = `[Track ${pData.track_idx}/${pData.total_tracks}] ${pData.track_file || 'Track'}`;
-            
-            const provLabel = primary.label ? `${primary.label.toUpperCase()} [${primary.confidence || 'HIGH'} CONFIDENCE]` : (recInfo.action ? recInfo.action.toUpperCase() : 'STANDARD MASTER');
-            const provEl = document.getElementById('promptProvLabel');
-            provEl.textContent = provLabel;
-            provEl.className = 'provenance-tag ' + (primary.label === 'Native Master' ? 'badge-provenance-native' : (primary.label === 'Lowpass Filtered' ? 'badge-provenance-lowpass' : 'badge-provenance-upsampled'));
-
-            document.getElementById('promptFormatMeta').textContent = `Source Format: ${srKhz} kHz • 2 Channels • Master FLAC`;
-            
-            let metricText = '';
-            if (pk && pk.is_brickwall_knee) {
-                metricText += `📐 Brickwall Knee: ${pk.freq_khz ? pk.freq_khz.toFixed(1) : ''} kHz (Slope: ${pk.steepest_slope_db_per_khz ? pk.steepest_slope_db_per_khz.toFixed(1) : ''} dB/kHz, Drop: ${pk.drop_db ? pk.drop_db.toFixed(1) : ''} dB) • `;
-            }
-            if (purity && purity.has_stopband) {
-                metricText += `📻 Stopband: ${purity.purity_label || 'Clean'} • `;
-            }
-            metricText += `📊 64-Bit Sinc Polyphase Reconstruction`;
-            document.getElementById('promptMetricsRow').textContent = metricText;
-
-            document.getElementById('promptActionDesc').textContent = recInfo.action ? `${recInfo.action}` : 'Direct 64-Bit Sinc Upsampling';
-            document.getElementById('promptDspFlag').textContent = recInfo.dsp_params || '--phase min --dither shibata';
-            
-            // Detailed Technical Rationale
-            if (recInfo.details) {
-                document.getElementById('promptTechnicalRationale').textContent = recInfo.details;
-            } else if (primary.label === 'Lowpass Filtered') {
-                document.getElementById('promptTechnicalRationale').textContent = 'A steep lowpass reconstruction knee was detected. A minimum-phase apodizing sinc filter is recommended to eliminate pre-ringing impulse artefacts and suppress ultrasonic alias imaging without touching audible frequencies.';
-            } else {
-                document.getElementById('promptTechnicalRationale').textContent = 'Preserves pristine bit-perfect audio fidelity across audible octaves while providing optimal 64-bit double-precision sinc reconstruction with psychoacoustic 24-bit Shibata noise shaping.';
-            }
-
-            // Populate form overrides from recommended parameters
-            const rateSelect = document.getElementById('upsampleRate');
-            const phaseSelect = document.getElementById('upsamplePhase');
-            const apodizingCheck = document.getElementById('upsampleApodizingEnable');
-            const cutoffInput = document.getElementById('upsampleCutoffHz');
-            const cutoffHint = document.getElementById('cutoffHint');
-            const steepCheck = document.getElementById('upsampleSteep');
-            const ditherSelect = document.getElementById('upsampleDither');
-            const mqaSelect = document.getElementById('upsampleMqa');
-
-            rateSelect.value = '4x';
-            phaseSelect.value = recParams.phase_mode || 'min';
-            ditherSelect.value = recParams.dither_mode || 'shibata';
-            mqaSelect.value = recParams.mqa_mode || 'adaptive';
-            steepCheck.checked = !!recParams.steep;
-
-            if (recParams.cutoff_hz) {
-                apodizingCheck.checked = true;
-                cutoffInput.disabled = false;
-                cutoffInput.value = Math.round(recParams.cutoff_hz);
-                if (cutoffHint) cutoffHint.textContent = `Recommended (${cutoffInput.value} Hz Knee)`;
-            } else if (recParams.apodizing) {
-                apodizingCheck.checked = true;
-                cutoffInput.disabled = false;
-                cutoffInput.value = '22050';
-                if (cutoffHint) cutoffHint.textContent = 'Standard Apodizing (22,050 Hz)';
-            } else {
-                apodizingCheck.checked = false;
-                cutoffInput.disabled = true;
-                cutoffInput.value = '';
-                if (cutoffHint) cutoffHint.textContent = 'Disabled (Full Nyquist)';
-            }
-
-            const btnSummary = document.getElementById('btnPromptViewSummary');
-            if (btnSummary) {
-                btnSummary.style.display = pData.has_summary ? 'flex' : 'none';
-            }
-        }
-
-        async function startUpsampleAlbumBatch(interactiveMode = true) {
-            if (!currentPath) {
-                alert('Please navigate to an album directory first.');
-                return;
-            }
-
-            let dstDir = '';
-            try {
-                const res = await fetch(`/api/upsample/dest_preview?path=${encodeURIComponent(currentPath)}`);
-                const data = await res.json();
-                if (data && data.dest_dir) {
-                    dstDir = data.dest_dir;
-                }
-            } catch (err) {}
-
-            const payload = {
-                source_path: currentPath,
-                dest_dir: dstDir,
-                rate: '4x',
-                phase: 'min',
-                apodizing: false,
-                cutoff_hz: null,
-                steep: false,
-                dither: 'shibata',
-                mqa: 'adaptive',
-                overwrite: 'off',
-                report: true,
-                interactive: interactiveMode,
-                use_recommended: true
-            };
-
-            try {
-                closeUpsampleModal();
-                updateHeaderUpsampleUI({ 
-                    status: 'running', 
-                    stage: 'Scanning Headroom & Auditing Track 1...', 
-                    progress_percent: 2, 
-                    current_track: 'Auditing Track 1...',
-                    track_index: 1,
-                    total_tracks: directoryData && directoryData.files ? directoryData.files.length : 1
-                });
-
-                const res = await fetch('/api/upsample/start', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(payload)
-                });
-                const data = await res.json();
-                if (data.status !== 'ok') {
-                    dismissUpsampleHeaderWidget();
-                    alert('Failed to start upsampling session: ' + (data.message || 'Unknown error'));
-                    return;
-                }
-
-                activeUpsampleJob = data;
-                lastLogIdx = 0;
-                activePromptTrack = null;
-                startPollingUpsampleStatus();
-            } catch (err) {
-                dismissUpsampleHeaderWidget();
-                alert('Error starting upsampler: ' + err.message);
-            }
-        }
-
-        function openUpsampleModalForTrack() {
-            if (!currentAnalysis || !currentAnalysis.filepath) {
-                alert('Please select and analyze a track first.');
-                return;
-            }
-            openUpsampleModal('track', currentAnalysis.filepath);
-        }
-
-        function openUpsampleModalForCurrentFolder() {
-            startUpsampleAlbumBatch(true);
-        }
-
-        function closeUpsampleModal() {
-            const modal = document.getElementById('upsampleModal');
-            if (modal) modal.style.display = 'none';
-        }
-
-        function toggleApodizingInput() {
-            const enableCheck = document.getElementById('upsampleApodizingEnable');
-            const cutoffInput = document.getElementById('upsampleCutoffHz');
-            const cutoffHint = document.getElementById('cutoffHint');
-            cutoffInput.disabled = !enableCheck.checked;
-            if (enableCheck.checked) {
-                if (!cutoffInput.value) cutoffInput.value = '22050';
-                if (cutoffHint) cutoffHint.textContent = `Active (${cutoffInput.value} Hz)`;
-            } else {
-                if (cutoffHint) cutoffHint.textContent = 'Disabled (Full Nyquist)';
-            }
-        }
-
-        function applyForensicRecommendationPreset() {
-            setActivePresetPill('presetBtnRecommended');
-            const rateSelect = document.getElementById('upsampleRate');
-            const phaseSelect = document.getElementById('upsamplePhase');
-            const apodizingCheck = document.getElementById('upsampleApodizingEnable');
-            const cutoffInput = document.getElementById('upsampleCutoffHz');
-            const cutoffHint = document.getElementById('cutoffHint');
-            const ditherSelect = document.getElementById('upsampleDither');
-            const mqaSelect = document.getElementById('upsampleMqa');
-            const steepCheck = document.getElementById('upsampleSteep');
-
-            rateSelect.value = '4x';
-            phaseSelect.value = 'min';
-            ditherSelect.value = 'shibata';
-            mqaSelect.value = 'adaptive';
-            steepCheck.checked = false;
-            apodizingCheck.checked = false;
-            cutoffInput.disabled = true;
-            cutoffInput.value = '';
-            if (cutoffHint) cutoffHint.textContent = 'Disabled (Full Nyquist)';
-
-            if (currentAnalysis && currentAnalysis.provenance) {
-                const p = currentAnalysis.provenance;
-                const rec = p.recommendation || {};
-                const paramsStr = rec.dsp_params || '';
-
-                if (paramsStr.includes('--phase linear')) {
-                    phaseSelect.value = 'linear';
-                } else if (paramsStr.includes('--phase min') || paramsStr.includes('--filter min')) {
-                    phaseSelect.value = 'min';
-                }
-
-                if (rec.filter_cutoff_khz) {
-                    apodizingCheck.checked = true;
-                    cutoffInput.disabled = false;
-                    const hz = Math.round(rec.filter_cutoff_khz * 1000);
-                    cutoffInput.value = hz;
-                    if (cutoffHint) cutoffHint.textContent = `Auto-detected (${rec.filter_cutoff_khz} kHz Knee)`;
-                } else if (paramsStr.includes('--cutoff') || paramsStr.includes('--apod')) {
-                    apodizingCheck.checked = true;
-                    cutoffInput.disabled = false;
-                    const m = paramsStr.match(/--cutoff\\s+(\\d+)/);
-                    cutoffInput.value = m ? m[1] : '22050';
-                    if (cutoffHint) cutoffHint.textContent = `Recommended (${cutoffInput.value} Hz)`;
-                }
-
-                if (paramsStr.includes('--steep')) {
-                    steepCheck.checked = true;
-                }
-
-                if (paramsStr.includes('--mqa strip')) {
-                    mqaSelect.value = 'strip';
-                } else if (paramsStr.includes('--mqa ignore')) {
-                    mqaSelect.value = 'ignore';
-                }
-            }
-        }
-
-        function applyDefaultPreset(type) {
-            const rateSelect = document.getElementById('upsampleRate');
-            const phaseSelect = document.getElementById('upsamplePhase');
-            const apodizingCheck = document.getElementById('upsampleApodizingEnable');
-            const cutoffInput = document.getElementById('upsampleCutoffHz');
-            const cutoffHint = document.getElementById('cutoffHint');
-            const ditherSelect = document.getElementById('upsampleDither');
-            const mqaSelect = document.getElementById('upsampleMqa');
-            const steepCheck = document.getElementById('upsampleSteep');
-
-            rateSelect.value = '4x';
-            ditherSelect.value = 'shibata';
-            mqaSelect.value = 'adaptive';
-            steepCheck.checked = false;
-
-            if (type === '4x') {
-                setActivePresetPill('presetBtnAudiophile4x');
-                phaseSelect.value = 'min';
-                apodizingCheck.checked = false;
-                cutoffInput.disabled = true;
-                cutoffInput.value = '';
-                if (cutoffHint) cutoffHint.textContent = 'Disabled (Full Nyquist)';
-            } else if (type === 'apod') {
-                setActivePresetPill('presetBtnApodizing');
-                phaseSelect.value = 'min';
-                apodizingCheck.checked = true;
-                cutoffInput.disabled = false;
-                cutoffInput.value = '22050';
-                if (cutoffHint) cutoffHint.textContent = 'Standard Apodizing (22,050 Hz)';
-            }
-        }
-
-        function setActivePresetPill(btnId) {
-            ['presetBtnRecommended', 'presetBtnAudiophile4x', 'presetBtnApodizing'].forEach(id => {
-                const el = document.getElementById(id);
-                if (el) el.classList.toggle('active', id === btnId);
-            });
-        }
-
-        async function quickUpsampleCurrentTrack() {
-            if (!currentAnalysis || !currentAnalysis.filepath) {
-                alert('Please select a track first.');
-                return;
-            }
-            await openUpsampleModal('track', currentAnalysis.filepath);
-            applyForensicRecommendationPreset();
-            startUpsampleJob(true);
-        }
-
-        async function startUpsampleJob(interactiveMode = true) {
-            const srcPath = document.getElementById('upsampleSrcPath').value.trim();
-            const dstDir = document.getElementById('upsampleDstDir').value.trim();
-            const rate = document.getElementById('upsampleRate').value;
-            const phase = document.getElementById('upsamplePhase').value;
-            const apodizingEnable = document.getElementById('upsampleApodizingEnable').checked;
-            const cutoffHz = apodizingEnable ? document.getElementById('upsampleCutoffHz').value : null;
-            const steep = document.getElementById('upsampleSteep').checked;
-            const dither = document.getElementById('upsampleDither').value;
-            const mqa = document.getElementById('upsampleMqa').value;
-            const overwrite = document.getElementById('upsampleOverwrite').value;
-            const report = document.getElementById('upsampleReport').checked;
-
-            if (!srcPath) {
-                alert('Source path is required.');
-                return;
-            }
-
-            const payload = {
-                source_path: srcPath,
-                dest_dir: dstDir,
-                rate: rate,
-                phase: phase,
-                apodizing: apodizingEnable,
-                cutoff_hz: cutoffHz,
-                steep: steep,
-                dither: dither,
-                mqa: mqa,
-                overwrite: overwrite,
-                report: report,
-                interactive: interactiveMode,
-                use_recommended: !interactiveMode
-            };
-
-            try {
-                closeUpsampleModal();
-                updateHeaderUpsampleUI({ 
-                    status: 'running', 
-                    stage: 'Scanning Headroom & Auditing...', 
-                    progress_percent: 2, 
-                    current_track: 'Initializing...' 
-                });
-
-                const res = await fetch('/api/upsample/start', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(payload)
-                });
-                const data = await res.json();
-                if (data.status !== 'ok') {
-                    dismissUpsampleHeaderWidget();
-                    alert('Failed to start upsampling job: ' + (data.message || 'Unknown error'));
-                    return;
-                }
-
-                activeUpsampleJob = data;
-                lastLogIdx = 0;
-                activePromptTrack = null;
-                startPollingUpsampleStatus();
-            } catch (err) {
-                dismissUpsampleHeaderWidget();
-                alert('Error submitting upsampling job: ' + err.message);
-            }
-        }
-
-        async function sendPromptChoice(choice) {
-            if (choice === 'q') {
-                cancelUpsampleJob();
-                return;
-            }
-
-            const phase = document.getElementById('upsamplePhase').value;
-            const apodizingEnable = document.getElementById('upsampleApodizingEnable').checked;
-            const cutoffHz = apodizingEnable && document.getElementById('upsampleCutoffHz').value ? parseFloat(document.getElementById('upsampleCutoffHz').value) : null;
-            const steep = document.getElementById('upsampleSteep').checked;
-            const dither = document.getElementById('upsampleDither').value;
-            const mqa = document.getElementById('upsampleMqa').value;
-
-            const customParams = {
-                phase_mode: phase,
-                apodizing: apodizingEnable,
-                dither_mode: dither,
-                cutoff_hz: cutoffHz,
-                mqa_mode: mqa,
-                steep: steep
-            };
-
-            // Immediately background modal until next prompt is needed
-            closeUpsampleModal();
-
-            try {
-                const res = await fetch('/api/upsample/respond', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        choice: choice,
-                        custom_params: customParams
-                    })
-                });
-                const data = await res.json();
-                if (data.status !== 'ok') {
-                    alert('Error submitting choice: ' + (data.message || 'Unknown error'));
-                }
-            } catch (err) {
-                alert('Failed to send decision: ' + err.message);
-            }
-        }
-
-        function startPollingUpsampleStatus() {
-            if (upsamplePollTimer) clearInterval(upsamplePollTimer);
-            upsamplePollTimer = setInterval(pollUpsampleStatus, 700);
-            pollUpsampleStatus();
-        }
-
-        async function pollUpsampleStatus() {
-            try {
-                const res = await fetch(`/api/upsample/status?since_log=${lastLogIdx}`);
-                const data = await res.json();
-                if (!data) return;
-                activeUpsampleJob = data;
-
-                // Append logs to terminal
-                if (data.logs && data.logs.length > 0) {
-                    const logsContainer = document.getElementById('upsampleTerminalLogs');
-                    data.logs.forEach(l => {
-                        lastLogIdx = Math.max(lastLogIdx, l.idx);
-                        if (logsContainer) {
-                            const lineEl = document.createElement('div');
-                            lineEl.className = 'drawer-terminal-line' + (l.text.includes('Error') ? ' error' : l.text.includes('Complete') || l.text.includes('==') ? ' highlight' : '');
-                            lineEl.textContent = `[${l.time}] ${l.text}`;
-                            logsContainer.appendChild(lineEl);
-                        }
-                    });
-                    const terminal = document.getElementById('upsampleTerminalBox');
-                    if (terminal) terminal.scrollTop = terminal.scrollHeight;
-                }
-
-                updateHeaderUpsampleUI(data);
-
-                // Handle interactive decision prompt
-                if (data.status === 'waiting_for_input' && data.prompt_data) {
-                    currentPromptData = data.prompt_data;
-                    const trackFile = data.prompt_data.track_file;
-                    if (activePromptTrack !== trackFile) {
-                        activePromptTrack = trackFile;
-                        renderInteractivePromptUI(data.prompt_data);
-                        const modal = document.getElementById('upsampleModal');
-                        if (modal) modal.style.display = 'flex';
-                    }
-                } else if (data.status === 'running') {
-                    currentPromptData = null;
-                } else if (data.status === 'completed') {
-                    currentPromptData = null;
-                    closeUpsampleModal();
-                } else if (data.status === 'failed' || data.status === 'cancelled') {
-                    dismissUpsampleHeaderWidget();
-                    closeUpsampleModal();
-                }
-            } catch (err) {}
-        }
-
-        let folderPickerTargetInputId = 'upsampleDstDir';
-        let folderPickerCurrentPath = '/mnt/PrimaryFS/FLAC_music/music';
-
-        async function openFolderPicker(targetInputId) {
-            folderPickerTargetInputId = targetInputId;
-            const currentVal = document.getElementById(targetInputId) ? document.getElementById(targetInputId).value.trim() : '';
-            folderPickerCurrentPath = currentVal || currentPath || '/mnt/PrimaryFS';
-            const modal = document.getElementById('folderPickerModal');
-            if (modal) modal.style.display = 'flex';
-            await loadFolderPickerDirectory(folderPickerCurrentPath);
+        function openFolderPickerForMainPath() {
+            openFolderPicker('pathBar');
         }
 
         function closeFolderPicker() {
@@ -4110,7 +4600,7 @@ HTML_PAGE = """<!DOCTYPE html>
         async function createNewFolderInPicker() {
             const folderName = prompt('Enter new subfolder name:');
             if (!folderName || !folderName.trim()) return;
-            const newPath = folderPickerCurrentPath.replace(/\\/+$/, '') + '/' + folderName.trim();
+            const newPath = folderPickerCurrentPath.replace(/[/]+$/, '') + '/' + folderName.trim();
             try {
                 const res = await fetch('/api/mkdir', {
                     method: 'POST',
@@ -4136,16 +4626,463 @@ HTML_PAGE = """<!DOCTYPE html>
                 targetInput.value = chosenPath;
             }
             closeFolderPicker();
+
+            if (folderPickerTargetInputId === 'pathBar' && chosenPath) {
+                loadDirectory(chosenPath, true);
+            }
         }
 
-        async function openUpsampleModal(mode = 'album', customSrcPath = null) {
-            upsampleTargetMode = mode;
+        function renderInteractivePromptUI(pData) {
             const modal = document.getElementById('upsampleModal');
+            const prepView = document.getElementById('upsampleModalPreparingView');
+            const interView = document.getElementById('upsampleModalInteractiveView');
             const scopeBadge = document.getElementById('upsampleModalScopeBadge');
             const srcInput = document.getElementById('upsampleSrcPath');
             const dstInput = document.getElementById('upsampleDstDir');
             const initialLaunchControls = document.getElementById('initialLaunchControls');
             const interactiveDecisionControls = document.getElementById('interactiveDecisionControls');
+
+            if (prepView) prepView.style.display = 'none';
+            if (interView) interView.style.display = 'block';
+            if (initialLaunchControls) initialLaunchControls.style.display = 'none';
+            if (interactiveDecisionControls) interactiveDecisionControls.style.display = 'grid';
+
+            scopeBadge.textContent = `TRACK ${pData.track_idx || 1} OF ${pData.total_tracks || 1}`;
+            scopeBadge.style.background = 'rgba(255, 234, 0, 0.15)';
+            scopeBadge.style.borderColor = 'rgba(255, 234, 0, 0.4)';
+            scopeBadge.style.color = 'var(--accent-yellow)';
+
+            srcInput.value = pData.filepath || '';
+            if (pData.album_dir && (!dstInput.value || dstInput.value.trim() === '')) {
+                fetch(`/api/upsample/dest_preview?path=${encodeURIComponent(pData.album_dir)}`)
+                    .then(r => r.json())
+                    .then(d => { if (d && d.dest_dir) dstInput.value = d.dest_dir; })
+                    .catch(() => {});
+            }
+
+            // Populate Forensic Audit Card
+            const recInfo = pData.rec_info || {};
+            const recParams = pData.rec_params || {};
+            const provInfo = pData.prov_info || {};
+            const primary = provInfo.primary || {};
+            const vis = provInfo.visual_morphology || {};
+            const pk = vis.primary_knee || {};
+            const purity = vis.stopband_purity || {};
+            const srKhz = pData.sr ? (pData.sr / 1000).toFixed(1) : '44.1';
+
+            document.getElementById('promptTrackTitle').textContent = `[Track ${pData.track_idx}/${pData.total_tracks}] ${pData.track_file || 'Track'}`;
+            
+            const provLabel = primary.label ? `${primary.label.toUpperCase()} [${primary.confidence || 'HIGH'} CONFIDENCE]` : (recInfo.action ? recInfo.action.toUpperCase() : 'STANDARD MASTER');
+            const provEl = document.getElementById('promptProvLabel');
+            provEl.textContent = provLabel;
+            provEl.className = 'provenance-tag ' + (primary.label === 'Native Master' ? 'badge-provenance-native' : (primary.label === 'Lowpass Filtered' ? 'badge-provenance-lowpass' : 'badge-provenance-upsampled'));
+
+            document.getElementById('promptFormatMeta').textContent = `Source Format: ${srKhz} kHz • 2 Channels • Master FLAC`;
+            
+            let metricText = '';
+            if (pk && pk.is_brickwall_knee) {
+                metricText += `📐 Brickwall Knee: ${pk.freq_khz ? pk.freq_khz.toFixed(1) : ''} kHz (Slope: ${pk.steepest_slope_db_per_khz ? pk.steepest_slope_db_per_khz.toFixed(1) : ''} dB/kHz, Drop: ${pk.drop_db ? pk.drop_db.toFixed(1) : ''} dB) • `;
+            }
+            if (purity && purity.has_stopband) {
+                metricText += `📻 Stopband: ${purity.purity_label || 'Clean'} • `;
+            }
+            metricText += `📊 64-Bit Sinc Polyphase Reconstruction`;
+            document.getElementById('promptMetricsRow').textContent = metricText;
+
+            document.getElementById('promptActionDesc').textContent = recInfo.action ? `${recInfo.action}` : 'Direct 64-Bit Sinc Upsampling';
+            document.getElementById('promptDspFlag').textContent = recInfo.dsp_params || '--phase min --dither shibata';
+            
+            // Detailed Technical Rationale
+            if (recInfo.details) {
+                document.getElementById('promptTechnicalRationale').textContent = recInfo.details;
+            } else if (primary.label === 'Lowpass Filtered') {
+                document.getElementById('promptTechnicalRationale').textContent = 'A steep lowpass reconstruction knee was detected. A minimum-phase apodizing sinc filter is recommended to eliminate pre-ringing impulse artefacts and suppress ultrasonic alias imaging without touching audible frequencies.';
+            } else {
+                document.getElementById('promptTechnicalRationale').textContent = 'Preserves pristine bit-perfect audio fidelity across audible octaves while providing optimal 64-bit double-precision sinc reconstruction with psychoacoustic 24-bit Shibata noise shaping.';
+            }
+
+            // Populate form overrides from recommended parameters
+            selectRateTile('4x', true);
+            selectPhaseMode(recParams.phase_mode || 'min', true);
+            selectDitherTile(recParams.dither_mode || 'shibata', true);
+            selectMqaTile(recParams.mqa_mode || 'adaptive', true);
+            selectSteepTile(!!recParams.steep, true);
+
+            if (recParams.cutoff_hz) {
+                setCutoffPreset(Math.round(recParams.cutoff_hz));
+            } else if (recParams.apodizing) {
+                setCutoffPreset(22050);
+            } else {
+                setCutoffPreset('');
+            }
+
+            const btnSummary = document.getElementById('btnPromptViewSummary');
+            if (btnSummary) {
+                btnSummary.style.display = pData.has_summary ? 'flex' : 'none';
+            }
+
+            if (modal) modal.style.display = 'flex';
+        }
+
+        async function startUpsampleAlbumBatch(interactiveMode = true) {
+            if (!currentPath) {
+                alert('Please navigate to an album directory first.');
+                return;
+            }
+
+            let dstDir = '';
+            try {
+                const res = await fetch(`/api/upsample/dest_preview?path=${encodeURIComponent(currentPath)}`);
+                const data = await res.json();
+                if (data && data.dest_dir) {
+                    dstDir = data.dest_dir;
+                }
+            } catch (err) {}
+
+            const payload = {
+                source_path: currentPath,
+                dest_dir: dstDir,
+                rate: '4x',
+                phase: 'min',
+                apodizing: false,
+                cutoff_hz: null,
+                steep: false,
+                dither: 'shibata',
+                mqa: 'adaptive',
+                overwrite: 'on',
+                report: true,
+                interactive: interactiveMode,
+                use_recommended: true
+            };
+
+            try {
+                updateHeaderUpsampleUI({ 
+                    status: 'running', 
+                    stage: 'Scanning Headroom & Auditing Track 1...', 
+                    progress_percent: 2, 
+                    current_track: 'Auditing Track 1...',
+                    track_index: 1,
+                    total_tracks: directoryData && directoryData.files ? directoryData.files.length : 1
+                });
+
+                const res = await fetch('/api/upsample/start', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+                const data = await res.json();
+                if (data.status !== 'ok') {
+                    dismissUpsampleHeaderWidget();
+                    closeUpsampleModal();
+                    alert('Failed to start upsampling session: ' + (data.message || 'Unknown error'));
+                    return;
+                }
+
+                activeUpsampleJob = data;
+                lastLogIdx = 0;
+                activePromptTrack = null;
+                startPollingUpsampleStatus();
+            } catch (err) {
+                dismissUpsampleHeaderWidget();
+                closeUpsampleModal();
+                alert('Error starting upsampler: ' + err.message);
+            }
+        }
+
+        function openUpsampleModalForTrack() {
+            if (!currentAnalysis || !currentAnalysis.filepath) {
+                alert('Please select and analyze a track first.');
+                return;
+            }
+            openUpsampleModal('track', currentAnalysis.filepath);
+        }
+
+        function openUpsampleModalForCurrentFolder() {
+            if (activeUpsampleJob && activeUpsampleJob.status === 'waiting_for_input' && currentPromptData) {
+                renderInteractivePromptUI(currentPromptData);
+                const modal = document.getElementById('upsampleModal');
+                if (modal) modal.style.display = 'flex';
+                return;
+            }
+            if (activeUpsampleJob && activeUpsampleJob.status === 'running') {
+                toggleUpsampleLogModal();
+                return;
+            }
+            if (!currentPath) {
+                alert('Please navigate to an album directory first.');
+                return;
+            }
+            openUpsampleModal('album', currentPath);
+        }
+
+        function closeUpsampleModal() {
+            const modal = document.getElementById('upsampleModal');
+            if (modal) modal.style.display = 'none';
+        }
+
+        function selectPhaseMode(mode, fromPreset = false) {
+            const phaseInput = document.getElementById('upsamplePhase');
+            if (phaseInput) phaseInput.value = mode;
+            const cardMin = document.getElementById('phaseCardMin');
+            const cardLinear = document.getElementById('phaseCardLinear');
+            if (cardMin) cardMin.classList.toggle('active', mode === 'min');
+            if (cardLinear) cardLinear.classList.toggle('active', mode === 'linear');
+            if (!fromPreset) setActivePresetPill(null);
+        }
+
+        function selectRateTile(val, fromPreset = false) {
+            const input = document.getElementById('upsampleRate');
+            if (input) input.value = val;
+            const btns = document.querySelectorAll('#tileRateGrid .tile-option-btn');
+            btns.forEach(btn => {
+                btn.classList.toggle('active', btn.getAttribute('data-val') === String(val));
+            });
+            if (!fromPreset) setActivePresetPill(null);
+        }
+
+        function selectSteepTile(isSteep, fromPreset = false) {
+            const input = document.getElementById('upsampleSteep');
+            if (input) input.checked = isSteep;
+            const btns = document.querySelectorAll('#tileSteepGrid .tile-option-btn');
+            btns.forEach(btn => {
+                const bVal = btn.getAttribute('data-val') === 'sharp';
+                btn.classList.toggle('active', bVal === isSteep);
+            });
+            if (!fromPreset) setActivePresetPill(null);
+        }
+
+        function syncSteepTileUI() {
+            const input = document.getElementById('upsampleSteep');
+            selectSteepTile(input ? input.checked : false);
+        }
+
+        function selectDitherTile(val, fromPreset = false) {
+            const input = document.getElementById('upsampleDither');
+            if (input) input.value = val;
+            const btns = document.querySelectorAll('#tileDitherGrid .tile-option-btn');
+            btns.forEach(btn => {
+                btn.classList.toggle('active', btn.getAttribute('data-val') === val);
+            });
+            if (!fromPreset) setActivePresetPill(null);
+        }
+
+        function selectMqaTile(val, fromPreset = false) {
+            const input = document.getElementById('upsampleMqa');
+            if (input) input.value = val;
+            const btns = document.querySelectorAll('#tileMqaGrid .tile-option-btn');
+            btns.forEach(btn => {
+                btn.classList.toggle('active', btn.getAttribute('data-val') === val);
+            });
+            if (!fromPreset) setActivePresetPill(null);
+        }
+
+        function selectOverwriteTile(val) {
+            const input = document.getElementById('upsampleOverwrite');
+            if (input) input.value = val;
+            const btns = document.querySelectorAll('#tileOverwriteGrid .tile-option-btn');
+            btns.forEach(btn => {
+                btn.classList.toggle('active', btn.getAttribute('data-val') === val);
+            });
+        }
+
+        function toggleReportTile() {
+            const input = document.getElementById('upsampleReport');
+            const btn = document.getElementById('btnTileReportToggle');
+            if (input) {
+                input.checked = !input.checked;
+                if (btn) btn.classList.toggle('active', input.checked);
+            }
+        }
+
+        function toggleApodizingTile() {
+            const enableCheck = document.getElementById('upsampleApodizingEnable');
+            const cutoffInput = document.getElementById('upsampleCutoffHz');
+            const cutoffSlider = document.getElementById('upsampleCutoffSlider');
+            if (enableCheck) {
+                enableCheck.checked = !enableCheck.checked;
+                if (enableCheck.checked) {
+                    if (!cutoffInput.value || parseFloat(cutoffInput.value) <= 0) {
+                        cutoffInput.value = '22050';
+                        if (cutoffSlider) cutoffSlider.value = 22050;
+                    }
+                } else {
+                    cutoffInput.value = '';
+                }
+                onCutoffInputChange(true);
+            }
+        }
+
+        function syncApodizingTileUI() {
+            const enableCheck = document.getElementById('upsampleApodizingEnable');
+            const btn = document.getElementById('btnTileApodToggle');
+            const sub = document.getElementById('apodToggleSub');
+            const isChecked = enableCheck ? enableCheck.checked : false;
+            if (btn) btn.classList.toggle('active', isChecked);
+            if (sub) sub.textContent = isChecked ? 'Filter active' : 'Click to enable';
+        }
+
+        function toggleApodizingInput() {
+            toggleApodizingTile();
+        }
+
+        function onCutoffSliderChange(val) {
+            const cutoffInput = document.getElementById('upsampleCutoffHz');
+            if (cutoffInput) {
+                cutoffInput.value = val;
+            }
+            onCutoffInputChange(false);
+        }
+
+        function onCutoffInputChange(syncSlider = true) {
+            const enableCheck = document.getElementById('upsampleApodizingEnable');
+            const cutoffInput = document.getElementById('upsampleCutoffHz');
+            const cutoffSlider = document.getElementById('upsampleCutoffSlider');
+            const cutoffHint = document.getElementById('cutoffHint');
+            const rolloffDesc = document.getElementById('cutoffRolloffDesc');
+            const val = cutoffInput.value.trim();
+            const num = parseFloat(val);
+            if (val && !isNaN(num) && num > 0) {
+                enableCheck.checked = true;
+                if (cutoffHint) {
+                    cutoffHint.textContent = `Active (${num.toLocaleString()} Hz Knee)`;
+                    cutoffHint.style.background = 'rgba(0, 229, 255, 0.15)';
+                    cutoffHint.style.color = 'var(--accent-cyan)';
+                    cutoffHint.style.borderColor = 'rgba(0, 229, 255, 0.4)';
+                }
+                if (syncSlider && cutoffSlider && num >= 15000 && num <= 48000) {
+                    cutoffSlider.value = num;
+                }
+                if (rolloffDesc) {
+                    const passbandTop = Math.max(10000, num - 2000);
+                    rolloffDesc.textContent = `Passband flat to ${(passbandTop/1000).toFixed(1)}k • Taper to ${(num/1000).toFixed(2)}k • >140dB rejection`;
+                }
+            } else {
+                enableCheck.checked = false;
+                if (cutoffHint) {
+                    cutoffHint.textContent = 'Disabled (Full Nyquist)';
+                    cutoffHint.style.background = 'rgba(139, 148, 158, 0.1)';
+                    cutoffHint.style.color = 'var(--text-muted)';
+                    cutoffHint.style.borderColor = '#30363d';
+                }
+                if (rolloffDesc) {
+                    rolloffDesc.textContent = 'Passband: Flat to Nyquist • 64-Bit Sinc';
+                }
+            }
+            syncApodizingTileUI();
+            updateCutoffQuickButtons();
+        }
+
+        function setCutoffPreset(hz) {
+            const cutoffInput = document.getElementById('upsampleCutoffHz');
+            const cutoffSlider = document.getElementById('upsampleCutoffSlider');
+            if (!hz || hz <= 0) {
+                cutoffInput.value = '';
+            } else {
+                cutoffInput.value = hz;
+                if (cutoffSlider && hz >= 15000 && hz <= 48000) {
+                    cutoffSlider.value = hz;
+                }
+            }
+            onCutoffInputChange(false);
+        }
+
+        function updateCutoffQuickButtons() {
+            const cutoffInput = document.getElementById('upsampleCutoffHz');
+            const curVal = cutoffInput ? cutoffInput.value.trim() : '';
+            const quickBtns = document.querySelectorAll('.cutoff-chip');
+            quickBtns.forEach(btn => {
+                const bHz = btn.getAttribute('data-hz') || '';
+                btn.classList.toggle('active', bHz === curVal || (!bHz && !curVal));
+            });
+        }
+
+        function applyForensicRecommendationPreset() {
+            setActivePresetPill('presetBtnRecommended');
+            selectRateTile('4x', true);
+            selectDitherTile('shibata', true);
+            selectMqaTile('adaptive', true);
+            selectSteepTile(false, true);
+            selectPhaseMode('min', true);
+            setCutoffPreset('');
+
+            if (currentAnalysis && currentAnalysis.provenance) {
+                const p = currentAnalysis.provenance;
+                const rec = p.recommendation || {};
+                const paramsStr = rec.dsp_params || '';
+
+                if (paramsStr.includes('--phase linear')) {
+                    selectPhaseMode('linear', true);
+                } else if (paramsStr.includes('--phase min') || paramsStr.includes('--filter min')) {
+                    selectPhaseMode('min', true);
+                }
+
+                if (rec.filter_cutoff_khz) {
+                    const hz = Math.round(rec.filter_cutoff_khz * 1000);
+                    setCutoffPreset(hz);
+                } else if (paramsStr.includes('--cutoff') || paramsStr.includes('--apod')) {
+                    const m = paramsStr.match(new RegExp('--cutoff\\\\s+(\\\\d+)'));
+                    setCutoffPreset(m ? parseInt(m[1]) : 22050);
+                }
+
+                if (paramsStr.includes('--steep')) {
+                    selectSteepTile(true, true);
+                }
+
+                if (paramsStr.includes('--mqa strip')) {
+                    selectMqaTile('strip', true);
+                } else if (paramsStr.includes('--mqa ignore')) {
+                    selectMqaTile('ignore', true);
+                }
+            }
+        }
+
+        function applyDefaultPreset(type) {
+            selectRateTile('4x', true);
+            selectDitherTile('shibata', true);
+            selectMqaTile('adaptive', true);
+            selectSteepTile(false, true);
+
+            if (type === '4x') {
+                setActivePresetPill('presetBtnAudiophile4x');
+                selectPhaseMode('min', true);
+                setCutoffPreset('');
+            } else if (type === 'apod') {
+                setActivePresetPill('presetBtnApodizing');
+                selectPhaseMode('min', true);
+                setCutoffPreset(22050);
+            }
+        }
+
+        function setActivePresetPill(btnId) {
+            ['presetBtnRecommended', 'presetBtnAudiophile4x', 'presetBtnApodizing'].forEach(id => {
+                const el = document.getElementById(id);
+                if (el) el.classList.toggle('active', id === btnId);
+            });
+        }
+
+        async function quickUpsampleCurrentTrack() {
+            if (!currentAnalysis || !currentAnalysis.filepath) {
+                alert('Please select a track first.');
+                return;
+            }
+            await openUpsampleModal('track', currentAnalysis.filepath);
+            applyForensicRecommendationPreset();
+            startUpsampleJob(true);
+        }
+
+        async function openUpsampleModal(mode = 'album', customSrcPath = null) {
+            upsampleTargetMode = mode;
+            const modal = document.getElementById('upsampleModal');
+            const prepView = document.getElementById('upsampleModalPreparingView');
+            const interView = document.getElementById('upsampleModalInteractiveView');
+            const scopeBadge = document.getElementById('upsampleModalScopeBadge');
+            const srcInput = document.getElementById('upsampleSrcPath');
+            const dstInput = document.getElementById('upsampleDstDir');
+            const initialLaunchControls = document.getElementById('initialLaunchControls');
+            const interactiveDecisionControls = document.getElementById('interactiveDecisionControls');
+
+            if (prepView) prepView.style.display = 'none';
+            if (interView) interView.style.display = 'block';
 
             if (activeUpsampleJob && activeUpsampleJob.status === 'waiting_for_input' && currentPromptData) {
                 renderInteractivePromptUI(currentPromptData);
@@ -4259,6 +5196,398 @@ HTML_PAGE = """<!DOCTYPE html>
             if (modal) modal.style.display = 'flex';
         }
 
+        async function startUpsampleJob(interactiveMode = true) {
+            const srcPath = document.getElementById('upsampleSrcPath').value.trim();
+            const dstDir = document.getElementById('upsampleDstDir').value.trim();
+            const rate = document.getElementById('upsampleRate').value;
+            const phase = document.getElementById('upsamplePhase').value;
+            const apodizingCheck = document.getElementById('upsampleApodizingEnable').checked;
+            const cutoffVal = document.getElementById('upsampleCutoffHz').value.trim();
+            const cutoffHz = cutoffVal && parseFloat(cutoffVal) > 0 ? parseFloat(cutoffVal) : null;
+            const apodizingEnable = apodizingCheck || !!cutoffHz;
+            const steep = document.getElementById('upsampleSteep').checked;
+            const dither = document.getElementById('upsampleDither').value;
+            const mqa = document.getElementById('upsampleMqa').value;
+            const overwrite = document.getElementById('upsampleOverwrite').value;
+            const report = document.getElementById('upsampleReport').checked;
+
+            if (!srcPath) {
+                alert('Source path is required.');
+                return;
+            }
+
+            const payload = {
+                source_path: srcPath,
+                dest_dir: dstDir,
+                rate: rate,
+                phase: phase,
+                apodizing: apodizingEnable,
+                cutoff_hz: cutoffHz,
+                steep: steep,
+                dither: dither,
+                mqa: mqa,
+                overwrite: overwrite,
+                report: report,
+                interactive: interactiveMode,
+                use_recommended: !interactiveMode
+            };
+
+            try {
+                closeUpsampleModal();
+                updateHeaderUpsampleUI({ 
+                    status: 'running', 
+                    stage: 'Scanning Headroom & Auditing...', 
+                    progress_percent: 2, 
+                    current_track: 'Initializing...' 
+                });
+
+                const res = await fetch('/api/upsample/start', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+                const data = await res.json();
+                if (data.status !== 'ok') {
+                    dismissUpsampleHeaderWidget();
+                    alert('Failed to start upsampling job: ' + (data.message || 'Unknown error'));
+                    return;
+                }
+
+                activeUpsampleJob = data;
+                lastLogIdx = 0;
+                activePromptTrack = null;
+                startPollingUpsampleStatus();
+            } catch (err) {
+                dismissUpsampleHeaderWidget();
+                alert('Error submitting upsampling job: ' + err.message);
+            }
+        }
+
+        async function sendPromptChoice(choice) {
+            if (choice === 'q') {
+                cancelUpsampleJob();
+                return;
+            }
+
+            const phase = document.getElementById('upsamplePhase').value;
+            const apodizingCheck = document.getElementById('upsampleApodizingEnable').checked;
+            const cutoffVal = document.getElementById('upsampleCutoffHz').value.trim();
+            const cutoffHz = cutoffVal && parseFloat(cutoffVal) > 0 ? parseFloat(cutoffVal) : null;
+            const apodizingEnable = apodizingCheck || !!cutoffHz;
+            const steep = document.getElementById('upsampleSteep').checked;
+            const dither = document.getElementById('upsampleDither').value;
+            const mqa = document.getElementById('upsampleMqa').value;
+
+            const customParams = {
+                phase_mode: phase,
+                apodizing: apodizingEnable,
+                dither_mode: dither,
+                cutoff_hz: cutoffHz,
+                mqa_mode: mqa,
+                steep: steep
+            };
+
+            // Immediately background modal until next prompt is needed
+            closeUpsampleModal();
+
+            try {
+                const res = await fetch('/api/upsample/respond', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        choice: choice,
+                        custom_params: customParams
+                    })
+                });
+                const data = await res.json();
+                if (data.status !== 'ok') {
+                    alert('Error submitting choice: ' + (data.message || 'Unknown error'));
+                }
+            } catch (err) {
+                alert('Failed to send decision: ' + err.message);
+            }
+        }
+
+        let activeTelemetryEvents = [];
+
+        function parseTelemetryEvent(line) {
+            const text = line.text || '';
+            const t = line.time || '';
+            
+            // Filter out raw CLI ASCII dividers and repetitive terminal noise
+            if (!text || text.match(/^=+$/) || text.match(/^-+$/) || text.match(/^>+$/) || text.includes('ACOUSTISINC: 64-BIT GPU')) {
+                return null;
+            }
+            if (text.includes('Source Path') || text.includes('Destination Path') || text.includes('Rate Multiple') || text.includes('Quality:') || text.includes('Command line')) {
+                return null;
+            }
+
+            let type = 'info';
+            let tag = 'INFO';
+            let cleanText = text;
+
+            if (text.includes('GPU Sinc complete') || text.includes('Batched GPU Sinc') || text.includes('VkFFT')) {
+                type = 'gpu';
+                tag = '⚡ GPU Sinc';
+                const m = text.match(/complete in ([0-9.]+s)/);
+                cleanText = `64-bit GPU Sinc transform completed ${m ? '(' + m[1] + ')' : ''}`;
+            } else if (text.includes('Noise Shaping completed') || text.includes('Shibata')) {
+                type = 'dither';
+                tag = '🎛️ Shibata';
+                const m = text.match(/completed in ([0-9.]+s)/);
+                cleanText = `Multi-core 24-bit psychoacoustic noise shaping ${m ? '(' + m[1] + ')' : ''}`;
+            } else if (text.includes('Handed off to NVMe Writer') || text.includes('Async Writer') || text.includes('FLAC')) {
+                type = 'io';
+                tag = '💾 NVMe FLAC';
+                cleanText = 'Lossless FLAC compression (Level 5) queued for background NVMe disk write';
+            } else if (text.includes('Scanning') && text.includes('headroom')) {
+                type = 'headroom';
+                tag = '🔍 Headroom';
+                cleanText = 'Scanning inter-sample headroom peaks across album tracks';
+            } else if (text.includes('Gain Factor:') || text.includes('Dynamic Backoff') || text.includes('ABORTING CURRENT PASS')) {
+                type = 'headroom';
+                tag = '⚠️ Headroom';
+                cleanText = text.replace(/>>>/g, '').trim();
+            } else if (text.includes('Processing track:') || text.includes('--- Track [')) {
+                type = 'info';
+                tag = '🎵 Track';
+                cleanText = text.replace(/---/g, '').replace(/Processing track:/g, '').trim();
+            } else if (text.includes('Comparative Upsampling Report Generated') || text.includes('ALBUM_REPORT.html') || text.includes('Interactive HTML Report:')) {
+                type = 'report';
+                tag = '📊 Report';
+                cleanText = text.includes('HTML:') ? text.split('HTML:')[1].trim() : 'Interactive forensic HTML & Markdown reports generated';
+            } else if (text.includes('Tagging') || text.includes('ReplayGain')) {
+                type = 'io';
+                tag = '🏷️ Metadata';
+                cleanText = 'Preserving metadata tags and computing album ReplayGain';
+            } else if (text.includes('Error') || text.includes('Fatal') || text.includes('Exception')) {
+                type = 'error';
+                tag = '❌ Error';
+                cleanText = text.trim();
+            } else if (text.includes('Directory completed cleanly') || text.includes('Finished Successfully')) {
+                type = 'report';
+                tag = '✅ Complete';
+                cleanText = 'Album upsampling & forensic analysis finished cleanly';
+            } else {
+                cleanText = text.replace(new RegExp('^[>\\\\-\\\\s]+'), '').trim();
+                if (!cleanText || cleanText.length < 3) return null;
+            }
+
+            return {
+                time: t,
+                type: type,
+                tag: tag,
+                text: cleanText
+            };
+        }
+
+        function toggleUpsampleDropdown(event) {
+            if (event) event.stopPropagation();
+            const container = document.getElementById('headerUpsampleContainer');
+            if (container) {
+                container.classList.toggle('is-open');
+            }
+        }
+
+        document.addEventListener('click', (e) => {
+            const container = document.getElementById('headerUpsampleContainer');
+            if (container && !container.contains(e.target)) {
+                container.classList.remove('is-open');
+            }
+        });
+
+        function startPollingUpsampleStatus() {
+            if (upsamplePollTimer) clearInterval(upsamplePollTimer);
+            upsamplePollTimer = setInterval(pollUpsampleStatus, 700);
+            pollUpsampleStatus();
+        }
+
+        async function pollUpsampleStatus() {
+            try {
+                const res = await fetch(`/api/upsample/status?since_log=${lastLogIdx}`);
+                const data = await res.json();
+                if (!data) return;
+                activeUpsampleJob = data;
+
+                // Append logs to terminal & UI telemetry stream
+                if (data.logs && data.logs.length > 0) {
+                    const logsContainer = document.getElementById('upsampleTerminalLogs');
+                    const telemetryStream = document.getElementById('popoverEventStream');
+
+                    data.logs.forEach(l => {
+                        lastLogIdx = Math.max(lastLogIdx, l.idx);
+
+                        // 1. Raw terminal log line
+                        if (logsContainer) {
+                            const lineEl = document.createElement('div');
+                            lineEl.className = 'drawer-terminal-line' + (l.text.includes('Error') ? ' error' : l.text.includes('Complete') || l.text.includes('==') ? ' highlight' : '');
+                            lineEl.textContent = `[${l.time}] ${l.text}`;
+                            logsContainer.appendChild(lineEl);
+                        }
+
+                        // 2. UI-Native Telemetry Event
+                        const ev = parseTelemetryEvent(l);
+                        if (ev && telemetryStream) {
+                            activeTelemetryEvents.push(ev);
+                            if (activeTelemetryEvents.length > 50) activeTelemetryEvents.shift();
+
+                            // Remove empty placeholder if present
+                            const emptyPlaceholder = telemetryStream.querySelector('.telemetry-empty');
+                            if (emptyPlaceholder) emptyPlaceholder.remove();
+
+                            const evEl = document.createElement('div');
+                            evEl.className = `telemetry-event event-${ev.type}`;
+                            evEl.innerHTML = `
+                                <span class="telemetry-time">${escapeHtml(ev.time)}</span>
+                                <span class="telemetry-tag">${escapeHtml(ev.tag)}</span>
+                                <span class="telemetry-text">${escapeHtml(ev.text)}</span>
+                            `;
+                            telemetryStream.appendChild(evEl);
+                            telemetryStream.scrollTop = telemetryStream.scrollHeight;
+                        }
+                    });
+                    
+                    const terminal = document.getElementById('upsampleTerminalBox');
+                    if (terminal) terminal.scrollTop = terminal.scrollHeight;
+                }
+
+                updateHeaderUpsampleUI(data);
+
+                // Handle interactive decision prompt
+                if (data.status === 'waiting_for_input' && data.prompt_data) {
+                    currentPromptData = data.prompt_data;
+                    const trackFile = data.prompt_data.track_file;
+                    if (activePromptTrack !== trackFile) {
+                        activePromptTrack = trackFile;
+                        renderInteractivePromptUI(data.prompt_data);
+                        const modal = document.getElementById('upsampleModal');
+                        if (modal) modal.style.display = 'flex';
+                    }
+                } else if (data.status === 'running') {
+                    currentPromptData = null;
+                } else if (data.status === 'completed') {
+                    currentPromptData = null;
+                    closeUpsampleModal();
+                } else if (data.status === 'failed' || data.status === 'cancelled') {
+                    dismissUpsampleHeaderWidget();
+                    closeUpsampleModal();
+                }
+            } catch (err) {}
+        }
+
+        function updateHeaderUpsampleUI(data) {
+            const container = document.getElementById('headerUpsampleContainer');
+            const btnUpsample = document.getElementById('headerBtnUpsample');
+            const dot = document.getElementById('headerUpsampleDot');
+            const title = document.getElementById('headerUpsampleTitle');
+            const sub = document.getElementById('headerUpsampleSub');
+            const badge = document.getElementById('headerUpsampleBadge');
+            const fill = document.getElementById('headerUpsampleFill');
+            
+            // Popover elements
+            const popTrack = document.getElementById('popoverCurrentTrack');
+            const popTime = document.getElementById('popoverTimeElapsed');
+            const popFill = document.getElementById('popoverProgressFill');
+            const popPct = document.getElementById('popoverProgressPct');
+            const popEventCount = document.getElementById('popoverEventCount');
+            const popReviewBtn = document.getElementById('popoverReviewBtn');
+            const popReportBtn = document.getElementById('popoverReportBtn');
+            const popAbortBtn = document.getElementById('popoverAbortBtn');
+            const popDismissBtn = document.getElementById('popoverDismissBtn');
+            const recButtons = document.getElementById('actionRecButtons');
+
+            if (!container) return;
+
+            if (!data || data.status === 'idle' || data.status === 'cancelled') {
+                dismissUpsampleHeaderWidget();
+                return;
+            }
+
+            // Replace header button with active status widget to prevent overlap
+            if (btnUpsample) btnUpsample.style.display = 'none';
+            container.style.display = 'inline-flex';
+
+            // Disable track recommendation buttons while an active job is processing
+            if (recButtons && (data.status === 'running' || data.status === 'waiting_for_input')) {
+                recButtons.querySelectorAll('button').forEach(b => { b.disabled = true; b.style.opacity = '0.4'; });
+            } else if (recButtons) {
+                recButtons.querySelectorAll('button').forEach(b => { b.disabled = false; b.style.opacity = '1'; });
+            }
+
+            const pct = Math.min(100, Math.max(0, data.progress_percent || 0));
+            const pctStr = `${pct.toFixed(0)}%`;
+            if (fill) fill.style.width = `${pct}%`;
+            if (popFill) popFill.style.width = `${pct}%`;
+            if (popPct) popPct.textContent = pctStr;
+
+            const elapsedSec = data.elapsed_seconds || 0;
+            const m = Math.floor(elapsedSec / 60);
+            const s = Math.floor(elapsedSec % 60);
+            const timeStr = `${m}:${('0' + s).slice(-2)} elapsed`;
+            if (popTime) popTime.textContent = timeStr;
+            if (popEventCount) popEventCount.textContent = `${activeTelemetryEvents.length} events`;
+
+            if (data.status === 'waiting_for_input') {
+                dot.style.background = 'var(--accent-yellow)';
+                dot.style.boxShadow = '0 0 8px var(--accent-yellow)';
+                dot.style.animation = 'pulse-glow 1s infinite ease-in-out';
+                title.textContent = `⚠️ Input Required`;
+                if (sub) sub.textContent = `[${data.track_index || 1}/${data.total_tracks || 1}] ${data.current_track || 'Track'}`;
+                badge.textContent = `[${data.track_index || 1}/${data.total_tracks || 1}]`;
+                badge.style.color = 'var(--accent-yellow)';
+                if (popTrack) popTrack.textContent = `[Track ${data.track_index || 1}/${data.total_tracks || 1}] ${data.current_track || 'Track'}`;
+                if (popReviewBtn) popReviewBtn.style.display = 'inline-block';
+                if (popReportBtn) popReportBtn.style.display = 'none';
+                if (popAbortBtn) popAbortBtn.style.display = 'inline-block';
+                if (popDismissBtn) popDismissBtn.style.display = 'none';
+            } else if (data.status === 'running') {
+                dot.style.background = 'var(--accent-cyan)';
+                dot.style.boxShadow = '0 0 8px var(--accent-cyan)';
+                dot.style.animation = 'pulse-glow 1.2s infinite ease-in-out';
+                const trkName = data.current_track ? (data.current_track.length > 22 ? data.current_track.substring(0, 20) + '...' : data.current_track) : 'Processing...';
+                title.textContent = `⚡ [${data.track_index || 1}/${data.total_tracks || 1}] ${trkName}`;
+                if (sub) sub.textContent = data.stage || '64-bit Sinc Resampling';
+                badge.textContent = pctStr;
+                badge.style.color = 'var(--accent-cyan)';
+                if (popTrack) popTrack.textContent = `[Track ${data.track_index || 1}/${data.total_tracks || 1}] ${data.current_track || 'Processing...'}`;
+                if (popReviewBtn) popReviewBtn.style.display = 'none';
+                if (popReportBtn) popReportBtn.style.display = 'none';
+                if (popAbortBtn) popAbortBtn.style.display = 'inline-block';
+                if (popDismissBtn) popDismissBtn.style.display = 'none';
+            } else if (data.status === 'completed') {
+                dot.style.background = '#00e676';
+                dot.style.boxShadow = '0 0 8px #00e676';
+                dot.style.animation = 'none';
+                title.textContent = '✅ Upsampling Complete';
+                if (sub) sub.textContent = '100% Finished Successfully';
+                badge.textContent = '100%';
+                badge.style.color = '#00e676';
+                if (fill) fill.style.width = '100%';
+                if (popFill) popFill.style.width = '100%';
+                if (popTrack) popTrack.textContent = 'All tracks processed and tagged with ReplayGain';
+                if (popReviewBtn) popReviewBtn.style.display = 'none';
+                if (popAbortBtn) popAbortBtn.style.display = 'none';
+                if (popReportBtn) {
+                    popReportBtn.style.display = 'inline-block';
+                    popReportBtn.setAttribute('data-report-url', data.report_url || '');
+                }
+                if (popDismissBtn) popDismissBtn.style.display = 'inline-block';
+            } else if (data.status === 'failed') {
+                dot.style.background = '#ff5252';
+                dot.style.boxShadow = '0 0 8px #ff5252';
+                dot.style.animation = 'none';
+                title.textContent = '❌ Upsampling Failed';
+                if (sub) sub.textContent = data.error_message || 'Processing Error';
+                badge.textContent = 'Error';
+                badge.style.color = '#ff5252';
+                if (popTrack) popTrack.textContent = data.error_message || 'Processing Error';
+                if (popReviewBtn) popReviewBtn.style.display = 'none';
+                if (popAbortBtn) popAbortBtn.style.display = 'none';
+                if (popReportBtn) popReportBtn.style.display = 'none';
+                if (popDismissBtn) popDismissBtn.style.display = 'inline-block';
+            }
+        }
+
         async function cancelUpsampleJob() {
             if (!confirm('Are you sure you want to abort the current upsampling job?')) return;
             try {
@@ -4275,9 +5604,28 @@ HTML_PAGE = """<!DOCTYPE html>
             }
         }
 
+        function toggleUpsampleLogModal() {
+            const modal = document.getElementById('upsampleLogModal');
+            if (!modal) return;
+            const isShown = modal.style.display !== 'none';
+            modal.style.display = isShown ? 'none' : 'flex';
+            if (!isShown) {
+                const terminal = document.getElementById('upsampleTerminalBox');
+                if (terminal) terminal.scrollTop = terminal.scrollHeight;
+            }
+        }
+
+        function closeUpsampleLogModal() {
+            const modal = document.getElementById('upsampleLogModal');
+            if (modal) modal.style.display = 'none';
+        }
+
         function dismissUpsampleHeaderWidget() {
-            const widget = document.getElementById('headerUpsampleWidget');
-            if (widget) widget.style.display = 'none';
+            const container = document.getElementById('headerUpsampleContainer');
+            if (container) {
+                container.style.display = 'none';
+                container.classList.remove('is-open');
+            }
             const btnUpsample = document.getElementById('headerBtnUpsample');
             if (btnUpsample) {
                 const hasFiles = !directoryData || !directoryData.files || directoryData.files.length > 0;
@@ -4286,6 +5634,11 @@ HTML_PAGE = """<!DOCTYPE html>
             activeUpsampleJob = null;
             currentPromptData = null;
             activePromptTrack = null;
+            activeTelemetryEvents = [];
+            const telemetryStream = document.getElementById('popoverEventStream');
+            if (telemetryStream) {
+                telemetryStream.innerHTML = '<div class="telemetry-empty">Waiting for telemetry stream...</div>';
+            }
             const recButtons = document.getElementById('actionRecButtons');
             if (recButtons) {
                 recButtons.querySelectorAll('button').forEach(b => { b.disabled = false; b.style.opacity = '1'; });
@@ -4296,347 +5649,101 @@ HTML_PAGE = """<!DOCTYPE html>
             }
         }
 
-        // Close modal on Escape key
+        function viewGeneratedReport() {
+            let reportUrl = null;
+            const popReportBtn = document.getElementById('popoverReportBtn');
+            if (popReportBtn && popReportBtn.getAttribute('data-report-url')) {
+                reportUrl = popReportBtn.getAttribute('data-report-url');
+            } else if (activeUpsampleJob && activeUpsampleJob.report_url) {
+                reportUrl = activeUpsampleJob.report_url;
+            }
+            if (reportUrl) {
+                const modal = document.getElementById('albumSummaryModal');
+                const body = document.getElementById('modalSummaryBody');
+                const badge = document.getElementById('modalSummaryBadge');
+                const extBtn = document.getElementById('modalOpenExternalBtn');
+                if (modal && body) {
+                    modal.style.display = 'flex';
+                    badge.textContent = 'ALBUM_REPORT.html (Freshly Mastered)';
+                    extBtn.style.display = 'inline-block';
+                    currentSummaryRawUrl = reportUrl;
+                    body.innerHTML = `<iframe class="modal-iframe" src="${reportUrl}" style="width: 100%; height: 100%; min-height: 72vh; border: none; border-radius: 6px; background: #0d1117;"></iframe>`;
+                }
+            }
+        }
+
+        // Modal keyboard shortcuts
         window.addEventListener('keydown', (e) => {
             if (e.key === 'Escape') {
                 closeAlbumSummaryModal();
                 closeUpsampleModal();
                 closeUpsampleLogModal();
                 closeFolderPicker();
+                return;
+            }
+
+            const upsampleModal = document.getElementById('upsampleModal');
+            const isModalOpen = upsampleModal && upsampleModal.style.display !== 'none';
+            const isTyping = ['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement?.tagName);
+
+            if (isModalOpen && !isTyping) {
+                const k = e.key.toLowerCase();
+                if (k === 'r') {
+                    e.preventDefault();
+                    applyForensicRecommendationPreset();
+                } else if (k === 'y') {
+                    e.preventDefault();
+                    const interView = document.getElementById('interactiveDecisionControls');
+                    if (interView && interView.style.display !== 'none') {
+                        sendPromptChoice('y');
+                    } else {
+                        startUpsampleJob(true);
+                    }
+                } else if (k === 'a') {
+                    e.preventDefault();
+                    const interView = document.getElementById('interactiveDecisionControls');
+                    if (interView && interView.style.display !== 'none') {
+                        sendPromptChoice('a');
+                    } else {
+                        startUpsampleJob(false);
+                    }
+                } else if (k === 'c') {
+                    e.preventDefault();
+                    const interView = document.getElementById('interactiveDecisionControls');
+                    if (interView && interView.style.display !== 'none') {
+                        sendPromptChoice('c');
+                    } else {
+                        startUpsampleJob(false);
+                    }
+                } else if (k === 's') {
+                    e.preventDefault();
+                    const interView = document.getElementById('interactiveDecisionControls');
+                    if (interView && interView.style.display !== 'none') {
+                        sendPromptChoice('s');
+                    }
+                } else if (k === 'k') {
+                    e.preventDefault();
+                    const interView = document.getElementById('interactiveDecisionControls');
+                    if (interView && interView.style.display !== 'none') {
+                        sendPromptChoice('k');
+                    } else {
+                        closeUpsampleModal();
+                    }
+                } else if (k === 'q') {
+                    e.preventDefault();
+                    const interView = document.getElementById('interactiveDecisionControls');
+                    if (interView && interView.style.display !== 'none') {
+                        sendPromptChoice('q');
+                    } else {
+                        cancelUpsampleJob();
+                    }
+                }
             }
         });
 
         // Initialize on load
         loadDirectory(currentPath, true);
     </script>
-
-    <!-- Folder Browser / Directory Picker Modal -->
-    <div id="folderPickerModal" class="modal-backdrop" style="display: none; z-index: 10050;" onclick="if(event.target===this) closeFolderPicker()">
-        <div class="modal-content" style="max-width: 720px; height: 78vh; display: flex; flex-direction: column; border-radius: 12px; border: 1px solid #30363d; box-shadow: 0 20px 50px rgba(0,0,0,0.85); background: #0d1117;">
-            <div class="modal-header" style="padding: 14px 20px; border-bottom: 1px solid #30363d;">
-                <div style="display: flex; align-items: center; gap: 10px; min-width: 0;">
-                    <span style="font-size: 1.1rem; font-weight: 700; color: var(--text-heading);">📁 Select Directory</span>
-                </div>
-                <button class="btn-bookmark" onclick="closeFolderPicker()" style="font-size: 1.2rem; padding: 2px 10px; line-height: 1;">&times;</button>
-            </div>
-            
-            <!-- Breadcrumbs Navigation Bar -->
-            <div style="padding: 8px 16px; background: #161b22; border-bottom: 1px solid #30363d; font-size: 0.80rem; overflow-x: auto; white-space: nowrap;" id="folderPickerBreadcrumbs">
-                <span class="crumb" onclick="loadFolderPickerDirectory('/')">🏠 /</span>
-            </div>
-
-            <!-- Path Bar & Action Buttons -->
-            <div style="padding: 10px 16px; background: #11141a; border-bottom: 1px solid #30363d; display: flex; gap: 8px; align-items: center;">
-                <input type="text" id="folderPickerPathBar" class="form-input" style="font-family: monospace; font-size: 0.82rem; height: 36px;" onkeydown="if(event.key==='Enter') loadFolderPickerDirectory(this.value.trim())" />
-                <button class="btn-bookmark" onclick="loadFolderPickerDirectory(document.getElementById('folderPickerPathBar').value.trim())" style="padding: 0 14px; height: 36px;">Go</button>
-                <button class="btn-bookmark" onclick="createNewFolderInPicker()" style="padding: 0 14px; height: 36px; color: var(--accent-cyan); border-color: rgba(0, 229, 255, 0.4); white-space: nowrap;">+ New Folder</button>
-            </div>
-
-            <!-- Folder Items List -->
-            <div class="modal-body" style="flex: 1; overflow-y: auto; padding: 8px 12px;" id="folderPickerList">
-                <div style="padding: 28px; text-align: center; color: var(--text-muted);">
-                    <div class="spinner" style="margin: 0 auto 10px;"></div>
-                    Loading directory contents...
-                </div>
-            </div>
-
-            <!-- Bottom Action Footer -->
-            <div style="padding: 12px 18px; background: #161b22; border-top: 1px solid #30363d; display: flex; justify-content: space-between; align-items: center; gap: 10px;">
-                <button class="btn-bookmark" onclick="closeFolderPicker()" style="padding: 7px 16px;">Cancel</button>
-                <button class="btn-bookmark" onclick="selectFolderPickerChoice()" style="background: rgba(0, 230, 118, 0.2); border-color: rgba(0, 230, 118, 0.55); color: #00e676; font-weight: 700; padding: 7px 20px; font-size: 0.88rem;">✓ Select Current Folder</button>
-            </div>
-        </div>
-    </div>
-    <div id="albumSummaryModal" class="modal-backdrop" style="display: none;" onclick="if(event.target===this) closeAlbumSummaryModal()">
-        <div class="modal-content">
-            <div class="modal-header">
-                <div style="display: flex; align-items: center; gap: 10px; min-width: 0;">
-                    <span style="font-size: 1.05rem; font-weight: 700; color: var(--text-heading); white-space: nowrap;">📋 Album Analysis Summary</span>
-                    <span id="modalSummaryBadge" class="brand-badge" style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">ALBUM_REPORT</span>
-                </div>
-                <div style="display: flex; align-items: center; gap: 8px; flex-shrink: 0;">
-                    <button class="btn-bookmark" id="btnCopySummary" onclick="copyAlbumSummaryText()">📋 Copy</button>
-                    <button class="btn-bookmark" id="modalOpenExternalBtn" onclick="openAlbumSummaryExternal()" style="display: none;">↗️ Open Tab</button>
-                    <button class="btn-bookmark" onclick="closeAlbumSummaryModal()" style="font-size: 1.2rem; padding: 2px 10px; line-height: 1;">&times;</button>
-                </div>
-            </div>
-            <div class="modal-body" id="modalSummaryBody">
-                <div style="text-align: center; padding: 40px; color: var(--text-muted);">
-                    <div class="spinner" style="margin: 0 auto 10px;"></div>
-                    Loading album analysis summary...
-                </div>
-            </div>
-        </div>
-    </div>
-
-    <!-- Upsample Configuration & Interactive Decision Modal -->
-    <div id="upsampleModal" class="modal-backdrop" style="display: none;" onclick="if(event.target===this) closeUpsampleModal()">
-        <div class="modal-content modal-upsample-dialog">
-            <div class="modal-header" style="padding: 14px 22px; border-bottom: 1px solid #30363d;">
-                <div style="display: flex; align-items: center; gap: 10px; min-width: 0;">
-                    <span style="font-size: 1.15rem; font-weight: 700; color: var(--text-heading); white-space: nowrap;">⚡ AcoustiSinc Interactive Upsampling Studio</span>
-                    <span id="upsampleModalScopeBadge" class="brand-badge" style="background: rgba(0, 230, 118, 0.15); border-color: rgba(0, 230, 118, 0.4); color: #00e676;">ALBUM BATCH</span>
-                </div>
-                <button class="btn-bookmark" onclick="closeUpsampleModal()" style="font-size: 1.2rem; padding: 2px 10px; line-height: 1;">&times;</button>
-            </div>
-            <div class="modal-body" style="padding: 20px 24px; overflow-y: auto;">
-                
-                <!-- 1. Forensic Audit & Recommendation Details Card -->
-                <div id="promptAuditCard" class="prompt-audit-card">
-                    <div style="display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap;">
-                        <span style="font-size: 0.78rem; font-weight: 700; color: var(--accent-cyan); letter-spacing: 0.5px;">🔬 FORENSIC AUDIT & RECIPE RECOMMENDATION</span>
-                        <span id="promptProvLabel" class="provenance-tag badge-provenance-native" style="font-size: 0.72rem; padding: 2px 10px;">RECOMMENDED RECIPE</span>
-                    </div>
-                    <div style="display: flex; justify-content: space-between; align-items: baseline; gap: 8px; flex-wrap: wrap; margin-top: 2px;">
-                        <div id="promptTrackTitle" style="font-weight: 700; font-size: 1.02rem; color: var(--text-heading);">Track Name</div>
-                        <div id="promptFormatMeta" style="font-size: 0.78rem; color: var(--text-muted); font-family: monospace;">44.1 kHz • 2 Channels • 24-bit PCM</div>
-                    </div>
-                    <div id="promptMetricsRow" style="font-size: 0.78rem; color: #8b949e;">Cutoff Knee: -- | Stopband: --</div>
-                    
-                    <div style="background: rgba(0, 229, 255, 0.06); border: 1px solid rgba(0, 229, 255, 0.28); border-radius: 6px; padding: 10px 14px; margin: 4px 0;">
-                        <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 3px;">
-                            <span style="font-size: 0.76rem; font-weight: 700; color: var(--accent-cyan);">Recommended Recipe:</span>
-                            <span id="promptActionDesc" style="font-size: 0.84rem; font-weight: 600; color: var(--text-heading);">Direct Sinc Resampling</span>
-                        </div>
-                        <div style="display: flex; align-items: center; gap: 6px; margin-top: 4px;">
-                            <span style="font-size: 0.74rem; color: var(--text-muted);">DSP CLI Flag:</span>
-                            <code class="action-code" id="promptDspFlag">--phase min --dither shibata</code>
-                        </div>
-                    </div>
-
-                    <div style="font-size: 0.80rem; color: var(--text); line-height: 1.45; background: rgba(0, 0, 0, 0.25); border-radius: 6px; padding: 8px 12px;">
-                        <span style="font-weight: 600; color: var(--accent-yellow);">💡 Technical Rationale: </span>
-                        <span id="promptTechnicalRationale">Applies optimal 64-bit double precision sinc filter.</span>
-                    </div>
-                </div>
-
-                <!-- Presets Pill Bar (for quick configurations) -->
-                <div class="preset-pill-group" id="presetPillGroup" style="margin-bottom: 14px;">
-                    <button class="preset-pill active" id="presetBtnRecommended" onclick="applyForensicRecommendationPreset()">✨ Apply Forensic Recommendation</button>
-                    <button class="preset-pill" id="presetBtnAudiophile4x" onclick="applyDefaultPreset('4x')">🎧 Standard 4x Audiophile</button>
-                    <button class="preset-pill" id="presetBtnApodizing" onclick="applyDefaultPreset('apod')">🛡️ Apodizing Ringing-Filter (22.05k)</button>
-                </div>
-
-                <!-- 2. Master Storage & Target Paths Card -->
-                <div class="modal-section-card">
-                    <div class="modal-section-header">
-                        <span>📁 Audio Master & Target Locations</span>
-                        <span class="form-label-sub">Lossless FLAC Library Storage</span>
-                    </div>
-                    
-                    <div class="form-group full-width">
-                        <label class="form-label">
-                            <span>Source Master Location</span>
-                            <span class="form-label-sub">Input File / Folder</span>
-                        </label>
-                        <div class="form-path-row">
-                            <input type="text" class="form-input" id="upsampleSrcPath" readonly />
-                            <button class="btn-browse" onclick="openFolderPicker('upsampleSrcPath')" title="Browse Source Master Folder">📁 Browse...</button>
-                        </div>
-                    </div>
-
-                    <div class="form-group full-width">
-                        <label class="form-label">
-                            <span>Destination Output Directory</span>
-                            <span class="form-label-sub">Target Master Storage Folder</span>
-                        </label>
-                        <div class="form-path-row">
-                            <input type="text" class="form-input" id="upsampleDstDir" placeholder="/mnt/PrimaryFS/1xxK_min/music/..." />
-                            <button class="btn-browse" onclick="openFolderPicker('upsampleDstDir')" title="Browse Target Destination Directory">📁 Browse...</button>
-                        </div>
-                    </div>
-                </div>
-
-                <!-- 3. Filter Phase & Apodizing Reconstruction Card -->
-                <div class="modal-section-card">
-                    <div class="modal-section-header">
-                        <span>⚙️ Filter Phase & Apodizing Reconstruction Architecture</span>
-                        <span class="form-label-sub">Strict 64-Bit Float Precision</span>
-                    </div>
-
-                    <div class="form-grid-2">
-                        <!-- Left Column: Rate & Phase Mode -->
-                        <div style="display: flex; flex-direction: column; gap: 12px;">
-                            <div class="form-group">
-                                <label class="form-label">
-                                    <span>Target Sample Rate</span>
-                                    <span class="form-label-sub">Integral Multiple</span>
-                                </label>
-                                <select class="form-select" id="upsampleRate">
-                                    <option value="4x" selected>Auto 4x Native (176.4k / 192k)</option>
-                                    <option value="192000">192.0 kHz (4x from 48k family)</option>
-                                    <option value="176400">176.4 kHz (4x from 44.1k family)</option>
-                                    <option value="384000">384.0 kHz (8x Ultra)</option>
-                                    <option value="352800">352.8 kHz (8x Ultra)</option>
-                                </select>
-                            </div>
-
-                            <div class="form-group">
-                                <label class="form-label">
-                                    <span>Filter Phase Response Mode</span>
-                                    <span class="form-label-sub">Impulse Symmetry</span>
-                                </label>
-                                <select class="form-select" id="upsamplePhase">
-                                    <option value="min" selected>Minimum Phase (Anti-Ringing / Causal Response)</option>
-                                    <option value="linear">Linear Phase (Symmetric Time Response)</option>
-                                </select>
-                            </div>
-                        </div>
-
-                        <!-- Right Column: Dedicated Apodizing Switch & Cutoff & Steep -->
-                        <div style="display: flex; flex-direction: column; gap: 12px;">
-                            <div class="form-group">
-                                <label class="form-label">
-                                    <span>Apodizing Reconstruction Filter</span>
-                                    <span id="cutoffHint" class="form-label-sub">Disabled (Full Nyquist)</span>
-                                </label>
-                                <div style="display: flex; gap: 8px; align-items: center;">
-                                    <label class="form-checkbox-card" style="flex: 1; margin: 0;">
-                                        <input type="checkbox" id="upsampleApodizingEnable" onchange="toggleApodizingInput()" style="cursor: pointer;" />
-                                        <span style="font-weight: 600; font-size: 0.82rem; color: var(--text-heading);">Enable Apodizing</span>
-                                    </label>
-                                    <div style="display: flex; align-items: center; gap: 4px; width: 130px;">
-                                        <input type="number" class="form-input" id="upsampleCutoffHz" placeholder="22050" min="10000" max="192000" step="50" disabled style="padding: 6px 10px; height: 40px;" />
-                                        <span style="font-size: 0.78rem; color: var(--text-muted);">Hz</span>
-                                    </div>
-                                </div>
-                            </div>
-
-                            <div class="form-group">
-                                <label class="form-label">
-                                    <span>Filter Transition Steepness</span>
-                                    <span class="form-label-sub">Brickwall Transition</span>
-                                </label>
-                                <label class="form-checkbox-card" style="margin: 0;">
-                                    <input type="checkbox" id="upsampleSteep" style="cursor: pointer;" />
-                                    <span style="font-size: 0.82rem; color: var(--text-heading);">Sharp 500 Hz Transition Band (--steep)</span>
-                                </label>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-
-                <!-- 4. Dither, MQA & Export Controls Card -->
-                <div class="modal-section-card">
-                    <div class="modal-section-header">
-                        <span>🎛️ Dither, MQA & Quality Controls</span>
-                        <span class="form-label-sub">Noise Shaping & Integrity</span>
-                    </div>
-
-                    <div class="form-grid-3">
-                        <div class="form-group">
-                            <label class="form-label">
-                                <span>Dither & Noise Shaping</span>
-                            </label>
-                            <select class="form-select" id="upsampleDither">
-                                <option value="shibata" selected>Shibata (High-Order 24-bit)</option>
-                                <option value="high_rate">High Rate Flat Dither</option>
-                                <option value="none">None (Float64 Direct)</option>
-                            </select>
-                        </div>
-
-                        <div class="form-group">
-                            <label class="form-label">
-                                <span>MQA Payload Policy</span>
-                            </label>
-                            <select class="form-select" id="upsampleMqa">
-                                <option value="adaptive" selected>adaptive (Subband Unfold)</option>
-                                <option value="strip">strip (Mask LSB & Re-dither)</option>
-                                <option value="ignore">ignore (Treat as Raw PCM)</option>
-                            </select>
-                        </div>
-
-                        <div class="form-group">
-                            <label class="form-label">
-                                <span>File Overwrite Mode</span>
-                            </label>
-                            <select class="form-select" id="upsampleOverwrite">
-                                <option value="on" selected>Overwrite Existing Output</option>
-                                <option value="off">Skip If Output Exists</option>
-                            </select>
-                        </div>
-                    </div>
-
-                    <div style="margin-top: 4px;">
-                        <label class="form-checkbox-card" style="margin: 0;">
-                            <input type="checkbox" id="upsampleReport" checked style="cursor: pointer;" />
-                            <span style="font-size: 0.82rem; color: var(--text-heading); font-weight: 500;">Generate Comparative HTML & Markdown Forensic Reports</span>
-                        </label>
-                    </div>
-                </div>
-
-                <!-- Initial Launch Actions (Batch / Album Launching) -->
-                <div id="initialLaunchControls" class="decision-btn-grid" style="border-top: 1px solid #30363d; padding-top: 14px; margin-top: 8px;">
-                    <button class="btn-decision btn-decision-primary" onclick="startUpsampleJob(true)" title="Launch interactive session, auditing and prompting per-track decisions">
-                        <span style="font-size: 0.92rem;">▶️ [Y] Start Interactive Mode</span>
-                        <span class="btn-decision-sub">Prompts per-track recipe & review in modal</span>
-                    </button>
-                    <button class="btn-decision btn-decision-auto" onclick="startUpsampleJob(false)" title="Automatically apply each track's forensic recommendation unattended">
-                        <span style="font-size: 0.92rem;">⚡ [A] Auto-Upsample Album</span>
-                        <span class="btn-decision-sub">Auto-applies recommendations unattended</span>
-                    </button>
-                    <button class="btn-decision btn-decision-lock" onclick="startUpsampleJob(false)" title="Upsample album using the custom parameters configured above">
-                        <span style="font-size: 0.92rem;">❄️ [C] Upsample with Configured Settings</span>
-                        <span class="btn-decision-sub">Applies settings above to all tracks</span>
-                    </button>
-                    <button class="btn-decision btn-decision-abort" onclick="closeUpsampleModal()" title="Cancel and close dialog">
-                        <span style="font-size: 0.92rem;">⏹️ [K] Cancel</span>
-                        <span class="btn-decision-sub">Dismiss this dialog</span>
-                    </button>
-                </div>
-
-                <!-- Interactive Track Decision Actions Grid (Live Subprocess Prompts) -->
-                <div id="interactiveDecisionControls" class="decision-btn-grid" style="display: none; border-top: 1px solid #30363d; padding-top: 14px; margin-top: 8px;">
-                    <button class="btn-decision btn-decision-primary" onclick="sendPromptChoice('y')" title="Accept recipe and process this track">
-                        <span style="font-size: 0.92rem;">▶️ [Y] Process This Track</span>
-                        <span class="btn-decision-sub">Process file, background & prompt next</span>
-                    </button>
-                    <button class="btn-decision btn-decision-lock" onclick="sendPromptChoice('c')" title="Apply this recipe to REST of album directory">
-                        <span style="font-size: 0.92rem;">❄️ [C] Apply to REST of Album</span>
-                        <span class="btn-decision-sub">Freeze recipe for all remaining tracks</span>
-                    </button>
-                    <button class="btn-decision btn-decision-auto" onclick="sendPromptChoice('a')" title="Adopt recommended recipes automatically for ALL remaining tracks">
-                        <span style="font-size: 0.92rem;">⚡ [A] Auto-Apply ALL Remaining</span>
-                        <span class="btn-decision-sub">Adopt recommendations unattended</span>
-                    </button>
-                    <button class="btn-decision btn-decision-skip" onclick="sendPromptChoice('s')" title="Skip this track and proceed to next">
-                        <span style="font-size: 0.92rem;">⏭️ [S] Skip This Track</span>
-                        <span class="btn-decision-sub">Skip file & move to next track</span>
-                    </button>
-                    <button class="btn-decision btn-decision-skip" onclick="sendPromptChoice('k')" title="Skip this track and ALL remaining in this album directory">
-                        <span style="font-size: 0.92rem;">⏹️ [K] Skip REST of Album</span>
-                        <span class="btn-decision-sub">Bypass remainder of album directory</span>
-                    </button>
-                    <button class="btn-decision" id="btnPromptViewSummary" onclick="openAlbumSummary()" style="background: rgba(0, 229, 255, 0.12); border: 1px solid rgba(0, 229, 255, 0.35); color: var(--accent-cyan);" title="View existing Album Analysis Summary">
-                        <span style="font-size: 0.92rem;">📋 [V] View Album Summary</span>
-                        <span class="btn-decision-sub">Read forensic album report</span>
-                    </button>
-                    <button class="btn-decision btn-decision-abort" onclick="sendPromptChoice('q')" style="grid-column: 1 / -1;" title="Abort the entire upsampling session">
-                        <span style="font-size: 0.92rem;">⛔ [Q] Abort Upsampling Session</span>
-                        <span class="btn-decision-sub">Gracefully terminate background process</span>
-                    </button>
-                </div>
-
-            </div>
-        </div>
-    </div>
-
-    <!-- Live Console Log Viewer Modal -->
-    <div id="upsampleLogModal" class="modal-backdrop" style="display: none;" onclick="if(event.target===this) closeUpsampleLogModal()">
-        <div class="modal-content" style="max-width: 800px; height: 75vh;">
-            <div class="modal-header">
-                <div style="display: flex; align-items: center; gap: 10px;">
-                    <span style="font-size: 1rem; font-weight: 700; color: var(--text-heading);">📜 AcoustiSinc DSP Terminal Output</span>
-                </div>
-                <button class="btn-bookmark" onclick="closeUpsampleLogModal()" style="font-size: 1.2rem; padding: 2px 10px; line-height: 1;">&times;</button>
-            </div>
-            <div class="modal-body" style="padding: 0; background: #0a0c10; display: flex; flex-direction: column;">
-                <div id="upsampleTerminalBox" style="flex: 1; overflow-y: auto; padding: 14px 18px; font-family: ui-monospace, SFMono-Regular, 'SF Mono', monospace; font-size: 0.74rem; color: #8b949e;">
-                    <div id="upsampleTerminalLogs" style="display: flex; flex-direction: column; gap: 3px;"></div>
-                </div>
-            </div>
-        </div>
-    </div>
 </body>
 </html>"""
 

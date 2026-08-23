@@ -202,6 +202,20 @@ def write_single_track_markdown_report(filepath, item, applied_recipe):
 
 def write_single_track_html_report(filepath, item, applied_recipe):
     item_json = json.dumps(item)
+    src_nyquist = item['src_nyquist']
+    dst_nyquist = item['dst_nyquist']
+    out_of_range_html = ""
+    if src_nyquist < dst_nyquist:
+        h_pct = 100.0 - (src_nyquist / dst_nyquist) * 100.0
+        out_of_range_html = (
+            f"<div style='position: absolute; top: 0; left: 0; width: 100%; height: {h_pct:.1f}%; "
+            f"background: repeating-linear-gradient(45deg, rgba(15,18,24,0.95), rgba(15,18,24,0.95) 10px, "
+            f"rgba(25,32,45,0.95) 10px, rgba(25,32,45,0.95) 20px); border-bottom: 1.5px dashed rgba(255,171,0,0.85); "
+            f"display: flex; align-items: center; justify-content: center;'>"
+            f"<span style='color: rgba(255,171,0,0.65); font-family: monospace; font-size: 11px; font-weight: 700;'>"
+            f"🔒 Out of Container Bandwidth (&gt;{src_nyquist:.1f} kHz)</span></div>"
+        )
+    src_img_h_pct = min(100.0, (src_nyquist / dst_nyquist) * 100.0)
 
     html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -370,13 +384,15 @@ def write_single_track_html_report(filepath, item, applied_recipe):
                 <span style="color: var(--text-muted);">⬅️ Source Master (Before)</span>
                 <span class="badge" style="color: #fff; background: rgba(255,255,255,0.1); border-color: #444;">{item['src_sr']/1000.0:.1f}k / {item['src_sub_format']}</span>
             </div>
-            <div class="spec-container">
+            <div class="spec-container" style="position: relative;">
                 <div class="spec-ruler">
-                    <span class="ruler-tag">{item['src_nyquist']:.1f} kHz</span>
+                    <span class="ruler-tag">{item['dst_nyquist']:.1f} kHz</span>
+                    <span class="ruler-tag" style="color: #ffab00; border-color: rgba(255,171,0,0.4);">{item['src_nyquist']:.1f} kHz Nyq</span>
                     {f'<span class="ruler-tag ruler-aud">20.0 kHz</span>' if item['src_nyquist'] >= 20.0 else ''}
                     <span class="ruler-tag">0 Hz</span>
                 </div>
-                <img src="data:image/webp;base64,{item['src_webp']}" class="spec-img" alt="Source Spectrogram" />
+                {out_of_range_html}
+                <img src="data:image/webp;base64,{item['src_webp']}" class="spec-img" style="position: absolute; bottom: 0; left: 0; width: 100%; height: {src_img_h_pct:.1f}%;" alt="Source Spectrogram" />
             </div>
             <div class="canvas-container">
                 <canvas id="srcCurveCanvas"></canvas>
@@ -400,7 +416,7 @@ def write_single_track_html_report(filepath, item, applied_recipe):
                 <span style="color: var(--accent-green);">➡️ AcoustiSinc Upsampled (After)</span>
                 <span class="badge" style="color: var(--accent-green); background: rgba(174,234,0,0.1); border-color: rgba(174,234,0,0.3);">{item['dst_sr']/1000.0:.1f}k / {item['dst_sub_format']}</span>
             </div>
-            <div class="spec-container">
+            <div class="spec-container" style="position: relative;">
                 <div class="spec-ruler">
                     <span class="ruler-tag">{item['dst_nyquist']:.1f} kHz</span>
                     {f'<span class="ruler-tag ruler-aud">20.0 kHz</span>' if item['dst_nyquist'] >= 20.0 else ''}
@@ -450,11 +466,40 @@ def write_single_track_html_report(filepath, item, applied_recipe):
             ctx.lineWidth = 1;
             ctx.strokeRect(padL, padT, plotW, plotH);
 
-            const fMin = 0, fMax = Math.max(22.05, nyquist * 1.04);
+            const normMax = Math.max(item.src_nyquist, item.dst_nyquist, item.src_sr % 44100 === 0 ? 88.2 : 96.0);
+            const fMin = 0, fMax = normMax;
             const dbMin = -160, dbMax = 0;
 
             function fToX(f) {{ return padL + ((f - fMin) / (fMax - fMin)) * plotW; }}
             function dbToY(db) {{ return padT + (1.0 - (Math.max(dbMin, Math.min(dbMax, db)) - dbMin) / (dbMax - dbMin)) * plotH; }}
+
+            // 0. Out-of-container Nyquist Hatch Pattern for source
+            if (fMax > nyquist) {{
+                const xNyq = fToX(nyquist);
+                const hatchW = (padL + plotW) - xNyq;
+                if (hatchW > 0) {{
+                    ctx.save();
+                    ctx.beginPath();
+                    ctx.rect(xNyq, padT, hatchW, plotH);
+                    ctx.clip();
+                    ctx.fillStyle = "rgba(10, 14, 20, 0.88)";
+                    ctx.fillRect(xNyq, padT, hatchW, plotH);
+                    ctx.strokeStyle = "rgba(255, 171, 0, 0.08)";
+                    ctx.lineWidth = 1.5;
+                    for (let pos = xNyq - plotH; pos < xNyq + hatchW + plotH; pos += 14) {{
+                        ctx.beginPath();
+                        ctx.moveTo(pos, padT + plotH);
+                        ctx.lineTo(pos + plotH, padT);
+                        ctx.stroke();
+                    }}
+                    ctx.fillStyle = "rgba(255, 171, 0, 0.55)";
+                    ctx.font = "bold 9px monospace";
+                    ctx.textAlign = "center";
+                    ctx.textBaseline = "middle";
+                    ctx.fillText(`🔒 Out of Container Bandwidth (>${{nyquist.toFixed(1)}} kHz)`, xNyq + hatchW / 2, padT + plotH / 2);
+                    ctx.restore();
+                }}
+            }}
 
             // 1. Horizontal dBFS Grid & Axis Ticks
             const dbSteps = [0, -20, -40, -60, -80, -100, -120, -140, -160];
@@ -482,12 +527,9 @@ def write_single_track_html_report(filepath, item, applied_recipe):
             ctx.fillText('Amplitude (dBFS)', 0, 0);
             ctx.restore();
 
-
             // 3. Vertical Frequency Grid & Axis Ticks
-            let fTicks = [0, 5, 10, 15, 20, 22.05];
-            if (nyquist > 25 && nyquist <= 50) fTicks = [0, 10, 20, 30, 40, nyquist <= 44.1 ? 44.1 : 48];
-            else if (nyquist > 50 && nyquist <= 100) fTicks = [0, 20, 40, 44.1, 60, 80, nyquist <= 88.2 ? 88.2 : 96];
-            else if (nyquist > 100) fTicks = [0, 20, 44.1, 88.2, 120, 160, 176.4, 192];
+            let fTicks = [0, 10, 20, 22.05, 40, 60, 80, 88.2, 96];
+            if (fMax > 100) fTicks = [0, 20, 44.1, 88.2, 120, 160, 176.4, 192];
 
             ctx.textAlign = 'center';
             ctx.textBaseline = 'top';
@@ -563,9 +605,12 @@ def write_single_track_html_report(filepath, item, applied_recipe):
                 ctx.beginPath();
                 ctx.moveTo(fToX(curve.f[0]), padT + plotH);
                 curve.f.forEach((f, i) => {{
-                    ctx.lineTo(fToX(f), dbToY(curve.rms[i]));
+                    if (f <= nyquist) {{
+                        ctx.lineTo(fToX(f), dbToY(curve.rms[i]));
+                    }}
                 }});
-                ctx.lineTo(fToX(curve.f[curve.f.length - 1]), padT + plotH);
+                const lastF = Math.min(nyquist, curve.f[curve.f.length - 1]);
+                ctx.lineTo(fToX(lastF), padT + plotH);
                 ctx.closePath();
                 ctx.fill();
 
@@ -573,9 +618,12 @@ def write_single_track_html_report(filepath, item, applied_recipe):
                 ctx.strokeStyle = '#ff007f';
                 ctx.lineWidth = 1.3;
                 ctx.beginPath();
+                let rFirst = true;
                 curve.f.forEach((f, i) => {{
-                    const x = fToX(f), y = dbToY(curve.rms[i]);
-                    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+                    if (f <= nyquist) {{
+                        const x = fToX(f), y = dbToY(curve.rms[i]);
+                        if (rFirst) {{ ctx.moveTo(x, y); rFirst = false; }} else ctx.lineTo(x, y);
+                    }}
                 }});
                 ctx.stroke();
 
@@ -583,9 +631,12 @@ def write_single_track_html_report(filepath, item, applied_recipe):
                 ctx.strokeStyle = '#00e5ff';
                 ctx.lineWidth = 1.4;
                 ctx.beginPath();
+                let pFirst = true;
                 curve.f.forEach((f, i) => {{
-                    const x = fToX(f), y = dbToY(curve.pk[i]);
-                    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+                    if (f <= nyquist) {{
+                        const x = fToX(f), y = dbToY(curve.pk[i]);
+                        if (pFirst) {{ ctx.moveTo(x, y); pFirst = false; }} else ctx.lineTo(x, y);
+                    }}
                 }});
                 ctx.stroke();
             }}
@@ -844,13 +895,15 @@ def write_album_html_report(filepath, comparisons, album_title, applied_recipe):
                 <span style="color: var(--text-muted);">⬅️ Source Master (Before)</span>
                 <span id="srcFmtBadge" class="badge" style="color: #fff; background: rgba(255,255,255,0.1); border-color: #444;">--</span>
             </div>
-            <div class="spec-container">
+            <div class="spec-container" style="position: relative;">
                 <div class="spec-ruler" id="srcSpecRuler">
                     <span class="ruler-tag" id="srcRulerTop">-- kHz</span>
+                    <span class="ruler-tag" id="srcRulerNyq" style="color: #ffab00; border-color: rgba(255,171,0,0.4);">-- kHz Nyq</span>
                     <span class="ruler-tag ruler-aud">20.0 kHz</span>
                     <span class="ruler-tag">0 Hz</span>
                 </div>
-                <img id="srcSpecImg" class="spec-img" alt="Source Spectrogram" />
+                <div id="srcSpecOutOfRange" style="position: absolute; top: 0; left: 0; width: 100%; height: 0; background: repeating-linear-gradient(45deg, rgba(15,18,24,0.95), rgba(15,18,24,0.95) 10px, rgba(25,32,45,0.95) 10px, rgba(25,32,45,0.95) 20px); border-bottom: 1.5px dashed rgba(255,171,0,0.85); display: none; align-items: center; justify-content: center;"></div>
+                <img id="srcSpecImg" class="spec-img" style="position: absolute; bottom: 0; left: 0; width: 100%; height: 100%;" alt="Source Spectrogram" />
             </div>
             <div class="canvas-container">
                 <canvas id="srcCurveCanvas"></canvas>
@@ -873,7 +926,7 @@ def write_album_html_report(filepath, comparisons, album_title, applied_recipe):
                 <span style="color: var(--accent-green);">➡️ AcoustiSinc Upsampled (After)</span>
                 <span id="dstFmtBadge" class="badge" style="color: var(--accent-green); background: rgba(174,234,0,0.1); border-color: rgba(174,234,0,0.3);">--</span>
             </div>
-            <div class="spec-container">
+            <div class="spec-container" style="position: relative;">
                 <div class="spec-ruler" id="dstSpecRuler">
                     <span class="ruler-tag" id="dstRulerTop">-- kHz</span>
                     <span class="ruler-tag ruler-aud">20.0 kHz</span>
@@ -952,10 +1005,23 @@ def write_album_html_report(filepath, comparisons, album_title, applied_recipe):
             document.getElementById('srcFmtBadge').textContent = `${{item.src_sr / 1000}}kHz / ${{item.src_sub_format}}`;
             document.getElementById('dstFmtBadge').textContent = `${{item.dst_sr / 1000}}kHz / ${{item.dst_sub_format}}`;
 
-            document.getElementById('srcSpecImg').src = 'data:image/webp;base64,' + item.src_webp;
+            const srcRatio = Math.min(1.0, item.src_nyquist / item.dst_nyquist);
+            const srcImg = document.getElementById('srcSpecImg');
+            const srcOut = document.getElementById('srcSpecOutOfRange');
+            srcImg.src = 'data:image/webp;base64,' + item.src_webp;
+            srcImg.style.height = (srcRatio * 100) + '%';
+            if (srcRatio < 0.99) {{
+                srcOut.style.display = 'flex';
+                srcOut.style.height = ((1.0 - srcRatio) * 100) + '%';
+                srcOut.innerHTML = `<span style='color: rgba(255,171,0,0.65); font-family: monospace; font-size: 11px; font-weight: 700;'>🔒 Out of Container Bandwidth (&gt;${{item.src_nyquist.toFixed(1)}} kHz)</span>`;
+            }} else {{
+                srcOut.style.display = 'none';
+            }}
+
             document.getElementById('dstSpecImg').src = 'data:image/webp;base64,' + item.dst_webp;
 
-            document.getElementById('srcRulerTop').textContent = `${{item.src_nyquist.toFixed(1)}} kHz`;
+            document.getElementById('srcRulerTop').textContent = `${{item.dst_nyquist.toFixed(1)}} kHz`;
+            document.getElementById('srcRulerNyq').textContent = `${{item.src_nyquist.toFixed(1)}} kHz Nyq`;
             document.getElementById('dstRulerTop').textContent = `${{item.dst_nyquist.toFixed(1)}} kHz`;
 
             document.getElementById('srcSrVal').textContent = `${{item.src_sr.toLocaleString()}} Hz (${{item.src_sub_format}})`;
@@ -979,11 +1045,11 @@ def write_album_html_report(filepath, comparisons, album_title, applied_recipe):
             document.getElementById('srcCrestVal').textContent = `${{item.src_crest}} dB`;
             document.getElementById('dstCrestVal').textContent = `${{item.dst_crest}} dB`;
 
-            drawForensicCurve('srcCurveCanvas', item.src_curve, item.src_nyquist, null, item.src_knee_khz);
-            drawForensicCurve('dstCurveCanvas', item.dst_curve, item.dst_nyquist, item.applied_cutoff_khz, item.dst_knee_khz);
+            drawForensicCurve('srcCurveCanvas', item.src_curve, item.src_nyquist, null, item.src_knee_khz, item.dst_nyquist, item.src_sr);
+            drawForensicCurve('dstCurveCanvas', item.dst_curve, item.dst_nyquist, item.applied_cutoff_khz, item.dst_knee_khz, item.dst_nyquist, item.dst_sr);
         }}
 
-        function drawForensicCurve(canvasId, curve, nyquist, cutoffKhz, kneeKhz) {{
+        function drawForensicCurve(canvasId, curve, nyquist, cutoffKhz, kneeKhz, targetNyquist, sr) {{
             const canvas = document.getElementById(canvasId);
             if (!canvas) return;
             const rect = canvas.getBoundingClientRect();
@@ -1005,11 +1071,40 @@ def write_album_html_report(filepath, comparisons, album_title, applied_recipe):
             ctx.lineWidth = 1;
             ctx.strokeRect(padL, padT, plotW, plotH);
 
-            const fMin = 0, fMax = Math.max(22.05, nyquist * 1.04);
+            const normMax = Math.max(nyquist, targetNyquist || 88.2, (sr && sr % 44100 === 0) ? 88.2 : 96.0);
+            const fMin = 0, fMax = normMax;
             const dbMin = -160, dbMax = 0;
 
             function fToX(f) {{ return padL + ((f - fMin) / (fMax - fMin)) * plotW; }}
             function dbToY(db) {{ return padT + (1.0 - (Math.max(dbMin, Math.min(dbMax, db)) - dbMin) / (dbMax - dbMin)) * plotH; }}
+
+            // 0. Out-of-container Nyquist Hatch Pattern for source
+            if (fMax > nyquist) {{
+                const xNyq = fToX(nyquist);
+                const hatchW = (padL + plotW) - xNyq;
+                if (hatchW > 0) {{
+                    ctx.save();
+                    ctx.beginPath();
+                    ctx.rect(xNyq, padT, hatchW, plotH);
+                    ctx.clip();
+                    ctx.fillStyle = "rgba(10, 14, 20, 0.88)";
+                    ctx.fillRect(xNyq, padT, hatchW, plotH);
+                    ctx.strokeStyle = "rgba(255, 171, 0, 0.08)";
+                    ctx.lineWidth = 1.5;
+                    for (let pos = xNyq - plotH; pos < xNyq + hatchW + plotH; pos += 14) {{
+                        ctx.beginPath();
+                        ctx.moveTo(pos, padT + plotH);
+                        ctx.lineTo(pos + plotH, padT);
+                        ctx.stroke();
+                    }}
+                    ctx.fillStyle = "rgba(255, 171, 0, 0.55)";
+                    ctx.font = "bold 9px monospace";
+                    ctx.textAlign = "center";
+                    ctx.textBaseline = "middle";
+                    ctx.fillText(`🔒 Out of Container Bandwidth (>${{nyquist.toFixed(1)}} kHz)`, xNyq + hatchW / 2, padT + plotH / 2);
+                    ctx.restore();
+                }}
+            }}
 
             // 1. Horizontal dBFS Grid & Axis Ticks
             const dbSteps = [0, -20, -40, -60, -80, -100, -120, -140, -160];
@@ -1037,12 +1132,9 @@ def write_album_html_report(filepath, comparisons, album_title, applied_recipe):
             ctx.fillText('Amplitude (dBFS)', 0, 0);
             ctx.restore();
 
-
             // 3. Vertical Frequency Grid & Axis Ticks
-            let fTicks = [0, 5, 10, 15, 20, 22.05];
-            if (nyquist > 25 && nyquist <= 50) fTicks = [0, 10, 20, 30, 40, nyquist <= 44.1 ? 44.1 : 48];
-            else if (nyquist > 50 && nyquist <= 100) fTicks = [0, 20, 40, 44.1, 60, 80, nyquist <= 88.2 ? 88.2 : 96];
-            else if (nyquist > 100) fTicks = [0, 20, 44.1, 88.2, 120, 160, 176.4, 192];
+            let fTicks = [0, 10, 20, 22.05, 40, 60, 80, 88.2, 96];
+            if (fMax > 100) fTicks = [0, 20, 44.1, 88.2, 120, 160, 176.4, 192];
 
             ctx.textAlign = 'center';
             ctx.textBaseline = 'top';
@@ -1118,9 +1210,12 @@ def write_album_html_report(filepath, comparisons, album_title, applied_recipe):
                 ctx.beginPath();
                 ctx.moveTo(fToX(curve.f[0]), padT + plotH);
                 curve.f.forEach((f, i) => {{
-                    ctx.lineTo(fToX(f), dbToY(curve.rms[i]));
+                    if (f <= nyquist) {{
+                        ctx.lineTo(fToX(f), dbToY(curve.rms[i]));
+                    }}
                 }});
-                ctx.lineTo(fToX(curve.f[curve.f.length - 1]), padT + plotH);
+                const lastF = Math.min(nyquist, curve.f[curve.f.length - 1]);
+                ctx.lineTo(fToX(lastF), padT + plotH);
                 ctx.closePath();
                 ctx.fill();
 
@@ -1128,9 +1223,12 @@ def write_album_html_report(filepath, comparisons, album_title, applied_recipe):
                 ctx.strokeStyle = '#ff007f';
                 ctx.lineWidth = 1.3;
                 ctx.beginPath();
+                let rFirst = true;
                 curve.f.forEach((f, i) => {{
-                    const x = fToX(f), y = dbToY(curve.rms[i]);
-                    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+                    if (f <= nyquist) {{
+                        const x = fToX(f), y = dbToY(curve.rms[i]);
+                        if (rFirst) {{ ctx.moveTo(x, y); rFirst = false; }} else ctx.lineTo(x, y);
+                    }}
                 }});
                 ctx.stroke();
 
@@ -1138,9 +1236,12 @@ def write_album_html_report(filepath, comparisons, album_title, applied_recipe):
                 ctx.strokeStyle = '#00e5ff';
                 ctx.lineWidth = 1.4;
                 ctx.beginPath();
+                let pFirst = true;
                 curve.f.forEach((f, i) => {{
-                    const x = fToX(f), y = dbToY(curve.pk[i]);
-                    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+                    if (f <= nyquist) {{
+                        const x = fToX(f), y = dbToY(curve.pk[i]);
+                        if (pFirst) {{ ctx.moveTo(x, y); pFirst = false; }} else ctx.lineTo(x, y);
+                    }}
                 }});
                 ctx.stroke();
             }}

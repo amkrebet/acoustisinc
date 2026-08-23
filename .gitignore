@@ -45,3 +45,4 @@ questionnable.png
 .vscode/
 .gemini/
 GEMINI.md
+*.log

@@ -961,14 +961,15 @@ def process_album_folder(source_album_dir, dest_album_dir, queue, default_params
         for idx, f in enumerate(files, 1):
             dest_file = os.path.join(dest_album_dir, os.path.basename(f))
             if os.path.exists(dest_file):
-                if prompt_ctrl is not None:
+                if prompt_ctrl is not None and getattr(prompt_ctrl, 'mode', 'none') != 'ask':
                     should_overwrite = prompt_ctrl.resolve_overwrite(dest_file, f, idx, len(files))
-                else:
-                    should_overwrite = (overwrite_mode == 'on')
-
-                if not should_overwrite:
-                    print(f"   [Skip] Output exists: {os.path.basename(f)} (use --overwrite to overwrite)")
-                    continue
+                    if not should_overwrite:
+                        print(f"   [Skip] Output exists: {os.path.basename(f)} (use --overwrite to overwrite)")
+                        continue
+                elif prompt_ctrl is None:
+                    if overwrite_mode != 'on':
+                        print(f"   [Skip] Output exists: {os.path.basename(f)} (use --overwrite to overwrite)")
+                        continue
 
             if prompt_ctrl is not None:
                 track_params, skip = prompt_ctrl.resolve_track_params(f, idx, len(files), default_params)
@@ -1070,6 +1071,7 @@ def process_album_folder(source_album_dir, dest_album_dir, queue, default_params
     # Generate Full Before & After Comparative Upsampling Report
     # ONLY analyze and generate reports if tracks were actually processed and album was not skipped
     is_album_skipped = bool(prompt_ctrl and getattr(prompt_ctrl, 'skip_album', False))
+    report_file = None
     if not is_album_skipped and processed_tracks:
         valid_items = [t for t in processed_tracks if os.path.exists(t["dst_path"])]
         if valid_items:
@@ -1083,8 +1085,11 @@ def process_album_folder(source_album_dir, dest_album_dir, queue, default_params
                 "date": time.strftime("%Y-%m-%d %H:%M:%S")
             }
             try:
+                if prompt_ctrl:
+                    prompt_ctrl.on_stage_change("Generating Comparative Reports", alb_name, len(files), len(files), 92.0)
                 html_rep, md_rep = generate_comparative_report(valid_items, alb_name, applied_recipe, dest_album_dir)
                 if html_rep:
+                    report_file = html_rep
                     print(f"\n   📊 [Comparative Upsampling Report Generated]")
                     print(f"      Interactive HTML Report: {html_rep}")
                     print(f"      Markdown Summary Report: {md_rep}")
@@ -1095,12 +1100,18 @@ def process_album_folder(source_album_dir, dest_album_dir, queue, default_params
     elif not processed_tracks:
         print(f"   [Report Notice] No tracks upsampled in this session. Comparative report analysis bypassed.")
 
+    return report_file
+
 
 # ==============================================================================
-# SESSION PROMPT CONTROLLER (PER-FILE FORENSIC RECIPE RESOLVER)
+# BASE & SPECIALIZED PROMPT CONTROLLERS (UNIFIED ARCHITECTURE FOR CLI & WEB UI)
 # ==============================================================================
 
-class SessionPromptController:
+class BasePromptController:
+    """
+    Base abstraction for prompting, forensic auditing, and progress telemetry.
+    Shared across both CLI and Web UI backends.
+    """
     def __init__(self, mode='none', overwrite_mode='off', default_params=None):
         self.initial_mode = mode  # 'none', 'ask', 'auto'
         self.mode = mode  # 'none', 'ask', 'auto', 'locked'
@@ -1113,6 +1124,15 @@ class SessionPromptController:
         self.track_decisions = {}
         self.overwrite_decisions = {}
 
+    def log(self, text):
+        print(text)
+
+    def on_stage_change(self, stage, track_name="", track_idx=0, total_tracks=0, progress_pct=0.0):
+        pass
+
+    def check_cancelled(self):
+        return False
+
     def set_album_context(self, album_dir):
         """
         Notify the controller that a new album directory is being processed.
@@ -1122,44 +1142,118 @@ class SessionPromptController:
         if self.current_album_dir is not None and self.current_album_dir != album_dir:
             folder_name = os.path.basename(album_dir) or album_dir
             if self.mode == 'locked':
-                print(f"\n[AcoustiSinc] Resetting per-album recipe lock for new directory: {folder_name}")
+                self.log(f"\n[AcoustiSinc] Resetting per-album recipe lock for new directory: {folder_name}")
                 self.mode = self.initial_mode
                 self.locked_params = None
             if self.album_overwrite_mode is not None:
-                print(f"\n[AcoustiSinc] Resetting per-album overwrite setting for new directory: {folder_name}")
+                self.log(f"\n[AcoustiSinc] Resetting per-album overwrite setting for new directory: {folder_name}")
                 self.album_overwrite_mode = None
             self.skip_album = False
         self.current_album_dir = album_dir
 
+    def _find_album_summary(self, album_dir):
+        if not album_dir or not os.path.exists(album_dir):
+            return None
+        candidate_names = [
+            'ALBUM_REPORT.md', 'album_report.md', 'ALBUM_SUMMARY.md', 'album_summary.md',
+            'analysis_summary.md', 'ANALYSIS_SUMMARY.md', 'album_analysis.md', 'ALBUM_ANALYSIS.md',
+            'PROVENANCE_SUMMARY.md', 'provenance_summary.md', 'report.md', 'REPORT.md'
+        ]
+        for name in candidate_names:
+            p = os.path.join(album_dir, name)
+            if os.path.exists(p) and os.path.isfile(p):
+                return p
+        try:
+            for entry in os.scandir(album_dir):
+                if entry.is_file() and entry.name.lower().endswith(('_report.md', '_summary.md', 'album_report.md')):
+                    return entry.path
+        except Exception:
+            pass
+        return None
+
+    def _audit_track(self, filepath, print_card=False, track_idx=None, total_tracks=None):
+        try:
+            data, sr = sf.read(filepath, frames=int(192000 * 25), dtype='float64', always_2d=True)
+        except Exception:
+            data, sr = load_audio_resilient(filepath, dtype='float64', frames=int(192000 * 25))
+        if data.ndim > 1:
+            data = np.mean(data, axis=1)
+
+        _, _, _, _, _, _, prov_info = analyze_audio_forensics(data, sr, filepath=filepath)
+        primary = prov_info.get("primary", {})
+        label = primary.get("label", "Standard Master")
+        rec = prov_info.get("recommendation", {})
+        vis = prov_info.get("visual_morphology", {})
+        pk = vis.get("primary_knee", {})
+        purity = vis.get("stopband_purity", {})
+
+        if print_card:
+            track_str = f" [Track {track_idx}/{total_tracks}]" if track_idx and total_tracks else ""
+            self.log(f"\n================================================================================")
+            self.log(f"🔬 FORENSIC AUDIT{track_str}: {os.path.basename(filepath)}")
+            self.log(f"================================================================================")
+            self.log(f"   Source Format   : {sr/1000.0:.1f} kHz (2 ch)")
+            self.log(f"   Provenance      : {label} [{primary.get('confidence', 'High')} Confidence]")
+            if pk and pk.get("is_brickwall_knee"):
+                self.log(f"   Primary Knee    : {pk.get('freq_khz', 0):.1f} kHz (Slope: {pk.get('steepest_slope_db_per_khz', 0):.1f} dB/kHz | Drop: {pk.get('drop_db', 0):.1f} dB)")
+            if purity and purity.get("has_stopband"):
+                self.log(f"   Stopband State  : {purity.get('purity_label', 'Clean')} ({purity.get('description', '')})")
+            if rec:
+                self.log(f"   Recommended Action: {rec.get('action', 'Direct Sinc Upsampling')}")
+                self.log(f"   Recommended DSP   : {rec.get('dsp_params', '--phase min --dither shibata')}")
+                if rec.get('details'):
+                    self.log(f"   Technical Rationale: {rec.get('details')}")
+
+        rec_phase = 'min'
+        rec_apodizing = False
+        rec_cutoff = None
+        rec_dither = 'shibata'
+        rec_mqa = 'adaptive'
+        rec_steep = False
+
+        if rec:
+            if rec.get("filter_cutoff_khz"):
+                rec_cutoff = rec["filter_cutoff_khz"] * 1000.0
+                rec_apodizing = True
+            params_str = rec.get("dsp_params", "")
+            if "--phase min" in params_str or "--filter min" in params_str:
+                rec_phase = 'min'
+            elif "--phase linear" in params_str:
+                rec_phase = 'linear'
+            if "--mqa" in params_str:
+                m = re.search(r"--mqa\s+(\w+)", params_str)
+                if m: rec_mqa = m.group(1)
+            if "--steep" in params_str:
+                rec_steep = True
+
+        return {
+            "phase_mode": rec_phase,
+            "apodizing": rec_apodizing,
+            "cutoff_hz": rec_cutoff,
+            "dither_mode": rec_dither,
+            "mqa_mode": rec_mqa,
+            "steep": rec_steep
+        }, rec, prov_info, sr
+
+
+class TerminalPromptController(BasePromptController):
+    """
+    Controller implementation for interactive terminal CLI sessions.
+    """
     def resolve_overwrite(self, dest_path, src_filepath, track_idx=1, total_tracks=1):
-        """
-        Resolves whether an existing target file should be overwritten based on --overwrite {on|off|ask}.
-        Returns True (overwrite) or False (skip).
-        """
         if not os.path.exists(dest_path):
             return True
 
-        # Re-use decision if already resolved in a prior pass (e.g. clipping retry)
         if dest_path in self.overwrite_decisions:
             return self.overwrite_decisions[dest_path]
 
-        # Check album-level override
-        if self.album_overwrite_mode == 'on':
+        if self.album_overwrite_mode == 'on' or self.overwrite_mode == 'on':
             self.overwrite_decisions[dest_path] = True
             return True
-        elif self.album_overwrite_mode == 'off':
+        elif self.album_overwrite_mode == 'off' or self.overwrite_mode == 'off':
             self.overwrite_decisions[dest_path] = False
             return False
 
-        # Check session overwrite mode
-        if self.overwrite_mode == 'on':
-            self.overwrite_decisions[dest_path] = True
-            return True
-        elif self.overwrite_mode == 'off':
-            self.overwrite_decisions[dest_path] = False
-            return False
-
-        # If overwrite_mode is 'ask' -> Interactive Prompt
         filename = os.path.basename(dest_path)
         track_str = f" [Track {track_idx}/{total_tracks}]" if track_idx and total_tracks else ""
 
@@ -1195,30 +1289,25 @@ class SessionPromptController:
             print(f">>> Overwriting target file: {filename}\n")
             self.overwrite_decisions[dest_path] = True
             return True
-
         elif choice in ['a', 'all']:
             print(f">>> Enabling overwrite for this and ALL remaining files in the entire session.\n")
             self.overwrite_mode = 'on'
             self.overwrite_decisions[dest_path] = True
             return True
-
         elif choice in ['c', 'continue', 'album']:
             print(f">>> Enabling overwrite for the REST of this album directory.\n")
             self.album_overwrite_mode = 'on'
             self.overwrite_decisions[dest_path] = True
             return True
-
         elif choice in ['n', 'no', 'skip']:
             print(f">>> Keeping existing file, skipping track: {filename}\n")
             self.overwrite_decisions[dest_path] = False
             return False
-
         elif choice in ['s', 'skip_album']:
             print(f">>> Skipping this and all remaining existing files in this album directory.\n")
             self.album_overwrite_mode = 'off'
             self.overwrite_decisions[dest_path] = False
             return False
-
         elif choice in ['q', 'quit', 'abort']:
             print("\n[AcoustiSinc] Processing aborted by user.")
             sys.exit(0)
@@ -1230,20 +1319,16 @@ class SessionPromptController:
     def resolve_track_params(self, filepath, track_idx=1, total_tracks=1, fallback_params=None):
         base_params = fallback_params or self.default_params
 
-        # Re-use decision if already resolved in a prior pass (e.g. clipping retry)
         if filepath in self.track_decisions:
             return self.track_decisions[filepath], False
 
-        # If user chose [C] Freeze recipe for remainder of album/session
         if self.mode == 'locked' and self.locked_params is not None:
             self.track_decisions[filepath] = self.locked_params
             return self.locked_params, False
 
-        # If mode is 'none' (user did not specify --use-recommended)
         if self.mode == 'none':
             return base_params, False
 
-        # If mode is 'auto'
         if self.mode == 'auto':
             rec_params, rec_info, _, _ = self._audit_track(filepath, print_card=False)
             dsp_str = rec_info.get("dsp_params", "--phase min --dither shibata")
@@ -1251,33 +1336,15 @@ class SessionPromptController:
             self.track_decisions[filepath] = rec_params
             return rec_params, False
 
-        # If user chose to skip the rest of the album
         if self.skip_album:
             return None, 'album'
 
-        # If mode is 'ask' -> Interactive Card Prompt
         rec_params, rec_info, prov_info, sr = self._audit_track(filepath, print_card=True, track_idx=track_idx, total_tracks=total_tracks)
         dsp_str = rec_info.get("dsp_params", "--phase min --dither shibata")
 
-        # Check if an album analysis summary / report exists in the folder
         album_dir = self.current_album_dir or os.path.dirname(filepath)
         album_summary_path = self._find_album_summary(album_dir)
         has_summary = (album_summary_path is not None)
-
-        # Emit structured machine-readable prompt for Web UI
-        prompt_payload = {
-            "track_file": os.path.basename(filepath),
-            "filepath": filepath,
-            "track_idx": track_idx,
-            "total_tracks": total_tracks,
-            "sr": sr,
-            "rec_params": rec_params,
-            "rec_info": rec_info,
-            "prov_info": prov_info,
-            "has_summary": has_summary,
-            "album_dir": album_dir
-        }
-        print(f"\n__PROMPT_JSON__:{json.dumps(prompt_payload)}", flush=True)
 
         while True:
             print("--------------------------------------------------------------------------------")
@@ -1297,25 +1364,14 @@ class SessionPromptController:
             except EOFError:
                 raw_input = 'y'
 
-            # Parse structured response from Web UI if provided
-            if raw_input.startswith("__RESP_JSON__:"):
-                try:
-                    resp_dict = json.loads(raw_input[len("__RESP_JSON__:"):])
-                    choice = resp_dict.get("choice", "y").strip().lower()
-                    custom_params = resp_dict.get("custom_params")
-                    if custom_params and isinstance(custom_params, dict):
-                        rec_params.update(custom_params)
-                        if rec_params.get("cutoff_hz"):
-                            rec_params["apodizing"] = True
-                        dsp_str = f"--phase {rec_params.get('phase_mode', 'min')} --dither {rec_params.get('dither_mode', 'shibata')}" + (f" --cutoff {int(rec_params['cutoff_hz'])}" if rec_params.get('cutoff_hz') else "")
-                except Exception:
-                    choice = "y"
-            else:
-                choice = raw_input.lower()
-
+            choice = raw_input.lower()
             if choice in ['v', 'view', 'summary']:
                 if album_summary_path:
-                    self._display_album_summary(album_summary_path)
+                    try:
+                        with open(album_summary_path, 'r', encoding='utf-8', errors='replace') as sf_file:
+                            print(sf_file.read())
+                    except Exception as err:
+                        print(f"Error reading album summary: {err}")
                 else:
                     print("\n⚠️  No album analysis summary file found in this folder.\n")
                 continue
@@ -1381,114 +1437,382 @@ class SessionPromptController:
                 self.track_decisions[filepath] = rec_params
                 return rec_params, False
 
-    def _find_album_summary(self, album_dir):
-        if not album_dir or not os.path.exists(album_dir):
-            return None
-        candidate_names = [
-            'ALBUM_REPORT.md',
-            'album_report.md',
-            'ALBUM_SUMMARY.md',
-            'album_summary.md',
-            'analysis_summary.md',
-            'ANALYSIS_SUMMARY.md',
-            'album_analysis.md',
-            'ALBUM_ANALYSIS.md',
-            'PROVENANCE_SUMMARY.md',
-            'provenance_summary.md',
-            'report.md',
-            'REPORT.md'
-        ]
-        for name in candidate_names:
-            p = os.path.join(album_dir, name)
-            if os.path.exists(p) and os.path.isfile(p):
-                return p
-        try:
-            for entry in os.scandir(album_dir):
-                if entry.is_file() and entry.name.lower().endswith(('_report.md', '_summary.md', 'album_report.md')):
-                    return entry.path
-        except Exception:
-            pass
-        return None
 
-    def _display_album_summary(self, summary_path):
-        if not summary_path or not os.path.exists(summary_path):
-            print("\n⚠️  No album analysis summary file found in this folder.\n")
-            return
-        filename = os.path.basename(summary_path)
-        print(f"\n================================================================================")
-        print(f"📋 ALBUM ANALYSIS SUMMARY: {filename}")
-        print(f"================================================================================")
+class WebPromptController(BasePromptController):
+    """
+    Controller implementation for asynchronous Web UI background execution.
+    Communicates directly in-process with UpsampleJobManager via thread synchronization.
+    """
+    def __init__(self, job_mgr, mode='ask', overwrite_mode='off', default_params=None):
+        super().__init__(mode=mode, overwrite_mode=overwrite_mode, default_params=default_params)
+        self.job_mgr = job_mgr
+        self.response_event = threading.Event()
+        self.pending_response = None
+
+    def log(self, text):
+        clean = str(text).rstrip()
+        if clean:
+            print(clean)
+            if self.job_mgr:
+                self.job_mgr.append_log(clean)
+
+    def on_stage_change(self, stage, track_name="", track_idx=0, total_tracks=0, progress_pct=0.0):
+        if self.job_mgr:
+            self.job_mgr.set_stage(stage, track_name=track_name, track_idx=track_idx, total_tracks=total_tracks, progress_pct=progress_pct)
+
+    def check_cancelled(self):
+        return bool(self.job_mgr and self.job_mgr.status == "cancelled")
+
+    def receive_web_response(self, resp_dict):
+        """Called by Web Server POST handler when user clicks an action in the modal dialog."""
+        self.pending_response = resp_dict
+        self.response_event.set()
+
+    def resolve_overwrite(self, dest_path, src_filepath, track_idx=1, total_tracks=1):
+        if self.check_cancelled():
+            return False
+        if not os.path.exists(dest_path):
+            return True
+        if dest_path in self.overwrite_decisions:
+            return self.overwrite_decisions[dest_path]
+        if self.album_overwrite_mode == 'on' or self.overwrite_mode == 'on':
+            self.overwrite_decisions[dest_path] = True
+            return True
+        elif self.album_overwrite_mode == 'off' or self.overwrite_mode == 'off':
+            self.overwrite_decisions[dest_path] = False
+            return False
+        # In Web UI mode, default to overwriting when requested by start configuration
+        self.overwrite_decisions[dest_path] = True
+        return True
+
+    def resolve_track_params(self, filepath, track_idx=1, total_tracks=1, fallback_params=None):
+        base_params = fallback_params or self.default_params
+
+        if self.check_cancelled():
+            return None, 'album'
+
+        if filepath in self.track_decisions:
+            return self.track_decisions[filepath], False
+
+        if self.mode == 'locked' and self.locked_params is not None:
+            self.track_decisions[filepath] = self.locked_params
+            return self.locked_params, False
+
+        if self.mode == 'none':
+            return base_params, False
+
+        if self.mode == 'auto':
+            rec_params, rec_info, _, _ = self._audit_track(filepath, print_card=False)
+            dsp_str = rec_info.get("dsp_params", "--phase min --dither shibata")
+            self.log(f">>> [Auto-Recommended] {os.path.basename(filepath)} -> {dsp_str}")
+            self.track_decisions[filepath] = rec_params
+            return rec_params, False
+
+        if self.skip_album:
+            return None, 'album'
+
+        # Mode 'ask': Audit and present interactive modal to the Web UI
+        self.on_stage_change(f"Auditing [{track_idx}/{total_tracks}]", os.path.basename(filepath), track_idx, total_tracks, 5.0 + (track_idx / max(1, total_tracks)) * 80.0)
+        rec_params, rec_info, prov_info, sr = self._audit_track(filepath, print_card=True, track_idx=track_idx, total_tracks=total_tracks)
+        dsp_str = rec_info.get("dsp_params", "--phase min --dither shibata")
+
+        album_dir = self.current_album_dir or os.path.dirname(filepath)
+        has_summary = bool(self._find_album_summary(album_dir))
+
+        prompt_payload = {
+            "track_file": os.path.basename(filepath),
+            "filepath": filepath,
+            "track_idx": track_idx,
+            "total_tracks": total_tracks,
+            "sr": sr,
+            "rec_params": rec_params,
+            "rec_info": rec_info,
+            "prov_info": prov_info,
+            "has_summary": has_summary,
+            "album_dir": album_dir
+        }
+
+        self.pending_response = None
+        self.response_event.clear()
+        if self.job_mgr:
+            self.job_mgr.set_waiting_prompt(prompt_payload)
+
+        # Wait for user input from Web UI or cancellation
+        while not self.response_event.is_set():
+            if self.check_cancelled():
+                return None, 'album'
+            self.response_event.wait(timeout=0.25)
+
+        resp = self.pending_response or {}
+        choice = str(resp.get("choice", "y")).strip().lower()
+        custom_params = resp.get("custom_params")
+
+        resolved_recipe = dict(rec_params)
+        if custom_params and isinstance(custom_params, dict):
+            resolved_recipe.update(custom_params)
+            if resolved_recipe.get("cutoff_hz"):
+                resolved_recipe["apodizing"] = True
+
+        dsp_str = f"--phase {resolved_recipe.get('phase_mode', 'min')} --dither {resolved_recipe.get('dither_mode', 'shibata')}" + (f" --cutoff {int(resolved_recipe['cutoff_hz'])}" if resolved_recipe.get('cutoff_hz') else "")
+
+        if choice in ['', 'y', 'yes']:
+            self.log(f">>> Applying recipe to {os.path.basename(filepath)}: {dsp_str}\n")
+            self.track_decisions[filepath] = resolved_recipe
+            return resolved_recipe, False
+
+        elif choice in ['a', 'all']:
+            self.log(f">>> Adopting recommended recipes automatically for ALL remaining tracks.\n")
+            self.mode = 'auto'
+            self.track_decisions[filepath] = resolved_recipe
+            return resolved_recipe, False
+
+        elif choice in ['c', 'continue', 'freeze']:
+            self.log(f">>> Freezing recipe ({dsp_str}) for REST of album.\n")
+            self.mode = 'locked'
+            self.locked_params = resolved_recipe
+            self.track_decisions[filepath] = resolved_recipe
+            return resolved_recipe, False
+
+        elif choice in ['s', 'skip', 'skip_track']:
+            self.log(f">>> Skipping track: {os.path.basename(filepath)}\n")
+            return None, 'track'
+
+        elif choice in ['k', 'skip_album', 'skip_rest', 'skip_all']:
+            self.log(f">>> Skipping REST of album: {os.path.basename(album_dir)}\n")
+            self.skip_album = True
+            return None, 'album'
+
+        elif choice in ['q', 'quit', 'abort']:
+            self.log("\n[AcoustiSinc] Session aborted by user.\n")
+            if self.job_mgr:
+                self.job_mgr.status = "cancelled"
+            return None, 'album'
+
+        else:
+            self.track_decisions[filepath] = resolved_recipe
+            return resolved_recipe, False
+
+
+# ==============================================================================
+# GLOBAL GPU CONTEXT & UNIFIED RUNNER ENGINE
+# ==============================================================================
+
+_GLOBAL_CL_CTX = None
+_GLOBAL_CL_QUEUE = None
+_GLOBAL_CL_LOCK = threading.Lock()
+
+def get_gpu_context_and_queue():
+    """
+    Thread-safe initialization and retrieval of OpenCL Context & CommandQueue.
+    """
+    global _GLOBAL_CL_CTX, _GLOBAL_CL_QUEUE
+    with _GLOBAL_CL_LOCK:
+        if _GLOBAL_CL_CTX is None:
+            try:
+                _GLOBAL_CL_CTX = cl.create_some_context(interactive=False)
+                _GLOBAL_CL_QUEUE = cl.CommandQueue(_GLOBAL_CL_CTX)
+            except Exception as e:
+                print(f"[Warning] OpenCL GPU initialization fallback: {e}")
+                _GLOBAL_CL_CTX = None
+                _GLOBAL_CL_QUEUE = None
+        return _GLOBAL_CL_CTX, _GLOBAL_CL_QUEUE
+
+
+def run_upsample_job(source_path, target_dir=None, default_params=None, overwrite_mode='off', prompt_ctrl=None, tmp_dir=DEFAULT_TMP_DIR):
+    """
+    Unified high-level execution entrypoint for AcoustiSinc upsampler.
+    Called directly by both CLI main() and server.py in-process worker thread.
+    """
+    global file_writer_pool
+    if getattr(file_writer_pool, '_shutdown', False):
+        file_writer_pool = BoundedThreadPoolExecutor(max_workers=1, max_queue_size=1)
+
+    source_path = os.path.abspath(source_path)
+    if not os.path.exists(source_path):
+        err = f"Source path not found: {source_path}"
+        if prompt_ctrl: prompt_ctrl.log(f"[Error] {err}")
+        return {"status": "error", "message": err}
+
+    if default_params is None:
+        default_params = {
+            "phase_mode": "linear",
+            "dither_mode": "shibata",
+            "apodizing": False,
+            "mqa_mode": "adaptive",
+            "cutoff_hz": None,
+            "steep": False,
+            "overwrite_mode": overwrite_mode
+        }
+
+    is_file = os.path.isfile(source_path)
+    is_min = default_params.get('phase_mode', 'linear').lower() in ['min', 'minimum']
+    phase_name = "MINIMUM PHASE" if is_min else "LINEAR PHASE"
+    topology_suffix = ("min_apod" if default_params.get('apodizing') else "min") if is_min else ("linear_apod" if default_params.get('apodizing') else "linear")
+    if default_params.get('cutoff_hz'):
+        topology_suffix += f"_{int(default_params['cutoff_hz'])}hz"
+
+    if not target_dir:
+        if is_file:
+            parent = os.path.dirname(source_path)
+            target_dir = os.path.join(parent, f"upsampled_{topology_suffix}")
+        else:
+            target_dir = f"{source_path.rstrip(os.sep)}_upsampled_{topology_suffix}"
+
+    target_dir = os.path.abspath(target_dir)
+
+    if os.path.abspath(source_path) == os.path.abspath(target_dir):
+        err = f"Target directory cannot be identical to source path ({target_dir})."
+        if prompt_ctrl: prompt_ctrl.log(f"[Fatal Safety Error] {err}")
+        return {"status": "error", "message": err}
+
+    if is_file and os.path.abspath(target_dir) == os.path.abspath(os.path.dirname(source_path)):
+        err = f"Output directory cannot be identical to the source file directory ({target_dir})."
+        if prompt_ctrl: prompt_ctrl.log(f"[Fatal Safety Error] {err}")
+        return {"status": "error", "message": err}
+
+    os.makedirs(tmp_dir, exist_ok=True)
+    os.makedirs(target_dir, exist_ok=True)
+
+    if prompt_ctrl is None:
+        prompt_ctrl = TerminalPromptController(mode='none', overwrite_mode=overwrite_mode, default_params=default_params)
+
+    ctx, queue = get_gpu_context_and_queue()
+
+    prompt_ctrl.log("\n=======================================================")
+    prompt_ctrl.log("🔬 ACOUSTISINC: 64-BIT GPU SINC AUDIO UPSAMPLER")
+    prompt_ctrl.log("=======================================================")
+    prompt_ctrl.log(f"Source Path     : {source_path}")
+    prompt_ctrl.log(f"Destination Path: {target_dir}")
+    prompt_ctrl.log(f"Phase Mode      : {phase_name}")
+    prompt_ctrl.log(f"Noise Shaping   : {default_params.get('dither_mode', 'shibata').upper()} (In-Register Double Precision)")
+    prompt_ctrl.log(f"MQA Processing  : {default_params.get('mqa_mode', 'adaptive').upper()}")
+    prompt_ctrl.log(f"FLAC Compression: Level 5 (Strict)")
+    prompt_ctrl.log(f"Precision       : 64-bit Double Precision (Strict)")
+    prompt_ctrl.log("=======================================================\n")
+
+    if is_file:
+        prompt_ctrl.on_stage_change("Analyzing Headroom", os.path.basename(source_path), 1, 1, 5.0)
+        dest_file = os.path.join(target_dir, os.path.basename(source_path))
+        if os.path.exists(dest_file):
+            should_overwrite = prompt_ctrl.resolve_overwrite(dest_file, source_path, 1, 1)
+            if not should_overwrite:
+                prompt_ctrl.log(f"   [Skip] Output exists: {os.path.basename(source_path)}")
+                prompt_ctrl.on_stage_change("Completed", os.path.basename(source_path), 1, 1, 100.0)
+                return {"status": "ok", "skipped": True}
+
+        prompt_ctrl.on_stage_change("Auditing Track Provenance", os.path.basename(source_path), 1, 1, 10.0)
+        t_params, skip = prompt_ctrl.resolve_track_params(source_path, 1, 1, default_params)
+        if skip or prompt_ctrl.check_cancelled():
+            prompt_ctrl.on_stage_change("Cancelled" if prompt_ctrl.check_cancelled() else "Skipped", os.path.basename(source_path), 1, 1, 100.0)
+            return {"status": "skipped"}
+
+        prompt_ctrl.on_stage_change("Resampling [1/1] (64-bit Sinc)", os.path.basename(source_path), 1, 1, 25.0)
+        gain_factor, pk = scan_album([source_path])
+        clipped, out_peak, fut = process_track(
+            source_path, target_dir, gain_factor, pk, queue,
+            phase_mode=t_params['phase_mode'],
+            dither_mode=t_params['dither_mode'],
+            tmp_dir=tmp_dir,
+            apodizing=t_params['apodizing'],
+            mqa_mode=t_params['mqa_mode'],
+            cutoff_hz=t_params['cutoff_hz'],
+            steep=t_params['steep'],
+            overwrite=True
+        )
+        if clipped and out_peak > PEAK_TARGET_LIN:
+            overshoot_ratio = PEAK_TARGET_LIN / out_peak
+            safety_margin_lin = 10.0 ** (-0.2 / 20.0)
+            gain_factor *= (overshoot_ratio * safety_margin_lin)
+            prompt_ctrl.log(f">>> Retrying single file with exact calculated Gain Factor: {gain_factor:.6f}")
+            clipped, out_peak, fut = process_track(
+                source_path, target_dir, gain_factor, pk, queue,
+                phase_mode=t_params['phase_mode'],
+                dither_mode=t_params['dither_mode'],
+                tmp_dir=tmp_dir,
+                apodizing=t_params['apodizing'],
+                mqa_mode=t_params['mqa_mode'],
+                cutoff_hz=t_params['cutoff_hz'],
+                steep=t_params['steep'],
+                overwrite=True
+            )
+
+        if fut is not None:
+            prompt_ctrl.on_stage_change("Tagging & ReplayGain [1/1]", os.path.basename(source_path), 1, 1, 85.0)
+            try: fut.result()
+            except Exception: pass
+
+        dest_file = os.path.join(target_dir, os.path.basename(source_path))
+        t_recipe = {
+            "cli_params": f"--phase {t_params['phase_mode']} --dither {t_params['dither_mode']}" + (f" --cutoff {int(t_params['cutoff_hz'])}" if t_params.get('cutoff_hz') else "") + (f" --mqa {t_params['mqa_mode']}" if t_params.get('mqa_mode') != 'adaptive' else "") + (" --steep" if t_params.get('steep') else ""),
+            "topology_name": f"{t_params['phase_mode'].upper()} APODIZING" if (t_params.get('apodizing') or t_params.get('cutoff_hz')) else f"{t_params['phase_mode'].upper()}",
+            "gain_factor": gain_factor,
+            "gain_db": 20.0 * np.log10(gain_factor),
+            "cutoff_hz": t_params.get('cutoff_hz'),
+            "phase_mode": t_params['phase_mode'],
+            "dither_mode": t_params['dither_mode'],
+            "mqa_mode": t_params['mqa_mode'],
+            "steep": t_params.get('steep', False),
+            "date": time.strftime("%Y-%m-%d %H:%M:%S")
+        }
+        applied_recipe = dict(t_recipe)
+        report_path = None
         try:
-            with open(summary_path, 'r', encoding='utf-8', errors='replace') as f:
-                content = f.read()
-            print(content)
+            prompt_ctrl.on_stage_change("Generating Comparative Forensic Reports", os.path.basename(source_path), 1, 1, 92.0)
+            html_rep, md_rep = generate_comparative_report([{"src_path": source_path, "dst_path": dest_file, "recipe": t_recipe}], os.path.basename(source_path), applied_recipe, target_dir)
+            if html_rep:
+                report_path = html_rep
+                prompt_ctrl.log(f"\n   📊 [Comparative Upsampling Report Generated]")
+                prompt_ctrl.log(f"      Interactive HTML Report: {html_rep}")
+                prompt_ctrl.log(f"      Markdown Summary Report: {md_rep}")
         except Exception as e:
-            print(f"[Error reading album summary]: {e}")
-        print(f"================================================================================\n")
+            prompt_ctrl.log(f"   [Notice] Could not generate comparative report: {e}")
 
-    def _audit_track(self, filepath, print_card=False, track_idx=None, total_tracks=None):
+        prompt_ctrl.on_stage_change("Finished Successfully", os.path.basename(source_path), 1, 1, 100.0)
+        return {"status": "ok", "report_path": report_path}
+
+    # If directory:
+    album_directories = sorted({
+        r for r, d, f in os.walk(source_path)
+        if not os.path.abspath(r).startswith(target_dir) and any(x.lower().endswith(('.flac', '.wav', '.aiff', '.m4a')) for x in f)
+    })
+
+    if not album_directories:
+        msg = f"No supported audio files found under {source_path}"
+        prompt_ctrl.log(f"[AcoustiSinc] {msg}")
+        prompt_ctrl.on_stage_change("Completed", "", 0, 0, 100.0)
+        return {"status": "ok", "message": msg}
+
+    total_albums = len(album_directories)
+    last_report = None
+    for idx, alb_dir in enumerate(album_directories, 1):
+        if prompt_ctrl.check_cancelled():
+            prompt_ctrl.log("\n[AcoustiSinc] Batch execution cancelled by user.")
+            break
+        rel = os.path.relpath(alb_dir, source_path)
+        dest_alb = target_dir if rel == "." else os.path.join(target_dir, rel)
+        prompt_ctrl.log(f"\n==================================================")
+        prompt_ctrl.log(f"[Album {idx}/{total_albums}]: {os.path.basename(alb_dir) or alb_dir}")
         try:
-            data, sr = sf.read(filepath, frames=int(192000 * 25), dtype='float64', always_2d=True)
-        except Exception:
-            data, sr = load_audio_resilient(filepath, dtype='float64', frames=int(192000 * 25))
-        if data.ndim > 1:
-            data = np.mean(data, axis=1)
+            rep = process_album_folder(alb_dir, dest_alb, queue, default_params, tmp_dir, overwrite_mode=overwrite_mode, prompt_ctrl=prompt_ctrl)
+            if rep: last_report = rep
+        except Exception as e:
+            err_msg = f"[Album {idx} Skipped on Error]: {alb_dir}\nDetails: {e}"
+            prompt_ctrl.log(f"\n{err_msg}\n>>> Continuing to next album...")
+            try:
+                with open(os.path.join(target_dir, "upsample_errors.log"), "a", encoding="utf-8") as ef:
+                    ef.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {err_msg}\n")
+            except Exception:
+                pass
+            GPU_FILTER_CACHE.clear()
+            clear_vkfftapp_cache()
+            gc.collect()
 
-        _, _, _, _, _, _, prov_info = analyze_audio_forensics(data, sr, filepath=filepath)
-        primary = prov_info.get("primary", {})
-        label = primary.get("label", "Standard Master")
-        rec = prov_info.get("recommendation", {})
-        vis = prov_info.get("visual_morphology", {})
-        pk = vis.get("primary_knee", {})
-        purity = vis.get("stopband_purity", {})
-
-        if print_card:
-            track_str = f" [Track {track_idx}/{total_tracks}]" if track_idx and total_tracks else ""
-            print(f"\n================================================================================")
-            print(f"🔬 FORENSIC AUDIT{track_str}: {os.path.basename(filepath)}")
-            print(f"================================================================================")
-            print(f"   Source Format   : {sr/1000.0:.1f} kHz (2 ch)")
-            print(f"   Provenance      : {label} [{primary.get('confidence', 'High')} Confidence]")
-            if pk and pk.get("is_brickwall_knee"):
-                print(f"   Primary Knee    : {pk.get('freq_khz', 0):.1f} kHz (Slope: {pk.get('steepest_slope_db_per_khz', 0):.1f} dB/kHz | Drop: {pk.get('drop_db', 0):.1f} dB)")
-            if purity and purity.get("has_stopband"):
-                print(f"   Stopband State  : {purity.get('purity_label', 'Clean')} ({purity.get('description', '')})")
-            if rec:
-                print(f"   Recommended Action: {rec.get('action', 'Direct Sinc Upsampling')}")
-                print(f"   Recommended DSP   : {rec.get('dsp_params', '--phase min --dither shibata')}")
-                if rec.get('details'):
-                    print(f"   Technical Rationale: {rec.get('details')}")
-
-        rec_phase = 'min'
-        rec_apodizing = False
-        rec_cutoff = None
-        rec_dither = 'shibata'
-        rec_mqa = 'adaptive'
-        rec_steep = False
-
-        if rec:
-            if rec.get("filter_cutoff_khz"):
-                rec_cutoff = rec["filter_cutoff_khz"] * 1000.0
-                rec_apodizing = True
-            params_str = rec.get("dsp_params", "")
-            if "--phase min" in params_str or "--filter min" in params_str:
-                rec_phase = 'min'
-            elif "--phase linear" in params_str:
-                rec_phase = 'linear'
-            if "--mqa" in params_str:
-                m = re.search(r"--mqa\s+(\w+)", params_str)
-                if m: rec_mqa = m.group(1)
-            if "--steep" in params_str:
-                rec_steep = True
-
-        return {
-            "phase_mode": rec_phase,
-            "apodizing": rec_apodizing,
-            "cutoff_hz": rec_cutoff,
-            "dither_mode": rec_dither,
-            "mqa_mode": rec_mqa,
-            "steep": rec_steep
-        }, rec, prov_info, sr
+    if prompt_ctrl.check_cancelled():
+        prompt_ctrl.on_stage_change("Cancelled", "", total_albums, total_albums, 100.0)
+        return {"status": "cancelled"}
+    else:
+        prompt_ctrl.on_stage_change("Finished Successfully", "", total_albums, total_albums, 100.0)
+        return {"status": "ok", "report_path": last_report}
 
 
 def main():
@@ -1515,48 +1839,18 @@ def main():
         print(f"[Error] Source path not found: {source_path}")
         sys.exit(1)
 
+    phase_choice = args.phase
     if args.filter:
         if args.filter in ['min-phase', 'min']:
-            args.phase = 'min'
+            phase_choice = 'min'
         elif args.filter in ['linear-phase', 'linear']:
-            args.phase = 'linear'
+            phase_choice = 'linear'
 
+    apod_choice = args.apodizing
     if args.cutoff:
-        args.apodizing = True
-
-    is_min = args.phase.lower() in ['min', 'minimum']
-    phase_name = "MINIMUM PHASE" if is_min else "LINEAR PHASE"
-    topology_name = f"{phase_name} APODIZING" if args.apodizing else phase_name
-    topology_suffix = ("min_apod" if args.apodizing else "min") if is_min else ("linear_apod" if args.apodizing else "linear")
-    if args.cutoff:
-        topology_suffix += f"_{int(args.cutoff)}hz"
-
-    target_dir = args.output_dir or args.target
-    if not target_dir:
-        if os.path.isfile(source_path):
-            parent = os.path.dirname(source_path)
-            target_dir = os.path.join(parent, f"upsampled_{topology_suffix}")
-        else:
-            target_dir = f"{source_path.rstrip(os.sep)}_upsampled_{topology_suffix}"
-
-    target_dir = os.path.abspath(target_dir)
-
-    # Bulletproof Safety Guard: Target cannot be identical to source
-    if os.path.abspath(source_path) == os.path.abspath(target_dir):
-        print(f"[Fatal Safety Error] Target directory cannot be identical to source path ({target_dir}). Aborting to protect original files.")
-        sys.exit(1)
-
-    if os.path.isfile(source_path):
-        src_file_dir = os.path.abspath(os.path.dirname(source_path))
-        if os.path.abspath(target_dir) == src_file_dir:
-            print(f"[Fatal Safety Error] Output directory cannot be identical to the source file directory ({target_dir}). Please specify a distinct target directory or use the default auto-named directory.")
-            sys.exit(1)
+        apod_choice = True
 
     dither_mode = "none" if args.no_dither else args.dither
-    tmp_dir = os.path.abspath(args.tmp_dir)
-    os.makedirs(tmp_dir, exist_ok=True)
-    os.makedirs(target_dir, exist_ok=True)
-
     overwrite_raw = str(args.overwrite).lower() if args.overwrite is not None else 'off'
     if overwrite_raw in ['true', '1', 'on']:
         overwrite_mode = 'on'
@@ -1566,132 +1860,26 @@ def main():
         overwrite_mode = 'off'
 
     default_params = {
-        "phase_mode": args.phase,
+        "phase_mode": phase_choice,
         "dither_mode": dither_mode,
-        "apodizing": args.apodizing,
+        "apodizing": apod_choice,
         "mqa_mode": args.mqa,
         "cutoff_hz": args.cutoff,
         "steep": args.steep,
         "overwrite_mode": overwrite_mode
     }
-    prompt_ctrl = SessionPromptController(mode=args.use_recommended, overwrite_mode=overwrite_mode, default_params=default_params)
+    prompt_ctrl = TerminalPromptController(mode=args.use_recommended, overwrite_mode=overwrite_mode, default_params=default_params)
+    target_dir = args.output_dir or args.target
 
-    overwrite_label = "ENABLED (Silent Overwrite)" if overwrite_mode == 'on' else ("ASK (Interactive Prompt on Existing Files)" if overwrite_mode == 'ask' else "DISABLED (Skip Existing)")
-
-    print(f"\n=======================================================")
-    print(f"ACOUSTISINC: 64-BIT GPU SINC AUDIO UPSAMPLER")
-    print(f"=======================================================")
-    print(f"Source Path     : {source_path}")
-    print(f"Destination Path: {target_dir}")
-    print(f"Filter Topology : {topology_name}")
-    print(f"Phase Mode      : {phase_name}")
-    print(f"Cutoff Frequency: {f'{args.cutoff:,.0f} Hz' if args.cutoff else 'Nyquist Bandwidth'}")
-    print(f"Apodizing Filter: {'ENABLED' if args.apodizing else 'DISABLED (Full Sinc Bandwidth)'}")
-    print(f"Overwrite Policy: {overwrite_label}")
-    print(f"Noise Shaping   : {dither_mode.upper()} (In-Register Double Precision)")
-    print(f"MQA Processing  : {args.mqa.upper()}")
-    print(f"FLAC Compression: Level 5 (Strict)")
-    print(f"Precision       : 64-bit Double Precision (Strict)")
-    print(f"=======================================================\n")
-
-    ctx = cl.create_some_context(interactive=False)
-    queue = cl.CommandQueue(ctx)
-
-    if os.path.isfile(source_path):
-        dest_file = os.path.join(target_dir, os.path.basename(source_path))
-        if os.path.exists(dest_file):
-            should_overwrite = prompt_ctrl.resolve_overwrite(dest_file, source_path, 1, 1)
-            if not should_overwrite:
-                print(f"   [Skip] Output exists: {os.path.basename(source_path)} (use --overwrite to overwrite)")
-                return
-
-        t_params, skip = prompt_ctrl.resolve_track_params(source_path, 1, 1, default_params)
-        if skip:
-            return
-        gain_factor, pk = scan_album([source_path])
-        clipped, out_peak, fut = process_track(
-            source_path, target_dir, gain_factor, pk, queue,
-            phase_mode=t_params['phase_mode'],
-            dither_mode=t_params['dither_mode'],
-            tmp_dir=tmp_dir,
-            apodizing=t_params['apodizing'],
-            mqa_mode=t_params['mqa_mode'],
-            cutoff_hz=t_params['cutoff_hz'],
-            steep=t_params['steep'],
-            overwrite=True
-        )
-        if clipped and out_peak > PEAK_TARGET_LIN:
-            overshoot_ratio = PEAK_TARGET_LIN / out_peak
-            safety_margin_lin = 10.0 ** (-0.2 / 20.0)
-            gain_factor *= (overshoot_ratio * safety_margin_lin)
-            print(f">>> Retrying single file with exact calculated Gain Factor: {gain_factor:.6f}")
-            process_track(
-                source_path, target_dir, gain_factor, pk, queue,
-                phase_mode=t_params['phase_mode'],
-                dither_mode=t_params['dither_mode'],
-                tmp_dir=tmp_dir,
-                apodizing=t_params['apodizing'],
-                mqa_mode=t_params['mqa_mode'],
-                cutoff_hz=t_params['cutoff_hz'],
-                steep=t_params['steep'],
-                overwrite=True
-            )
-        file_writer_pool.shutdown(wait=True)
-
-        dest_file = os.path.join(target_dir, os.path.basename(source_path))
-        t_recipe = {
-            "cli_params": f"--phase {t_params['phase_mode']} --dither {t_params['dither_mode']}" + (f" --cutoff {int(t_params['cutoff_hz'])}" if t_params.get('cutoff_hz') else "") + (f" --mqa {t_params['mqa_mode']}" if t_params.get('mqa_mode') != 'adaptive' else "") + (" --steep" if t_params.get('steep') else ""),
-            "topology_name": f"{t_params['phase_mode'].upper()} APODIZING" if (t_params.get('apodizing') or t_params.get('cutoff_hz')) else f"{t_params['phase_mode'].upper()}",
-            "gain_factor": gain_factor,
-            "gain_db": 20.0 * np.log10(gain_factor),
-            "cutoff_hz": t_params.get('cutoff_hz'),
-            "phase_mode": t_params['phase_mode'],
-            "dither_mode": t_params['dither_mode'],
-            "mqa_mode": t_params['mqa_mode'],
-            "steep": t_params.get('steep', False),
-            "date": time.strftime("%Y-%m-%d %H:%M:%S")
-        }
-        applied_recipe = dict(t_recipe)
-        try:
-            html_rep, md_rep = generate_comparative_report([{"src_path": source_path, "dst_path": dest_file, "recipe": t_recipe}], os.path.basename(source_path), applied_recipe, target_dir)
-            if html_rep:
-                print(f"\n   📊 [Comparative Upsampling Report Generated]")
-                print(f"      Interactive HTML Report: {html_rep}")
-                print(f"      Markdown Summary Report: {md_rep}")
-        except Exception as e:
-            print(f"   [Notice] Could not generate comparative report: {e}")
-        return
-
-    # Discover all subdirectories containing FLAC or WAV files
-    album_directories = sorted({
-        r for r, d, f in os.walk(source_path)
-        if not os.path.abspath(r).startswith(target_dir) and any(x.lower().endswith(('.flac', '.wav')) for x in f)
-    })
-
-    if not album_directories:
-        print(f"[AcoustiSinc] No FLAC or WAV files found under {source_path}")
-        return
-
-    for idx, alb_dir in enumerate(album_directories, 1):
-        rel = os.path.relpath(alb_dir, source_path)
-        dest_alb = target_dir if rel == "." else os.path.join(target_dir, rel)
-        print(f"\n==================================================")
-        print(f"[Album {idx}/{len(album_directories)}]")
-        try:
-            process_album_folder(alb_dir, dest_alb, queue, default_params, tmp_dir, overwrite_mode=overwrite_mode, prompt_ctrl=prompt_ctrl)
-        except Exception as e:
-            err_msg = f"[Album {idx} Skipped on Error]: {alb_dir}\nDetails: {e}"
-            print(f"\n{err_msg}\n>>> Continuing to next album...")
-            try:
-                with open(os.path.join(target_dir, "upsample_errors.log"), "a", encoding="utf-8") as ef:
-                    ef.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {err_msg}\n")
-            except Exception:
-                pass
-            GPU_FILTER_CACHE.clear()
-            clear_vkfftapp_cache()
-            gc.collect()
-    file_writer_pool.shutdown(wait=True)
-    print("\n>>> All recursive album batches completed cleanly!")
+    run_upsample_job(
+        source_path=source_path,
+        target_dir=target_dir,
+        default_params=default_params,
+        overwrite_mode=overwrite_mode,
+        prompt_ctrl=prompt_ctrl,
+        tmp_dir=args.tmp_dir
+    )
 
 if __name__ == "__main__":
     main()
+
