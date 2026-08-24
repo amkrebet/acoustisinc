@@ -2,7 +2,7 @@
 
 > **High-Performance GPU-Accelerated 64-Bit Sinc Audio Upsampler & Interactive Forensic Spectral Analyzer**
 
-![AcoustiSinc Forensic Spectral Analysis](acoustisinc_forensic_analysis_v2.png)
+![AcoustiSinc Forensic Audio Studio](acoustisinc_forensic_studio_v4.png)
 
 ---
 
@@ -16,7 +16,7 @@
 * **Dynamic Headroom Auto-Healing**: Pre-flight album headroom scanning with exact overshoot-calculated auto-healing guaranteeing zero intersample clipping.
 * **Forensic Authentication Engine**: Automated analysis identifying upsampled CD masters, brickwall filter cutoffs, zero-stuffing, and ultrasonic noise profiles.
 * **Audiophile Dynamic Range (DR) Scoring**: Official 64-bit Pleasurize Music Foundation (PMF) TT Dynamic Range Meter scoring alongside EBU R128 Loudness Range (LRA) and Integrated LUFS.
-* **Interactive Web Explorer & Tile Studio**: A real-time browser application providing dynamic library navigation, live sub-second forensic spectral analysis, interactive spectrogram HUD with exact cursor dB level readouts, in-browser lossless streaming, and an interactive **Tile-Oriented DSP Studio** for visual recipe design.
+* **Interactive Web Explorer & Tile Studio**: A real-time browser application providing dynamic library navigation, live sub-second forensic spectral analysis, dual-graph spectrogram & power spectrum HUD with exact cursor dB level readouts, in-browser lossless streaming, and an interactive **Tile-Oriented DSP Studio** for visual recipe design.
 * **Decoupled Standalone Batch Engine**: Complete independence between the web UI and the high-throughput CLI batch upsampler (`upsampler.py`), allowing headless execution across thousands of albums via cron, systemd, or detached terminal sessions.
 
 ---
@@ -33,6 +33,8 @@ python server.py --root "/Music/Hi-Res" --port 8765
 ```
 
 Open **`http://localhost:8765`** in your browser.
+
+![AcoustiSinc Tile-Oriented DSP Studio](acoustisinc_tile_studio_modal_v4.png)
 
 * **Tile-Oriented DSP Studio**: Modular tactile cards for Target Rate multiplier, Minimum Phase vs Linear Phase A/B comparison, logarithmic cutoff frequency slider ($15\text{ kHz} \leftrightarrow 48\text{ kHz}$), quick snap chips (`20.7k ADC`, `21.5k Alias`, `22.05k CD Std`, `24k`, `44.1k`), transition steepness, 24-bit Shibata noise shaping, and MQA payload policies.
 * **Instant Recommendation Controls**: Dedicated `✨ [R] Apply Recommended Recipe` banner button and global `[R]` keyboard shortcut.
