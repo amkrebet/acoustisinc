@@ -1197,6 +1197,12 @@ class BasePromptController:
             if rec.get('details'):
                 self.log(f"   Technical Rationale: {rec.get('details')}")
 
+    def clear_album_caches(self):
+        """Releases cached track audit metadata and decisions to maintain minimal RAM footprint."""
+        self.precomputed_audits.clear()
+        self.track_decisions.clear()
+        self.overwrite_decisions.clear()
+
     def set_album_context(self, album_dir):
         """
         Notify the controller that a new album directory is being processed.
@@ -1204,6 +1210,7 @@ class BasePromptController:
         so that settings never bleed across distinct album directories.
         """
         if self.current_album_dir is not None and self.current_album_dir != album_dir:
+            self.clear_album_caches()
             folder_name = os.path.basename(album_dir) or album_dir
             if self.mode == 'locked':
                 self.log(f"\n[AcoustiSinc] Resetting per-album recipe lock for new directory: {folder_name}")
@@ -1867,8 +1874,16 @@ def run_upsample_job(source_path, target_dir=None, default_params=None, overwrit
                     ef.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {err_msg}\n")
             except Exception:
                 pass
+        finally:
             GPU_FILTER_CACHE.clear()
             clear_vkfftapp_cache()
+            if prompt_ctrl:
+                prompt_ctrl.clear_album_caches()
+            try:
+                from gpu_analyser import gpu_engine
+                gpu_engine.clear_cache()
+            except Exception:
+                pass
             gc.collect()
 
     if prompt_ctrl.check_cancelled():

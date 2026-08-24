@@ -135,6 +135,11 @@ class GPUForensicEngine:
             logger.warning(f"Failed to initialize OpenCL GPU context: {e}. Using CPU fallback.")
             self.enabled = False
 
+    def clear_cache(self):
+        """Releases cached VkFFT applications and cleans memory."""
+        with self._lock:
+            self._cached_apps.clear()
+
     def compute_stft_and_reductions(self, y: np.ndarray, sr: int, n_fft: int = 16384, hop_length: int = None):
         """
         Executes batched 64-bit STFT and 2D reduction on GPU with CPU fallback.
