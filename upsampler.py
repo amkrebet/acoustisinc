@@ -904,9 +904,8 @@ def process_track(filepath, dest_dir, gain_factor, album_max_peak_lin, queue, ph
         except Exception: pass
     gc.collect()
 
-    # Clear VRAM filter kernel cache and VkFFT plans between tracks
+    # Free VRAM filter kernel buffer for this track
     GPU_FILTER_CACHE.clear()
-    clear_vkfftapp_cache()
 
     # Async hand-off to NVMe FLAC compression worker
     fut = file_writer_pool.submit(save_and_tag_async, wip_path, dest_path, out_int32, target_rate, filepath, t0, out_peak, album_max_peak_lin, gain_factor)
@@ -1082,7 +1081,6 @@ def process_album_folder(source_album_dir, dest_album_dir, queue, default_params
             print(f"   [Async Writer Notice]: {e}")
 
     GPU_FILTER_CACHE.clear()
-    clear_vkfftapp_cache()
     gc.collect()
     print(f"\n>>> Directory completed cleanly! (Gain Factor: {gain_factor:.6f})")
 
@@ -1880,7 +1878,6 @@ def run_upsample_job(source_path, target_dir=None, default_params=None, overwrit
                 pass
         finally:
             GPU_FILTER_CACHE.clear()
-            clear_vkfftapp_cache()
             if prompt_ctrl:
                 prompt_ctrl.clear_album_caches()
             try:
