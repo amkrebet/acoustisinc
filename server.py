@@ -3012,17 +3012,20 @@ HTML_PAGE = """<!DOCTYPE html>
             }
 
             let provClass = badge.badge_class || 'badge-provenance-native';
-            let provTitle = escapeHtml(badge.verdict);
+            let provTitle = `🔎 Forensic Inference: ${escapeHtml(badge.verdict)} (${escapeHtml(badge.confidence || 'Moderate')} Confidence)`;
             if (badge.recommendation && badge.recommendation.action) {
                 const conf = (badge.confidence || '').toLowerCase();
                 if (conf !== 'low') {
                     const isPot = (conf === 'moderate' || conf === 'medium' || badge.recommendation.is_potential);
-                    const labelPrefix = isPot ? '💡 Potential Action:' : '💡 Recommended Action:';
+                    const labelPrefix = isPot ? '💡 Potential DSP Strategy:' : '💡 Suggested DSP Strategy:';
                     provTitle += `&#10;${labelPrefix} ${escapeHtml(badge.recommendation.action)}`;
+                    if (badge.recommendation.details) {
+                        provTitle += `&#10;📄 Evidence: ${escapeHtml(badge.recommendation.details)}`;
+                    }
                 }
             }
             if (badge.alternative && badge.alternative.label) {
-                provTitle += `&#10;🥈 Alternative: ${escapeHtml(badge.alternative.label)}`;
+                provTitle += `&#10;🥈 Alternative Option: ${escapeHtml(badge.alternative.label)}`;
             }
             let provBadgeHtml = `<span class="badge-tag ${provClass}" title="${provTitle}">${escapeHtml(badge.short_verdict)}</span>`;
 
@@ -3686,6 +3689,52 @@ HTML_PAGE = """<!DOCTYPE html>
                 }
             }
 
+            // 3. Active Cutoff Filter Overlay & Marker
+            let sRecCutoffKhz = null;
+            const sCutoffInput = document.getElementById('upsampleCutoffHz');
+            const sApodCheck = document.getElementById('upsampleApodizingEnable');
+            if (sCutoffInput && sCutoffInput.value && parseFloat(sCutoffInput.value) > 0 && (!sApodCheck || sApodCheck.checked)) {
+                sRecCutoffKhz = parseFloat(sCutoffInput.value) / 1000.0;
+            } else {
+                const rec = currentAnalysis.provenance ? currentAnalysis.provenance.recommendation : null;
+                if (rec) {
+                    if (rec.filter_cutoff_khz) sRecCutoffKhz = rec.filter_cutoff_khz;
+                    else if (rec.dsp_params) {
+                        const m = rec.dsp_params.match(/--(?:cutoff|apodize)\\s+(\\d+)/);
+                        if (m) sRecCutoffKhz = parseFloat(m[1]) / 1000.0;
+                    }
+                }
+            }
+
+            if (sRecCutoffKhz && sRecCutoffKhz < nyqF) {
+                const sVisCutF = Math.max(specFMin, sRecCutoffKhz);
+                const sVisTopF = Math.min(specFMax, nyqF);
+                if (sVisTopF > sVisCutF) {
+                    const yTop = padT + (1.0 - (sVisTopF - specFMin) / (specFMax - specFMin)) * plotH;
+                    const yBot = padT + (1.0 - (sVisCutF - specFMin) / (specFMax - specFMin)) * plotH;
+                    const hZone = yBot - yTop;
+                    if (hZone > 0) {
+                        sCtx.fillStyle = "rgba(10, 16, 24, 0.45)";
+                        sCtx.fillRect(padL, yTop, plotW, hZone);
+                    }
+                }
+                const yCut = padT + (1.0 - (sRecCutoffKhz - specFMin) / (specFMax - specFMin)) * plotH;
+                if (yCut >= padT && yCut <= padT + plotH) {
+                    sCtx.strokeStyle = "rgba(0, 230, 118, 0.9)";
+                    sCtx.lineWidth = 1.5;
+                    sCtx.setLineDash([4, 3]);
+                    sCtx.beginPath();
+                    sCtx.moveTo(padL, yCut);
+                    sCtx.lineTo(padL + plotW, yCut);
+                    sCtx.stroke();
+                    sCtx.setLineDash([]);
+                    sCtx.fillStyle = "#00e676";
+                    sCtx.font = "bold 9px monospace";
+                    sCtx.textAlign = "left";
+                    sCtx.fillText(`Cutoff @ ${(sRecCutoffKhz).toFixed(1)}k (Filtered Attenuation Zone)`, padL + 6, yCut + 11);
+                }
+            }
+
             // Interactive Crosshair & HUD on hover
             if (specMouseX >= padL && specMouseX <= padL + plotW && specMouseY >= padT && specMouseY <= padT + plotH) {
                 sCtx.strokeStyle = "rgba(255, 255, 255, 0.45)";
@@ -4071,30 +4120,37 @@ HTML_PAGE = """<!DOCTYPE html>
             }
             cCtx.stroke();
 
-            // Projected Filter Cutoff Response
+            // Projected Composite Filter + Music Response
             let recCutoffKhz = null;
-            const rec = currentAnalysis.provenance ? currentAnalysis.provenance.recommendation : null;
-            if (rec) {
-                if (rec.filter_cutoff_khz) {
-                    recCutoffKhz = rec.filter_cutoff_khz;
-                } else if (rec.dsp_params) {
-                    const m = rec.dsp_params.match(/--(?:cutoff|apodize)\\s+(\\d+)/);
-                    if (m) recCutoffKhz = parseFloat(m[1]) / 1000.0;
+            const cutoffInput = document.getElementById('upsampleCutoffHz');
+            const apodCheck = document.getElementById('upsampleApodizingEnable');
+            if (cutoffInput && cutoffInput.value && parseFloat(cutoffInput.value) > 0 && (!apodCheck || apodCheck.checked)) {
+                recCutoffKhz = parseFloat(cutoffInput.value) / 1000.0;
+            } else {
+                const rec = currentAnalysis.provenance ? currentAnalysis.provenance.recommendation : null;
+                if (rec) {
+                    if (rec.filter_cutoff_khz) {
+                        recCutoffKhz = rec.filter_cutoff_khz;
+                    } else if (rec.dsp_params) {
+                        const m = rec.dsp_params.match(/--(?:cutoff|apodize)\\s+(\\d+)/);
+                        if (m) recCutoffKhz = parseFloat(m[1]) / 1000.0;
+                    }
                 }
             }
 
-            function calcProjectedLevel(f, origRmsDb, cutoffF) {
-                if (f < cutoffF) return origRmsDb;
+            const isSteep = document.getElementById('upsampleSteep') ? document.getElementById('upsampleSteep').checked : false;
+
+            function calcCompositeLevel(f, origRmsDb, cutoffF, steep = false) {
+                if (f <= cutoffF) return origRmsDb;
                 const deltaF = f - cutoffF;
-                const wTrans = Math.min(1.2, Math.max(0.5, 0.03 * cutoffF));
-                let attDb = 0;
-                if (deltaF <= wTrans) {
-                    const ratio = deltaF / wTrans;
-                    attDb = 120.0 * Math.pow((1.0 - Math.cos(Math.PI * ratio)) / 2.0, 1.5);
-                } else {
-                    attDb = 120.0 + 20.0 * ((deltaF - wTrans) / wTrans);
+                const wTrans = steep ? 0.5 : Math.min(2.0, Math.max(0.6, 0.08 * cutoffF));
+                if (deltaF >= wTrans) {
+                    return Math.max(-160.0, origRmsDb - 145.0);
                 }
-                return Math.max(-170.0, origRmsDb - attDb);
+                const ratio = deltaF / wTrans;
+                const raisedCos = (1.0 + Math.cos(Math.PI * ratio)) / 2.0;
+                const attDb = -20.0 * Math.log10(Math.max(1e-7, raisedCos));
+                return Math.max(-160.0, origRmsDb - attDb);
             }
 
             const legProj = document.getElementById('legendProjectedCutoff');
@@ -4102,9 +4158,45 @@ HTML_PAGE = """<!DOCTYPE html>
                 const cutoffLabel = (recCutoffKhz % 1 === 0) ? `${recCutoffKhz.toFixed(0)}k` : `${recCutoffKhz.toFixed(2).replace(/0$/, '')}k`;
                 if (legProj) {
                     legProj.style.display = 'inline';
-                    legProj.textContent = `-- 🎯 Projected Filter (@ ${cutoffLabel})`;
+                    legProj.textContent = `-- 🎯 Composite Spectrum (Music + Filter @ ${cutoffLabel})`;
                 }
 
+                const nyq = currentAnalysis.nyquist_khz;
+
+                // 1. Draw Shaded Attenuation Delta Region between Original RMS and Composite Spectrum
+                cCtx.fillStyle = "rgba(0, 230, 118, 0.12)";
+                cCtx.beginPath();
+                let startedShade = false;
+                let lastValidX = 0, lastValidY = 0;
+                // Forward pass along original RMS curve in cutoff zone
+                for (let i = 0; i < freqs.length; i++) {
+                    const f = freqs[i];
+                    if (f < recCutoffKhz || f > nyq || f < curveFMin || f > curveFMax) continue;
+                    const x = freqToX(f, w, padL, padR);
+                    const y = dbToY(rms[i], h, padT, padB);
+                    if (!startedShade) {
+                        cCtx.moveTo(x, y);
+                        startedShade = true;
+                    } else {
+                        cCtx.lineTo(x, y);
+                    }
+                    lastValidX = x; lastValidY = y;
+                }
+                // Backward pass along composite filtered curve in cutoff zone
+                if (startedShade) {
+                    for (let i = freqs.length - 1; i >= 0; i--) {
+                        const f = freqs[i];
+                        if (f < recCutoffKhz || f > nyq || f < curveFMin || f > curveFMax) continue;
+                        const compDb = calcCompositeLevel(f, rms[i], recCutoffKhz, isSteep);
+                        const x = freqToX(f, w, padL, padR);
+                        const y = dbToY(compDb, h, padT, padB);
+                        cCtx.lineTo(x, y);
+                    }
+                    cCtx.closePath();
+                    cCtx.fill();
+                }
+
+                // 2. Vertical Cutoff Knee Marker
                 if (curveFMin <= recCutoffKhz && curveFMax >= recCutoffKhz) {
                     const xCut = freqToX(recCutoffKhz, w, padL, padR);
                     cCtx.strokeStyle = "rgba(0, 230, 118, 0.85)";
@@ -4115,23 +4207,21 @@ HTML_PAGE = """<!DOCTYPE html>
                     cCtx.fillStyle = "#00e676";
                     cCtx.font = "bold 9px monospace";
                     cCtx.textAlign = "left";
-                    cCtx.fillText(`Cutoff @ ${cutoffLabel}`, xCut + 4, padT + plotH - 8);
+                    cCtx.fillText(`Cutoff @ ${cutoffLabel} (Filtered Area)`, xCut + 4, padT + plotH - 8);
                 }
 
+                // 3. Full Composite Spectrum Curve (Glowing Emerald)
                 cCtx.strokeStyle = "#00e676";
                 cCtx.lineWidth = 2.0;
-                cCtx.setLineDash([5, 3]);
+                cCtx.setLineDash([4, 2]);
                 cCtx.beginPath();
                 let pFirst = true;
-                const nyq = currentAnalysis.nyquist_khz;
                 for (let i = 0; i < freqs.length; i++) {
                     const f = freqs[i];
-                    if (f < recCutoffKhz || f > nyq) continue;
-                    if (f < curveFMin || f > curveFMax) continue;
-                    
-                    const projDb = calcProjectedLevel(f, rms[i], recCutoffKhz);
+                    if (f > nyq || f < curveFMin || f > curveFMax) continue;
+                    const compDb = calcCompositeLevel(f, rms[i], recCutoffKhz, isSteep);
                     const x = freqToX(f, w, padL, padR);
-                    const y = dbToY(projDb, h, padT, padB);
+                    const y = dbToY(compDb, h, padT, padB);
                     if (pFirst) { cCtx.moveTo(x, y); pFirst = false; }
                     else { cCtx.lineTo(x, y); }
                 }
@@ -4194,25 +4284,29 @@ HTML_PAGE = """<!DOCTYPE html>
                     cCtx.lineWidth = 1;
                     cCtx.stroke();
 
-                    // Projected point indicator (Neon Green) if active in cutoff zone
+                    // Projected composite point indicator (Neon Green) if active in cutoff zone
                     const hudProjItem = document.getElementById('hudProjItem');
                     const hudProj = document.getElementById('hudProj');
-                    if (recCutoffKhz && freqs[closestIdx] >= recCutoffKhz && freqs[closestIdx] <= currentAnalysis.nyquist_khz) {
-                        const projDb = calcProjectedLevel(freqs[closestIdx], rms[closestIdx], recCutoffKhz);
+                    if (recCutoffKhz && freqs[closestIdx] <= currentAnalysis.nyquist_khz) {
+                        const compDb = calcCompositeLevel(freqs[closestIdx], rms[closestIdx], recCutoffKhz, isSteep);
                         
                         if (hudProjItem && hudProj) {
                             hudProjItem.style.display = 'block';
-                            hudProj.textContent = `${projDb.toFixed(1)} dBFS`;
+                            const delta = compDb - rms[closestIdx];
+                            const deltaStr = (Math.abs(delta) > 0.05) ? ` (Δ ${delta.toFixed(1)} dB)` : '';
+                            hudProj.textContent = `${compDb.toFixed(1)} dBFS${deltaStr}`;
                         }
 
-                        const curYProj = dbToY(projDb, h, padT, padB);
-                        cCtx.fillStyle = "#00e676";
-                        cCtx.beginPath();
-                        cCtx.arc(curX, curYProj, 4, 0, Math.PI * 2);
-                        cCtx.fill();
-                        cCtx.strokeStyle = "#fff";
-                        cCtx.lineWidth = 1;
-                        cCtx.stroke();
+                        if (freqs[closestIdx] >= recCutoffKhz) {
+                            const curYProj = dbToY(compDb, h, padT, padB);
+                            cCtx.fillStyle = "#00e676";
+                            cCtx.beginPath();
+                            cCtx.arc(curX, curYProj, 4, 0, Math.PI * 2);
+                            cCtx.fill();
+                            cCtx.strokeStyle = "#fff";
+                            cCtx.lineWidth = 1;
+                            cCtx.stroke();
+                        }
                     } else {
                         if (hudProjItem) hudProjItem.style.display = 'none';
                     }
@@ -4970,6 +5064,12 @@ HTML_PAGE = """<!DOCTYPE html>
             }
             syncApodizingTileUI();
             updateCutoffQuickButtons();
+
+            // Real-time canvas redraw of composite spectrum and spectrogram overlay
+            const cCanvas = document.getElementById('spectrumCanvas');
+            if (cCanvas) drawCurve(cCanvas.getBoundingClientRect().width, cCanvas.getBoundingClientRect().height);
+            const sCanvas = document.getElementById('spectrogramCanvas');
+            if (sCanvas) drawSpectrogram(sCanvas.getBoundingClientRect().width, sCanvas.getBoundingClientRect().height);
         }
 
         function setCutoffPreset(hz) {

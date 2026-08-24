@@ -877,7 +877,7 @@ def generate_dsp_recommendation(primary_prov, bitdepth_info, mqa_info, sr, nyqui
     
     if "Upsampled from 44.1 kHz" in label or ("Upsampled" in label and "44.1" in label):
         if has_ultrasonic_noise or is_messy:
-            noise_reason = f"transient spurs up to {max_p:.1f} dBFS (+{crest_p:.1f} dB crest)" if is_messy else "elevated 16-bit noise and dither artifacts"
+            noise_reason = f"transient spurs up to {max_p:.1f} dBFS (+{crest_p:.1f} dB crest)" if is_messy else "elevated noise and dither artifacts"
             return {
                 "action_type": action_prefix,
                 "is_potential": is_potential,
@@ -886,7 +886,7 @@ def generate_dsp_recommendation(primary_prov, bitdepth_info, mqa_info, sr, nyqui
                 "action_short": "Apodize @ 22.05k",
                 "risk_level": "Minimal Risk — Recommended",
                 "risk_class": "risk-minimal",
-                "details": f"Source signal brickwalls at 22.05 kHz, but stopband contains {noise_reason}. When expanding bit-depth or re-upsampling, apply a minimum-phase apodizing filter at 22.05 kHz to replace the legacy transition band, eliminate filter ringing, and purge 16-bit noise before 24-bit Shibata noise shaping.",
+                "details": f"Spectral analysis indicates an energy cutoff near 22.05 kHz with stopband exhibiting {noise_reason}. Applying a minimum-phase apodizing filter at 22.05 kHz can help replace the legacy transition band, mitigate potential studio ADC pre-ringing, and shape the noise floor before 24-bit Shibata dither.",
                 "dsp_params": "--cutoff 22050 --phase min --dither shibata"
             }
         else:
@@ -898,12 +898,12 @@ def generate_dsp_recommendation(primary_prov, bitdepth_info, mqa_info, sr, nyqui
                 "action_short": "Direct / Apodize @ 22.05k",
                 "risk_level": "Zero Risk",
                 "risk_class": "risk-zero",
-                "details": "Clean brickwall cutoff at 22.05 kHz. For direct decimation, process directly. When expanding bit-depth or re-upsampling, applying a minimum-phase apodizing filter at 22.05 kHz improves the transition band, removes legacy ADC ringing, and pre-cleans the noise floor before Shibata dither shaping.",
+                "details": "Spectral evidence indicates a clean cutoff near 22.05 kHz. Can be processed directly, or a minimum-phase apodizing filter at 22.05 kHz can be applied to smoothly transition the high frequencies and shape the noise floor before 24-bit Shibata dither.",
                 "dsp_params": "--cutoff 22050 --phase min --dither shibata"
             }
     elif "Upsampled from 48.0 kHz" in label or ("Upsampled" in label and "48.0" in label):
         if has_ultrasonic_noise or is_messy:
-            noise_reason = f"transient spurs up to {max_p:.1f} dBFS" if is_messy else "elevated synthetic noise/dither humps"
+            noise_reason = f"transient spurs up to {max_p:.1f} dBFS" if is_messy else "elevated ultrasonic noise/dither artifacts"
             return {
                 "action_type": action_prefix,
                 "is_potential": is_potential,
@@ -912,7 +912,7 @@ def generate_dsp_recommendation(primary_prov, bitdepth_info, mqa_info, sr, nyqui
                 "action_short": "Apodize @ 24.0k",
                 "risk_level": "Minimal Risk — Recommended",
                 "risk_class": "risk-minimal",
-                "details": f"Musical harmonics terminate at 24.0 kHz, but stopband contains {noise_reason}. When expanding bit-depth or re-upsampling, apply a minimum-phase apodizing filter at 24.0 kHz to replace the legacy transition band and purge ultrasonic hash before 24-bit Shibata shaping.",
+                "details": f"Spectral envelope suggests high-frequency content terminates near 24.0 kHz with stopband exhibiting {noise_reason}. Applying a minimum-phase apodizing filter at 24.0 kHz can help damp potential transition ringing and attenuate ultrasonic noise before 24-bit Shibata shaping.",
                 "dsp_params": "--cutoff 24000 --phase min --dither shibata"
             }
         else:
@@ -924,13 +924,13 @@ def generate_dsp_recommendation(primary_prov, bitdepth_info, mqa_info, sr, nyqui
                 "action_short": "Direct / Apodize @ 24k",
                 "risk_level": "Zero Risk",
                 "risk_class": "risk-zero",
-                "details": "Clean brickwall cutoff at 24.0 kHz. For direct decimation, process directly. When expanding bit-depth, applying a minimum-phase apodizing filter at 24.0 kHz replaces the legacy transition band and eliminates ringing before 24-bit noise shaping.",
+                "details": "Spectral evidence indicates a cutoff near 24.0 kHz. Can be processed directly, or an apodizing filter at 24.0 kHz can be applied to smooth the transition band before 24-bit noise shaping.",
                 "dsp_params": "--cutoff 24000 --phase min --dither shibata"
             }
     elif "Upsampled from 88.2 kHz" in label or "Upsampled from 96.0 kHz" in label:
         fn = 44.1 if "88.2" in label else 48.0
         if has_ultrasonic_noise or is_messy:
-            noise_reason = f"messy noise hash and transient spurs up to {max_p:.1f} dBFS (+{crest_p:.1f} dB crest)" if is_messy else "elevated ultrasonic noise"
+            noise_reason = f"noise hash and transient spurs up to {max_p:.1f} dBFS (+{crest_p:.1f} dB crest)" if is_messy else "elevated ultrasonic noise"
             return {
                 "action_type": action_prefix,
                 "is_potential": is_potential,
@@ -939,7 +939,7 @@ def generate_dsp_recommendation(primary_prov, bitdepth_info, mqa_info, sr, nyqui
                 "action_short": f"Low-Pass @ {fn}k",
                 "risk_level": "Minimal Risk",
                 "risk_class": "risk-minimal",
-                "details": f"Source signal brickwalls near {fn} kHz, but stopband contains {noise_reason}. Apply a low-pass filter at {fn} kHz before re-upsampling.",
+                "details": f"Spectral analysis indicates an energy cutoff near {fn} kHz with stopband exhibiting {noise_reason}. A low-pass filter at {fn} kHz can help attenuate ultrasonic noise before re-upsampling.",
                 "dsp_params": f"--cutoff {int(fn*1000)} --phase min --dither shibata"
             }
         else:
@@ -951,7 +951,7 @@ def generate_dsp_recommendation(primary_prov, bitdepth_info, mqa_info, sr, nyqui
                 "action_short": f"Apodize @ {fn}k",
                 "risk_level": "Minimal Risk — Recommended",
                 "risk_class": "risk-minimal",
-                "details": f"Clean brickwall cutoff detected near {fn} kHz with no legitimate musical harmonics above {fn} kHz. When re-upsampling or expanding bit-depth, applying a minimum-phase apodizing filter at {fn} kHz cleanses unneeded ultrasonic imaging and pre-cleans the noise floor before Shibata dither shaping.",
+                "details": f"Spectral evidence indicates a cutoff near {fn} kHz with minimal musical harmonics above {fn} kHz. An apodizing filter at {fn} kHz can help attenuate potential ultrasonic imaging before Shibata noise shaping.",
                 "dsp_params": f"--cutoff {int(fn*1000)} --phase min --dither shibata"
             }
     elif "Leaky" in label:
@@ -965,7 +965,7 @@ def generate_dsp_recommendation(primary_prov, bitdepth_info, mqa_info, sr, nyqui
             "action_short": f"Apodize @ {f_cut:.1f}k",
             "risk_level": "Low Risk",
             "risk_class": "risk-low",
-            "details": f"Mirrored ultrasonic imaging aliases detected above {fn:.2f} kHz. Apply an apodizing minimum-phase filter with stopband notch at {fn:.2f} kHz to remove ultrasonic imaging.",
+            "details": f"Spectral morphology suggests potential sample-rate converter alias mirrors above {fn:.2f} kHz. Applying an apodizing minimum-phase filter with stopband notch at {fn:.2f} kHz can help attenuate suspected ultrasonic imaging.",
             "dsp_params": f"--apodize {int(f_cut*1000)}"
         }
     elif "Zero-Stuffed" in label or "NOS" in label:
@@ -977,7 +977,7 @@ def generate_dsp_recommendation(primary_prov, bitdepth_info, mqa_info, sr, nyqui
             "action_short": "Brickwall LP @ 21.5k",
             "risk_level": "Low Risk",
             "risk_class": "risk-low",
-            "details": "Unfiltered mirror images detected across ultrasonic spectrum. Apply steep low-pass brickwall filter at 21.5 kHz to eliminate imaging aliases.",
+            "details": "Spectral pattern is consistent with non-oversampled (NOS) or zero-stuffed imaging. A sharp low-pass filter at 21.5 kHz can help attenuate ultrasonic imaging mirrors.",
             "dsp_params": "--cutoff 21500 --steep"
         }
     elif "MQA" in label or (mqa_info and mqa_info.get("is_mqa")):
@@ -990,7 +990,7 @@ def generate_dsp_recommendation(primary_prov, bitdepth_info, mqa_info, sr, nyqui
                 "action_short": "Strip MQA Hash",
                 "risk_level": "Minimal Risk — Recommended",
                 "risk_class": "risk-minimal",
-                "details": f"MQA packaging detected on a {sr/1000.0:.1f} kHz native master (no ultrasonic subbands folded into container). Strip pseudo-random LSB bitstream payload to eliminate digital hash, apply 24-bit TPDF dither, and upsample with Shibata noise shaping.",
+                "details": f"MQA bitstream synchronization detected on a {sr/1000.0:.1f} kHz master with no ultrasonic subbands folded. Stripping the LSB payload bits and applying 24-bit TPDF dither eliminates digital hash before Shibata noise shaping.",
                 "dsp_params": "--mqa strip --dither shibata"
             }
         else:
@@ -1002,7 +1002,7 @@ def generate_dsp_recommendation(primary_prov, bitdepth_info, mqa_info, sr, nyqui
                 "action_short": "Adaptive MQA Unfold",
                 "risk_level": "Minimal Risk",
                 "risk_class": "risk-minimal",
-                "details": f"MQA subband packaging detected (Original Master: {orig_sr_str}). Unfold with psychoacoustic noise-gating to reconstruct transient details while suppressing high-frequency quantization noise.",
+                "details": f"MQA subband packaging detected with original master indicated at {orig_sr_str}. Adaptive unfolding with psychoacoustic noise-gating reconstructs high-frequency details while suppressing quantization noise.",
                 "dsp_params": "--mqa adaptive --dither shibata"
             }
     elif bitdepth_info and bitdepth_info.get("is_zero_padded"):
@@ -1011,11 +1011,11 @@ def generate_dsp_recommendation(primary_prov, bitdepth_info, mqa_info, sr, nyqui
         return {
             "action_type": action_prefix,
             "is_potential": is_potential,
-            "action": f"Direct 64-Bit Processing (Lossless Truncation of {tz} Inactive LSBs)",
+            "action": f"Direct 64-Bit Processing (Lossless Handling of {tz} Inactive LSBs)",
             "action_short": f"Lossless {eff}b Process",
             "risk_level": "Zero Risk",
             "risk_class": "risk-zero",
-            "details": f"Container is zero-padded ({eff}-bit audio in 24-bit container). Processing directly in 64-bit float is lossless. Re-dither to true 24-bit with Shibata shaping on output.",
+            "details": f"Bit-depth analysis indicates the lower {tz} bits are zero-padded, consistent with {eff}-bit audio in a 24-bit container. Processing directly in 64-bit float is lossless; outputs are re-dithered to true 24-bit with Shibata shaping.",
             "dsp_params": "--precision float64 --dither shibata"
         }
     elif "Native" in label:
