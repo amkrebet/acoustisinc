@@ -451,7 +451,7 @@ class BoundedThreadPoolExecutor(ThreadPoolExecutor):
             self._semaphore.release()
             raise
 
-file_writer_pool = BoundedThreadPoolExecutor(max_workers=1, max_queue_size=1)
+file_writer_pool = BoundedThreadPoolExecutor(max_workers=1, max_queue_size=0)
 
 
 # ==============================================================================
@@ -1696,7 +1696,7 @@ def run_upsample_job(source_path, target_dir=None, default_params=None, overwrit
     """
     global file_writer_pool
     if getattr(file_writer_pool, '_shutdown', False):
-        file_writer_pool = BoundedThreadPoolExecutor(max_workers=1, max_queue_size=1)
+        file_writer_pool = BoundedThreadPoolExecutor(max_workers=1, max_queue_size=0)
 
     source_path = os.path.abspath(source_path)
     if not os.path.exists(source_path):

@@ -26,10 +26,11 @@ def audit_track_pair(src_path, dst_path, applied_recipe=None, track_recipe=None)
     rec = track_recipe or applied_recipe or {}
 
     # 1. Analyze Source (Before)
+    MAX_AUDIT_SECONDS = 240  # 4 minutes max provides full 2048-column spectrogram & accurate DR scoring
     try:
-        data_src, sr_src = sf.read(src_path, dtype='float64', always_2d=True)
+        data_src, sr_src = sf.read(src_path, frames=int(192000 * MAX_AUDIT_SECONDS), dtype='float64', always_2d=True)
     except Exception:
-        data_src, sr_src = load_audio_resilient(src_path, dtype='float64')
+        data_src, sr_src = load_audio_resilient(src_path, dtype='float64', frames=int(192000 * MAX_AUDIT_SECONDS))
     if data_src.ndim > 1: data_src = np.mean(data_src, axis=1)
 
     spec_src, freqs_src, peak_src, rms_src, rep_src, dr_src, prov_src = analyze_audio_forensics(data_src, sr_src, filepath=src_path)
@@ -47,9 +48,9 @@ def audit_track_pair(src_path, dst_path, applied_recipe=None, track_recipe=None)
 
     # 2. Analyze Target (After)
     try:
-        data_dst, sr_dst = sf.read(dst_path, dtype='float64', always_2d=True)
+        data_dst, sr_dst = sf.read(dst_path, frames=int(sr_src * 4 * MAX_AUDIT_SECONDS), dtype='float64', always_2d=True)
     except Exception:
-        data_dst, sr_dst = load_audio_resilient(dst_path, dtype='float64')
+        data_dst, sr_dst = load_audio_resilient(dst_path, dtype='float64', frames=int(192000 * MAX_AUDIT_SECONDS))
     if data_dst.ndim > 1: data_dst = np.mean(data_dst, axis=1)
 
     spec_dst, freqs_dst, peak_dst, rms_dst, rep_dst, dr_dst, prov_dst = analyze_audio_forensics(data_dst, sr_dst, filepath=dst_path)
