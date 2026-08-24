@@ -904,6 +904,10 @@ def process_track(filepath, dest_dir, gain_factor, album_max_peak_lin, queue, ph
         except Exception: pass
     gc.collect()
 
+    # Clear VRAM filter kernel cache and VkFFT plans between tracks
+    GPU_FILTER_CACHE.clear()
+    clear_vkfftapp_cache()
+
     # Async hand-off to NVMe FLAC compression worker
     fut = file_writer_pool.submit(save_and_tag_async, wip_path, dest_path, out_int32, target_rate, filepath, t0, out_peak, album_max_peak_lin, gain_factor)
     print(f"{elapsed()} [Compute Pipeline Complete] Handed off to NVMe Writer")
